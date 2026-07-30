@@ -1,0 +1,287 @@
+package bkm:plugin@1.0.0;
+
+interface types {
+    enum host-error-code {
+        invalid-argument,
+        permission-denied,
+        not-found,
+        resource-exhausted,
+        transient,
+        host-failure,
+    }
+
+    record host-error {
+        code: host-error-code,
+        message: string,
+        retryable: bool,
+    }
+
+    enum plugin-error-code {
+        invalid-config,
+        permission-denied,
+        resource-exhausted,
+        transient,
+        permanent,
+    }
+
+    record plugin-error {
+        code: plugin-error-code,
+        message: string,
+        retryable: bool,
+    }
+
+    record encoded-value {
+        schema-version: string,
+        content-type: string,
+        data: list<u8>,
+    }
+
+    record config-entry {
+        key: string,
+        value: encoded-value,
+    }
+
+    record state-value {
+        value: list<u8>,
+        revision: u64,
+    }
+
+    record state-entry {
+        key: string,
+        value: list<u8>,
+        revision: u64,
+    }
+
+    record extension-payload {
+        namespace: string,
+        schema-version: string,
+        content-type: string,
+        data: list<u8>,
+    }
+
+    variant message-target {
+        group(string),
+        private(string),
+        channel(string),
+    }
+
+    record sender {
+        id: string,
+        display-name: option<string>,
+    }
+
+    variant message-segment {
+        text(string),
+        opaque(encoded-value),
+    }
+
+    record message-created {
+        message-id: string,
+        target: message-target,
+        sender: sender,
+        text: string,
+        segments: list<message-segment>,
+        reply-to: option<string>,
+    }
+
+    enum action-status {
+        succeeded,
+        failed,
+        denied,
+        timed-out,
+        unknown,
+        cancelled,
+    }
+
+    record action-completed {
+        source-event-id: string,
+        source-invocation-id: string,
+        command-id: string,
+        kind: string,
+        status: action-status,
+        retryable: bool,
+        result-data: option<encoded-value>,
+        error-code: option<string>,
+        error-message: option<string>,
+    }
+
+    record schedule-triggered {
+        task-id: string,
+        scheduled-at-ms: s64,
+        payload: encoded-value,
+    }
+
+    variant event-payload {
+        message-created(message-created),
+        notice(encoded-value),
+        request(encoded-value),
+        lifecycle(encoded-value),
+        action-completed(action-completed),
+        schedule-triggered(schedule-triggered),
+        opaque(encoded-value),
+    }
+
+    record event-envelope {
+        protocol-version: string,
+        event-id: string,
+        delivery-id: string,
+        invocation-id: string,
+        occurred-at-ms: option<s64>,
+        received-at-ms: s64,
+        adapter-id: string,
+        event-type: string,
+        trace-id: option<string>,
+        payload: event-payload,
+        extensions: list<extension-payload>,
+    }
+
+    record put-state {
+        key: string,
+        value: list<u8>,
+        expected-revision: option<u64>,
+    }
+
+    record delete-state {
+        key: string,
+        expected-revision: option<u64>,
+    }
+
+    variant state-op {
+        put(put-state),
+        delete(delete-state),
+    }
+
+    record message-reply-command {
+        content: string,
+    }
+
+    record message-send-command {
+        target: message-target,
+        content: string,
+    }
+
+    record http-header {
+        name: string,
+        value: string,
+    }
+
+    record http-request-command {
+        method: string,
+        url: string,
+        headers: list<http-header>,
+        body: option<list<u8>>,
+        timeout-ms: u64,
+        max-response-bytes: u64,
+    }
+
+    record schedule-create-command {
+        task-id: string,
+        run-at-ms: s64,
+        payload: encoded-value,
+    }
+
+    record schedule-cancel-command {
+        task-id: string,
+    }
+
+    record opaque-command {
+        kind: string,
+        payload: encoded-value,
+    }
+
+    variant command-payload {
+        message-reply(message-reply-command),
+        message-send(message-send-command),
+        http-request(http-request-command),
+        schedule-create(schedule-create-command),
+        schedule-cancel(schedule-cancel-command),
+        opaque(opaque-command),
+    }
+
+    record command {
+        command-id: string,
+        idempotency-key: option<string>,
+        deadline-ms: option<u64>,
+        payload: command-payload,
+    }
+
+    enum diagnostic-level {
+        debug,
+        info,
+        warning,
+        error,
+    }
+
+    record diagnostic {
+        level: diagnostic-level,
+        code: string,
+        message: string,
+    }
+
+    enum disposition {
+        continue,
+        stop,
+        ignore,
+    }
+
+    record handler-output {
+        disposition: disposition,
+        state-ops: list<state-op>,
+        commands: list<command>,
+        diagnostics: list<diagnostic>,
+    }
+
+    enum health-status {
+        healthy,
+        degraded,
+    }
+
+    record init-context {
+        protocol-version: string,
+        plugin-id: string,
+        instance-id: string,
+        granted-capabilities: list<string>,
+        config: list<config-entry>,
+    }
+
+    record migration-output {
+        state-ops: list<state-op>,
+    }
+}
+
+interface queries {
+    use types.{host-error, state-entry, state-value, encoded-value};
+
+    config-get: func(key: string) -> result<option<encoded-value>, host-error>;
+    state-get: func(key: string) -> result<option<state-value>, host-error>;
+    state-scan: func(prefix: string, limit: u32) -> result<list<state-entry>, host-error>;
+    asset-get: func(path: string) -> result<option<list<u8>>, host-error>;
+    granted-capabilities: func() -> list<string>;
+    invocation-time-ms: func() -> s64;
+}
+
+interface lifecycle {
+    use types.{config-entry, health-status, init-context, migration-output, plugin-error, state-entry};
+
+    validate-config: func(config: list<config-entry>) -> result<_, plugin-error>;
+    init: func(context: init-context) -> result<_, plugin-error>;
+    health: func() -> result<health-status, plugin-error>;
+    migrate-state: func(
+        from-version: u32,
+        to-version: u32,
+        state: list<state-entry>,
+    ) -> result<migration-output, plugin-error>;
+    shutdown: func() -> result<_, plugin-error>;
+}
+
+interface handler {
+    use types.{event-envelope, handler-output, plugin-error};
+
+    on-event: func(event: event-envelope) -> result<handler-output, plugin-error>;
+}
+
+world plugin {
+    import queries;
+    export lifecycle;
+    export handler;
+}

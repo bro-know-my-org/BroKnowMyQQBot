@@ -1,0 +1,106 @@
+[workspace]
+members = [
+    ".",
+    "crates/adapter-qqbot",
+    "crates/bot-core",
+    "crates/plugin-api",
+    "crates/plugin-host",
+    "crates/qqbot-protocol",
+    "plugins/builtin",
+    "test-support/plugin-fixtures",
+]
+resolver = "3"
+exclude = ["test-support/wasm-plugins/ping"]
+
+[package]
+name = "bro-know-my-bot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+adapter-qqbot = { path = "crates/adapter-qqbot" }
+bot-core = { path = "crates/bot-core" }
+builtin-plugins = { path = "plugins/builtin" }
+chrono.workspace = true
+dialoguer.workspace = true
+dotenvy.workspace = true
+fs2.workspace = true
+libc.workspace = true
+plugin-api = { path = "crates/plugin-api" }
+plugin-host = { path = "crates/plugin-host", features = ["wasm"] }
+qqbot-protocol = { path = "crates/qqbot-protocol" }
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+
+[lints]
+workspace = true
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["BroKnowMyQQBot contributors"]
+repository = "https://github.com/BroKnowMy/BroKnowMyQQBot"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bitflags = { version = "2", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dialoguer = "0.11"
+dotenvy = "0.15"
+futures-util = "0.3"
+fs2 = "0.4"
+jsonschema = { version = "0.49", default-features = false }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+secrecy = "0.10"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+toml = "0.9"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+wasmtime = { version = "34.0.2", default-features = false, features = ["async", "component-model", "cranelift", "runtime", "std"] }
+wasmparser = { version = "0.254", features = ["component-model"] }
+wit-parser = { version = "0.254", default-features = false, features = ["std"] }
+zip = { version = "6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zstd = "0.13"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

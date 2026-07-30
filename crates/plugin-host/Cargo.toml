@@ -1,0 +1,48 @@
+[package]
+name = "plugin-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+wasm = ["dep:anyhow", "dep:wasmtime"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+async-trait.workspace = true
+bot-core = { path = "../bot-core" }
+futures-util.workspace = true
+jsonschema.workspace = true
+plugin-api = { path = "../plugin-api" }
+reqwest.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+url.workspace = true
+wasmtime = { workspace = true, optional = true }
+wasmparser.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+builtin-plugins = { path = "../../plugins/builtin" }
+plugin-fixtures = { path = "../../test-support/plugin-fixtures" }
+base64.workspace = true
+
+[[test]]
+name = "wasm_ping"
+required-features = ["wasm"]
+
+[[test]]
+name = "wasm_resources"
+required-features = ["wasm"]
+
+[lints]
+workspace = true

@@ -1,0 +1,32 @@
+# Generated as config/bot.toml on first run. Do not put AppSecret or tokens here.
+
+[qq]
+environment = "production"
+public_guild_messages = false
+check_only = false
+
+[runtime]
+event_concurrency = 32
+
+[plugins]
+database = "data/plugins.db"
+# installations = "config/plugins.toml"
+
+[logging.console]
+enabled = true
+language = "en"
+ansi = true
+filter = "info"
+message_content = false
+
+[logging.files]
+enabled = true
+directory = "logs"
+filter = "debug"
+message_content = false
+zstd_level = 3
+buffer_lines = 8192
+runtime_max_file_mb = 64
+runtime_max_total_mb = 512
+messages_max_file_mb = 256
+messages_max_total_mb = 2048

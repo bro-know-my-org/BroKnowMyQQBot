@@ -1,0 +1,33 @@
+[package]
+name = "bkm-wasm-ping-fixture"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+autobins = false
+
+[features]
+host-tools = []
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+base64 = "0.22"
+wit-component = { version = "0.254", default-features = false }
+zip = { version = "6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[workspace]
+
+[[bin]]
+name = "build_component"
+path = "src/bin/build_component.rs"
+required-features = ["host-tools"]
+
+[[bin]]
+name = "build_package"
+path = "src/bin/build_package.rs"
+required-features = ["host-tools"]

@@ -1,0 +1,12 @@
+# Functional plugin profile for a real QQ Official WebSocket smoke test.
+# Test-only fault fixtures remain excluded from the production application.
+bundled = [
+    "ping",
+    "help",
+    "echo",
+    "counter",
+    "http-probe",
+    "scheduler-probe",
+    "qq-extension-probe",
+    "active-send-probe",
+]

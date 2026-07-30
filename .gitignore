@@ -1,0 +1,45 @@
+# Ignore everything at the repository root by default.
+/*
+
+# Repository metadata and source.
+!/.github/
+!/.gitignore
+!/Cargo.lock
+!/Cargo.toml
+!/rustfmt.toml
+!/config/
+!/crates/
+!/plugins/
+!/src/
+!/test-data/
+!/test-support/
+
+# Build artifacts.
+/target/
+/test-support/wasm-plugins/*/target/
+
+# Editor and operating-system files.
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local configuration and secrets.
+.env
+.env.*
+!.env.example
+config.local.toml
+/config/bot.toml
+/config/plugins.toml
+/config/secrets.env
+secrets.toml
+*.pem
+*.key
+
+# Runtime state.
+/data/
+/logs/
+*.db
+*.db-shm
+*.db-wal

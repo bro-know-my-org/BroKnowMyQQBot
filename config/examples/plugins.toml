@@ -1,0 +1,18 @@
+# Bundled Rust plugins enabled by default when no installation file is set.
+bundled = ["ping", "help", "echo", "counter"]
+
+# Optional functional coverage plugins can be added explicitly:
+# bundled = ["ping", "help", "echo", "counter", "http-probe", "scheduler-probe", "qq-extension-probe"]
+
+# Add local WebAssembly Component packages explicitly. Relative package paths
+# are resolved from this file. Grants are intersected with plugin.toml and are
+# never treated as wildcards.
+#
+# [[wasm]]
+# package = "../data/plugins/example.bkm-plugin"
+# instance_id = "dev.example.plugin/default"
+# enabled = true
+# grants = ["message.reply"]
+#
+# [wasm.config]
+# greeting = "你好"
