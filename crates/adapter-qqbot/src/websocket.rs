@@ -64,6 +64,7 @@ impl Default for QqWebSocketConfig {
 pub struct QqWebSocketAdapter {
     config: QqWebSocketConfig,
     api: OpenApiClient,
+    actions: QqActionExecutor,
     session: Mutex<SessionState>,
 }
 
@@ -72,6 +73,11 @@ impl QqWebSocketAdapter {
         config.reconnect_min_delay = config.reconnect_min_delay.max(MIN_RECONNECT_DELAY);
         config.reconnect_max_delay = config.reconnect_max_delay.max(config.reconnect_min_delay);
         Self {
+            actions: QqActionExecutor::new(
+                config.adapter_id.clone(),
+                api.clone(),
+                config.log_message_content,
+            ),
             config,
             api,
             session: Mutex::new(SessionState::default()),
@@ -418,13 +424,36 @@ impl QqWebSocketAdapter {
         }
         Ok(authenticated)
     }
+}
 
-    async fn execute_action(&self, action: Action) -> Result<ActionResult, AdapterError> {
+#[derive(Debug)]
+pub(crate) struct QqActionExecutor {
+    adapter_id: AdapterId,
+    api: OpenApiClient,
+    log_message_content: bool,
+}
+
+impl QqActionExecutor {
+    pub(crate) fn new(
+        adapter_id: AdapterId,
+        api: OpenApiClient,
+        log_message_content: bool,
+    ) -> Self {
+        Self {
+            adapter_id,
+            api,
+            log_message_content,
+        }
+    }
+
+    pub(crate) async fn execute_action(
+        &self,
+        action: Action,
+    ) -> Result<ActionResult, AdapterError> {
         match action {
             Action::Reply(reply) => {
                 let message_scope = message_scope_name(&reply.target);
                 let message_log = self
-                    .config
                     .log_message_content
                     .then(|| MessageActionLog::new(&reply.target, reply.content.clone()));
                 let result = match &reply.target {
@@ -467,7 +496,6 @@ impl QqWebSocketAdapter {
             Action::SendMessage(message) => {
                 let message_scope = message_scope_name(&message.target);
                 let message_log = self
-                    .config
                     .log_message_content
                     .then(|| MessageActionLog::new(&message.target, message.content.clone()));
                 let result = match &message.target {
@@ -511,7 +539,7 @@ impl QqWebSocketAdapter {
         match result {
             Ok(result) => {
                 info!(
-                    adapter_id = %self.config.adapter_id,
+                    adapter_id = %self.adapter_id,
                     action_type = %action_type,
                     message_scope = %message_scope,
                     "QQ message action succeeded"
@@ -519,7 +547,7 @@ impl QqWebSocketAdapter {
                 if let Some(message) = message_log {
                     info!(
                         target: MESSAGE_LOG_TARGET,
-                        adapter_id = %self.config.adapter_id,
+                        adapter_id = %self.adapter_id,
                         action_type = %action_type,
                         message_scope = %message_scope,
                         direction = "outbound",
@@ -531,7 +559,7 @@ impl QqWebSocketAdapter {
                     );
                 }
                 debug!(
-                    adapter_id = %self.config.adapter_id,
+                    adapter_id = %self.adapter_id,
                     action_type = %action_type,
                     message_id = %compact_id(result.id.as_deref().unwrap_or("-")),
                     "QQ message action result details"
@@ -543,7 +571,7 @@ impl QqWebSocketAdapter {
             }
             Err(error) => {
                 warn!(
-                    adapter_id = %self.config.adapter_id,
+                    adapter_id = %self.adapter_id,
                     action_type = %action_type,
                     message_scope = %message_scope,
                     error = %error,
@@ -552,7 +580,7 @@ impl QqWebSocketAdapter {
                 if let Some(message) = message_log {
                     info!(
                         target: MESSAGE_LOG_TARGET,
-                        adapter_id = %self.config.adapter_id,
+                        adapter_id = %self.adapter_id,
                         action_type = %action_type,
                         message_scope = %message_scope,
                         direction = "outbound",
@@ -577,7 +605,7 @@ const fn message_scope_name(target: &MessageTarget) -> &'static str {
     }
 }
 
-fn compact_id(value: &str) -> String {
+pub(crate) fn compact_id(value: &str) -> String {
     const EDGE_LENGTH: usize = 8;
     let characters = value.chars().collect::<Vec<_>>();
     if characters.len() <= EDGE_LENGTH * 2 {
@@ -664,7 +692,7 @@ impl Adapter for QqWebSocketAdapter {
     }
 
     async fn execute(&self, action: Action) -> Result<ActionResult, AdapterError> {
-        self.execute_action(action).await
+        self.actions.execute_action(action).await
     }
 
     async fn event_handled(&self, event: &EventEnvelope) -> Result<(), AdapterError> {

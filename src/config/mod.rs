@@ -18,6 +18,12 @@ const DEFAULT_CONFIG_PATH: &str = "config/bot.toml";
 const DEFAULT_SECRETS_PATH: &str = "config/secrets.env";
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_SECRETS_BYTES: usize = 64 * 1024;
+const MAX_WEBHOOK_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS: u64 = 3600;
+const MAX_WEBHOOK_REQUEST_CONCURRENCY: usize = 1024;
+const MAX_WEBHOOK_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+const MAX_WEBHOOK_BUFFERED_BODY_BYTES: usize = 256 * 1024 * 1024;
+const WEBHOOK_REQUEST_MEMORY_MULTIPLIER: usize = 4;
 const CONFIG_TEMPLATE: &str = include_str!("../../config/examples/bot.toml");
 const SECRETS_TEMPLATE: &str = include_str!("../../config/examples/secrets.env");
 const SMOKE_PLUGINS_TEMPLATE: &str = include_str!("../../config/examples/plugins.qq-smoke.toml");
@@ -82,11 +88,20 @@ impl BotConfig {
         if let Ok(value) = env::var("BKM_QQ_ENVIRONMENT") {
             self.qq.environment = value;
         }
+        if let Ok(value) = env::var("BKM_QQ_TRANSPORT") {
+            self.qq.transport = value;
+        }
         apply_bool_override(
             "BKM_QQ_PUBLIC_GUILD_MESSAGES",
             &mut self.qq.public_guild_messages,
         )?;
         apply_bool_override("BKM_QQ_CHECK_ONLY", &mut self.qq.check_only)?;
+        if let Ok(value) = env::var("BKM_QQ_WEBHOOK_LISTEN") {
+            self.qq.webhook.listen = value;
+        }
+        if let Ok(value) = env::var("BKM_QQ_WEBHOOK_PATH") {
+            self.qq.webhook.path = value;
+        }
         if let Some(value) = env::var_os("BKM_PLUGIN_DB") {
             self.plugins.database = PathBuf::from(value);
         }
@@ -123,6 +138,14 @@ impl BotConfig {
             return Err(ConfigError::InvalidValue(
                 "qq.environment must be `production` or `sandbox`".to_owned(),
             ));
+        }
+        if !matches!(self.qq.transport.as_str(), "websocket" | "webhook") {
+            return Err(ConfigError::InvalidValue(
+                "qq.transport must be `websocket` or `webhook`".to_owned(),
+            ));
+        }
+        if self.qq.transport == "webhook" {
+            validate_webhook_config(&self.qq.webhook)?;
         }
         if self.runtime.event_concurrency == 0
             || self.runtime.event_concurrency > tokio::sync::Semaphore::MAX_PERMITS
@@ -187,6 +210,59 @@ fn validate_log_capacity(kind: &str, file_mb: u64, total_mb: u64) -> Result<(), 
     if file_mb == 0 || total_mb == 0 || file_mb > total_mb {
         return Err(ConfigError::InvalidValue(format!(
             "logging.files.{kind}_max_file_mb must be greater than zero and no larger than {kind}_max_total_mb"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_webhook_config(config: &model::QqWebhookConfig) -> Result<(), ConfigError> {
+    let listen = config.listen.parse::<std::net::SocketAddr>().map_err(|_| {
+        ConfigError::InvalidValue("qq.webhook.listen must be an IP socket address".to_owned())
+    })?;
+    if listen.port() == 0 {
+        return Err(ConfigError::InvalidValue(
+            "qq.webhook.listen must use a non-zero port".to_owned(),
+        ));
+    }
+    if !adapter_qqbot::is_literal_http_path(&config.path) {
+        return Err(ConfigError::InvalidValue(
+            "qq.webhook.path must be a literal absolute HTTP path".to_owned(),
+        ));
+    }
+    if config.timestamp_tolerance_seconds == 0
+        || config.timestamp_tolerance_seconds > MAX_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS
+    {
+        return Err(ConfigError::InvalidValue(format!(
+            "qq.webhook.timestamp_tolerance_seconds must be between 1 and {MAX_WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS}",
+        )));
+    }
+    if config.max_body_bytes == 0 || config.max_body_bytes > MAX_WEBHOOK_BODY_BYTES {
+        return Err(ConfigError::InvalidValue(format!(
+            "qq.webhook.max_body_bytes must be between 1 and {MAX_WEBHOOK_BODY_BYTES}",
+        )));
+    }
+    if config.max_request_concurrency == 0
+        || config.max_request_concurrency > MAX_WEBHOOK_REQUEST_CONCURRENCY
+    {
+        return Err(ConfigError::InvalidValue(format!(
+            "qq.webhook.max_request_concurrency must be between 1 and {MAX_WEBHOOK_REQUEST_CONCURRENCY}",
+        )));
+    }
+    if config
+        .max_body_bytes
+        .checked_mul(config.max_request_concurrency)
+        .and_then(|bytes| bytes.checked_mul(WEBHOOK_REQUEST_MEMORY_MULTIPLIER))
+        .is_none_or(|bytes| bytes > MAX_WEBHOOK_BUFFERED_BODY_BYTES)
+    {
+        return Err(ConfigError::InvalidValue(format!(
+            "qq.webhook estimated aggregate request memory must not exceed {MAX_WEBHOOK_BUFFERED_BODY_BYTES} bytes",
+        )));
+    }
+    if config.request_timeout_seconds == 0
+        || config.request_timeout_seconds > MAX_WEBHOOK_REQUEST_TIMEOUT_SECONDS
+    {
+        return Err(ConfigError::InvalidValue(format!(
+            "qq.webhook.request_timeout_seconds must be between 1 and {MAX_WEBHOOK_REQUEST_TIMEOUT_SECONDS}",
         )));
     }
     Ok(())

@@ -2,14 +2,14 @@
 
 #![forbid(unsafe_code)]
 
-use std::{env, process::ExitCode, sync::Arc};
+use std::{env, process::ExitCode, sync::Arc, time::Duration};
 
 use crate::{
     config::{self, BotConfig, load_secret_environment},
     logging,
     plugins::load_plugins,
 };
-use adapter_qqbot::{QqWebSocketAdapter, QqWebSocketConfig};
+use adapter_qqbot::{QqWebSocketAdapter, QqWebSocketConfig, QqWebhookAdapter, QqWebhookConfig};
 use bot_core::{Adapter, RuntimeBuilder, shutdown_channel};
 use plugin_host::{PluginStore, StaticPluginHost};
 use qqbot_protocol::{Intents, OpenApiClient, OpenApiEnvironment, TokenManager};
@@ -23,6 +23,8 @@ enum AppError {
         "required environment variable `{0}` is not set; edit config/secrets.env or provide it through the process environment"
     )]
     MissingEnvironment(&'static str),
+    #[error("QQ Webhook secret was not retained during adapter construction")]
+    MissingWebhookSecret,
 }
 
 pub(crate) async fn run() -> ExitCode {
@@ -63,24 +65,20 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         intents = intents.with_public_guild_messages();
     }
 
-    let tokens = TokenManager::new(app_id, SecretString::from(app_secret.into_boxed_str()))?;
+    let webhook_secret = (config.qq.transport == "webhook")
+        .then(|| SecretString::from(app_secret.clone().into_boxed_str()));
+    let tokens = TokenManager::new(
+        app_id.clone(),
+        SecretString::from(app_secret.into_boxed_str()),
+    )?;
     let api = OpenApiClient::new(environment, tokens)?;
-    let adapter = Arc::new(QqWebSocketAdapter::new(
-        QqWebSocketConfig {
-            intents,
-            log_message_content: config.logging.console.message_content
-                || config.logging.files.message_content,
-            ..QqWebSocketConfig::default()
-        },
-        api.clone(),
-    ));
+    let adapter = build_qq_adapter(&config, app_id, webhook_secret, api.clone(), intents)?;
     let plugin_db = config.plugins.database.clone();
     if let Some(parent) = plugin_db.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let plugin_adapter: Arc<dyn Adapter> = adapter.clone();
     let mut plugins =
-        StaticPluginHost::new(PluginStore::open(plugin_db)?).with_adapter(plugin_adapter);
+        StaticPluginHost::new(PluginStore::open(plugin_db)?).with_adapter(adapter.clone());
     let installation_file = config.plugins.installations.clone();
     if let Err(error) = load_plugins(&mut plugins, installation_file.as_deref()).await {
         if let Err(shutdown_error) = plugins.shutdown().await {
@@ -110,7 +108,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         .adapter(adapter)
         .handler(plugins.clone())
         .build()?;
-    info!("starting BroKnowMyQQBot with QQ Official WebSocket adapter");
+    info!(transport = %config.qq.transport, "starting BroKnowMyQQBot with QQ Official adapter");
     let runtime_run = runtime.run(shutdown_signal);
     tokio::pin!(runtime_run);
     let runtime_result = tokio::select! {
@@ -135,6 +133,49 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     runtime_result?;
     info!("BroKnowMyQQBot stopped");
     Ok(())
+}
+
+fn build_qq_adapter(
+    config: &BotConfig,
+    app_id: String,
+    app_secret: Option<SecretString>,
+    api: OpenApiClient,
+    intents: Intents,
+) -> Result<Arc<dyn Adapter>, Box<dyn std::error::Error>> {
+    let log_message_content =
+        config.logging.console.message_content || config.logging.files.message_content;
+    match config.qq.transport.as_str() {
+        "websocket" => Ok(Arc::new(QqWebSocketAdapter::new(
+            QqWebSocketConfig {
+                intents,
+                log_message_content,
+                ..QqWebSocketConfig::default()
+            },
+            api,
+        ))),
+        "webhook" => {
+            let app_secret = app_secret.ok_or(AppError::MissingWebhookSecret)?;
+            Ok(Arc::new(QqWebhookAdapter::new(
+                QqWebhookConfig {
+                    timestamp_tolerance: Duration::from_secs(
+                        config.qq.webhook.timestamp_tolerance_seconds,
+                    ),
+                    max_body_bytes: config.qq.webhook.max_body_bytes,
+                    max_request_concurrency: config.qq.webhook.max_request_concurrency,
+                    request_timeout: Duration::from_secs(config.qq.webhook.request_timeout_seconds),
+                    log_message_content,
+                    ..QqWebhookConfig::new(
+                        config.qq.webhook.listen.parse()?,
+                        config.qq.webhook.path.clone(),
+                        app_id,
+                        app_secret,
+                    )
+                },
+                api,
+            )?))
+        }
+        _ => unreachable!("configuration validation only accepts known QQ transports"),
+    }
 }
 
 #[cfg(unix)]

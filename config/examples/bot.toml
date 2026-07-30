@@ -2,8 +2,17 @@
 
 [qq]
 environment = "production"
+transport = "websocket"
 public_guild_messages = false
 check_only = false
+
+[qq.webhook]
+listen = "127.0.0.1:8080"
+path = "/callbacks/qq"
+timestamp_tolerance_seconds = 300
+max_body_bytes = 1048576
+max_request_concurrency = 64
+request_timeout_seconds = 10
 
 [runtime]
 event_concurrency = 32

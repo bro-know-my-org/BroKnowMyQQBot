@@ -17,16 +17,44 @@ pub(crate) struct BotConfig {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct QqConfig {
     pub(crate) environment: String,
+    pub(crate) transport: String,
     pub(crate) public_guild_messages: bool,
     pub(crate) check_only: bool,
+    pub(crate) webhook: QqWebhookConfig,
 }
 
 impl Default for QqConfig {
     fn default() -> Self {
         Self {
             environment: "production".to_owned(),
+            transport: "websocket".to_owned(),
             public_guild_messages: false,
             check_only: false,
+            webhook: QqWebhookConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct QqWebhookConfig {
+    pub(crate) listen: String,
+    pub(crate) path: String,
+    pub(crate) timestamp_tolerance_seconds: u64,
+    pub(crate) max_body_bytes: usize,
+    pub(crate) max_request_concurrency: usize,
+    pub(crate) request_timeout_seconds: u64,
+}
+
+impl Default for QqWebhookConfig {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:8080".to_owned(),
+            path: "/callbacks/qq".to_owned(),
+            timestamp_tolerance_seconds: 300,
+            max_body_bytes: 1024 * 1024,
+            max_request_concurrency: 64,
+            request_timeout_seconds: 10,
         }
     }
 }
