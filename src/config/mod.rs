@@ -31,7 +31,7 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl BotConfig {
     pub(crate) fn load() -> Result<Self, ConfigError> {
-        let explicit_path = env::var_os("BKM_CONFIG").map(PathBuf::from);
+        let explicit_path = env::var_os("BKMQB_CONFIG").map(PathBuf::from);
         let path = explicit_path
             .clone()
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
@@ -85,33 +85,33 @@ impl BotConfig {
     }
 
     fn apply_environment_overrides(&mut self) -> Result<(), ConfigError> {
-        if let Ok(value) = env::var("BKM_QQ_ENVIRONMENT") {
+        if let Ok(value) = env::var("BKMQB_QQ_ENVIRONMENT") {
             self.qq.environment = value;
         }
-        if let Ok(value) = env::var("BKM_QQ_TRANSPORT") {
+        if let Ok(value) = env::var("BKMQB_QQ_TRANSPORT") {
             self.qq.transport = value;
         }
         apply_bool_override(
-            "BKM_QQ_PUBLIC_GUILD_MESSAGES",
+            "BKMQB_QQ_PUBLIC_GUILD_MESSAGES",
             &mut self.qq.public_guild_messages,
         )?;
-        apply_bool_override("BKM_QQ_CHECK_ONLY", &mut self.qq.check_only)?;
-        if let Ok(value) = env::var("BKM_QQ_WEBHOOK_LISTEN") {
+        apply_bool_override("BKMQB_QQ_CHECK_ONLY", &mut self.qq.check_only)?;
+        if let Ok(value) = env::var("BKMQB_QQ_WEBHOOK_LISTEN") {
             self.qq.webhook.listen = value;
         }
-        if let Ok(value) = env::var("BKM_QQ_WEBHOOK_PATH") {
+        if let Ok(value) = env::var("BKMQB_QQ_WEBHOOK_PATH") {
             self.qq.webhook.path = value;
         }
-        if let Some(value) = env::var_os("BKM_PLUGIN_DB") {
+        if let Some(value) = env::var_os("BKMQB_PLUGIN_DB") {
             self.plugins.database = PathBuf::from(value);
         }
-        if let Some(value) = env::var_os("BKM_PLUGIN_INSTALLATIONS") {
+        if let Some(value) = env::var_os("BKMQB_PLUGIN_INSTALLATIONS") {
             self.plugins.installations = Some(PathBuf::from(value));
         }
-        if let Ok(value) = env::var("BKM_EVENT_CONCURRENCY") {
+        if let Ok(value) = env::var("BKMQB_EVENT_CONCURRENCY") {
             self.runtime.event_concurrency =
                 value.parse().map_err(|_| ConfigError::InvalidEnvironment {
-                    name: "BKM_EVENT_CONCURRENCY",
+                    name: "BKMQB_EVENT_CONCURRENCY",
                     value,
                 })?;
         }
@@ -119,14 +119,14 @@ impl BotConfig {
             self.logging.console.filter.clone_from(&value);
             self.logging.files.filter = value;
         }
-        if let Ok(value) = env::var("BKM_LOG_LANGUAGE") {
+        if let Ok(value) = env::var("BKMQB_LOG_LANGUAGE") {
             self.logging.console.language = value;
         }
-        if let Some(value) = env::var_os("BKM_LOG_DIRECTORY") {
+        if let Some(value) = env::var_os("BKMQB_LOG_DIRECTORY") {
             self.logging.files.directory = PathBuf::from(value);
         }
-        if let Ok(value) = env::var("BKM_LOG_MESSAGE_CONTENT") {
-            let enabled = parse_bool_environment("BKM_LOG_MESSAGE_CONTENT", &value)?;
+        if let Ok(value) = env::var("BKMQB_LOG_MESSAGE_CONTENT") {
+            let enabled = parse_bool_environment("BKMQB_LOG_MESSAGE_CONTENT", &value)?;
             self.logging.console.message_content = enabled;
             self.logging.files.message_content = enabled;
         }
@@ -269,7 +269,7 @@ fn validate_webhook_config(config: &model::QqWebhookConfig) -> Result<(), Config
 }
 
 pub(crate) fn application_config_path() -> PathBuf {
-    env::var_os("BKM_CONFIG").map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), PathBuf::from)
+    env::var_os("BKMQB_CONFIG").map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), PathBuf::from)
 }
 
 pub(crate) fn ensure_smoke_plugin_config() -> Result<PathBuf, ConfigError> {
@@ -283,7 +283,7 @@ pub(crate) fn ensure_smoke_plugin_config() -> Result<PathBuf, ConfigError> {
 }
 
 pub(crate) fn load_secret_environment() -> Result<Option<PathBuf>, ConfigError> {
-    let explicit_path = env::var_os("BKM_SECRETS_FILE").map(PathBuf::from);
+    let explicit_path = env::var_os("BKMQB_SECRETS_FILE").map(PathBuf::from);
     let path = explicit_path
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_SECRETS_PATH));
@@ -365,7 +365,7 @@ fn open_secrets_file(path: &Path) -> std::io::Result<fs::File> {
 }
 
 fn credentials_are_set() -> bool {
-    ["BKM_QQ_OFFICIAL_APP_ID", "BKM_QQ_OFFICIAL_APP_SECRET"]
+    ["BKMQB_QQ_OFFICIAL_APP_ID", "BKMQB_QQ_OFFICIAL_APP_SECRET"]
         .into_iter()
         .all(|name| env::var(name).is_ok_and(|value| !value.trim().is_empty()))
 }
@@ -376,7 +376,7 @@ pub(crate) fn write_secret_environment(
     app_secret: &str,
 ) -> Result<(), ConfigError> {
     let contents = format!(
-        "# Local QQ credentials. This file is ignored by Git.\nBKM_QQ_OFFICIAL_APP_ID={}\nBKM_QQ_OFFICIAL_APP_SECRET={}\n",
+        "# Local QQ credentials. This file is ignored by Git.\nBKMQB_QQ_OFFICIAL_APP_ID={}\nBKMQB_QQ_OFFICIAL_APP_SECRET={}\n",
         quote_environment_value(app_id),
         quote_environment_value(app_secret)
     );

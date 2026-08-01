@@ -47,7 +47,7 @@ pub(crate) fn run(
     };
 
     let mut app_id_prompt = Input::<String>::with_theme(&theme).with_prompt(text.app_id_prompt);
-    if let Some(existing) = non_empty_environment("BKM_QQ_OFFICIAL_APP_ID") {
+    if let Some(existing) = non_empty_environment("BKMQB_QQ_OFFICIAL_APP_ID") {
         app_id_prompt = app_id_prompt.with_initial_text(existing);
     }
     let app_id = app_id_prompt

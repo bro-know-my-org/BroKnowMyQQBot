@@ -16,7 +16,7 @@ use builtin_plugins::{
     ActiveSendProbePlugin, CounterPlugin, EchoPlugin, HelpPlugin, HttpProbePlugin, PingPlugin,
     QqExtensionProbePlugin, SchedulerProbePlugin,
 };
-use plugin_host::{StaticPluginHost, ValidatedPluginPackage, WasmPlugin};
+use plugin_host::{PluginStore, StaticPluginHost, ValidatedPluginPackage, WasmPlugin};
 
 const MAX_INSTALLATION_FILE_BYTES: usize = 1024 * 1024;
 
@@ -108,13 +108,15 @@ const fn enabled_by_default() -> bool {
 
 pub(crate) async fn load_plugins(
     plugins: &mut StaticPluginHost,
+    store: &PluginStore,
     installation_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let installations = installation_file.map_or_else(
         || Ok(PluginInstallations::default()),
         PluginInstallations::from_path,
     )?;
-    let include_help = register_bundled_plugins(plugins, installations.bundled).await?;
+    let (include_help, mut declared_instances) =
+        register_bundled_plugins(plugins, installations.bundled).await?;
     for installation in installations.wasm {
         if !installation.enabled {
             info!(
@@ -123,10 +125,15 @@ pub(crate) async fn load_plugins(
             );
             continue;
         }
+        if !declared_instances.insert(installation.instance_id.clone()) {
+            return Err(Box::new(PluginConfigError::DuplicateInstance(
+                installation.instance_id,
+            )));
+        }
         let package_path = installation.resolved_package(
             installation_file.expect("WASM declarations require an installation file"),
         );
-        let package = ValidatedPluginPackage::from_path(&package_path)?;
+        let package = load_validated_package(package_path.clone()).await?;
         let plugin_id = package.manifest().id.to_string();
         let package_sha256 = package.package_sha256().to_owned();
         let plugin = std::sync::Arc::new(WasmPlugin::from_package(package).await?);
@@ -146,10 +153,55 @@ pub(crate) async fn load_plugins(
             "loaded local WASM plugin"
         );
     }
+    let installation_store = store.clone();
+    let managed_installations =
+        tokio::task::spawn_blocking(move || installation_store.installations()).await??;
+    for installation in managed_installations {
+        if !installation.enabled {
+            continue;
+        }
+        if !declared_instances.insert(installation.instance_id.clone()) {
+            return Err(Box::new(PluginConfigError::DuplicateInstance(
+                installation.instance_id,
+            )));
+        }
+        let package_path = PathBuf::from(&installation.package_path);
+        let package = load_validated_package(package_path.clone()).await?;
+        if package.package_sha256() != installation.package_sha256 {
+            return Err(Box::new(PluginConfigError::PackageHashChanged {
+                path: package_path,
+                expected: installation.package_sha256,
+                actual: package.package_sha256().to_owned(),
+            }));
+        }
+        if package.manifest().id.as_str() != installation.plugin_id {
+            return Err(Box::new(PluginConfigError::PackageIdentityChanged {
+                instance_id: installation.instance_id,
+            }));
+        }
+        let plugin = std::sync::Arc::new(WasmPlugin::from_package(package).await?);
+        plugins
+            .register(
+                plugin,
+                installation.instance_id,
+                installation.config,
+                installation.granted_permissions.into_iter().collect(),
+            )
+            .await?;
+    }
     if include_help {
         register_help_plugin(plugins).await?;
     }
     Ok(())
+}
+
+async fn load_validated_package(
+    package_path: PathBuf,
+) -> Result<ValidatedPluginPackage, Box<dyn std::error::Error>> {
+    Ok(
+        tokio::task::spawn_blocking(move || ValidatedPluginPackage::from_path(&package_path))
+            .await??,
+    )
 }
 
 async fn register_help_plugin(
@@ -168,13 +220,14 @@ async fn register_help_plugin(
 async fn register_bundled_plugins(
     plugins: &mut StaticPluginHost,
     selected: Option<Vec<String>>,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<(bool, BTreeSet<String>), Box<dyn std::error::Error>> {
     let selected = selected.unwrap_or_else(|| {
         ["ping", "help", "echo", "counter"]
             .map(str::to_owned)
             .to_vec()
     });
     let mut seen = BTreeSet::new();
+    let mut instance_ids = BTreeSet::new();
     let mut include_help = false;
     for name in selected {
         if !seen.insert(name.clone()) {
@@ -182,6 +235,7 @@ async fn register_bundled_plugins(
         }
         if name == "help" {
             include_help = true;
+            instance_ids.insert("dev.bkm.help/default".to_owned());
             continue;
         }
         let (plugin, instance_id): (std::sync::Arc<dyn plugin_api::StaticPlugin>, &str) =
@@ -219,8 +273,9 @@ async fn register_bundled_plugins(
         plugins
             .register_trusted(plugin, instance_id, BTreeMap::new())
             .await?;
+        instance_ids.insert(instance_id.to_owned());
     }
-    Ok(include_help)
+    Ok((include_help, instance_ids))
 }
 
 #[derive(Debug, Error)]
@@ -229,6 +284,16 @@ enum PluginConfigError {
     UnknownBundled(String),
     #[error("bundled plugin `{0}` is listed more than once")]
     DuplicateBundled(String),
+    #[error("plugin instance `{0}` is declared by more than one installation source")]
+    DuplicateInstance(String),
+    #[error("installed plugin package `{path}` changed: expected SHA-256 {expected}, got {actual}")]
+    PackageHashChanged {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    #[error("installed plugin package identity changed for instance `{instance_id}`")]
+    PackageIdentityChanged { instance_id: String },
     #[error("failed to read plugin installation file `{path}`")]
     Read {
         path: PathBuf,
@@ -309,7 +374,7 @@ mod tests {
     #[tokio::test]
     async fn bundled_selection_can_replace_static_ping() {
         let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
-        let include_help = register_bundled_plugins(
+        let (include_help, instance_ids) = register_bundled_plugins(
             &mut plugins,
             Some(vec![
                 "help".to_owned(),
@@ -323,6 +388,7 @@ mod tests {
         .await
         .unwrap();
         assert!(include_help);
+        assert!(instance_ids.contains("dev.bkm.help/default"));
         register_help_plugin(&mut plugins).await.unwrap();
 
         assert!(plugins.instance_manifest("dev.bkm.ping/default").is_none());
@@ -378,8 +444,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
-        load_plugins(&mut plugins, Some(&installation_file))
+        let store = plugin_host::PluginStore::in_memory().unwrap();
+        let mut plugins = StaticPluginHost::new(store.clone());
+        load_plugins(&mut plugins, &store, Some(&installation_file))
             .await
             .unwrap();
 
@@ -391,6 +458,124 @@ mod tests {
                 .id
                 .to_string(),
             "dev.bkm.wasm-ping"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_instance_id_conflict_is_rejected_before_package_loading() {
+        let directory = TestDirectory::new();
+        let installation_file = directory.0.join("plugins.toml");
+        fs::write(
+            &installation_file,
+            r#"
+                bundled = ["help"]
+
+                [[wasm]]
+                package = "missing.bkm-plugin"
+                instance_id = "dev.bkm.help/default"
+            "#,
+        )
+        .unwrap();
+        let store = PluginStore::in_memory().unwrap();
+        let mut plugins = StaticPluginHost::new(store.clone());
+        let error = load_plugins(&mut plugins, &store, Some(&installation_file))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("more than one installation source")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_installation_rejects_package_hash_drift() {
+        let directory = TestDirectory::new();
+        let package_path = directory.0.join("wasm-ping.bkm-plugin");
+        let package = base64::engine::general_purpose::STANDARD
+            .decode(
+                include_str!("../test-support/wasm-plugins/ping/component.bkm-plugin.b64").trim(),
+            )
+            .unwrap();
+        fs::write(&package_path, package).unwrap();
+        let store = plugin_host::PluginStore::in_memory().unwrap();
+        store
+            .upsert_installation(&plugin_host::PluginInstallation {
+                plugin_id: "dev.bkm.wasm-ping".to_owned(),
+                metadata: plugin_api::PluginMetadata::single_locale(
+                    "en",
+                    "WASM Ping",
+                    "WASM ping fixture",
+                ),
+                instance_id: "dev.bkm.wasm-ping/default".to_owned(),
+                version: "0.1.0".to_owned(),
+                package_path: package_path.display().to_string(),
+                package_sha256: "changed".to_owned(),
+                source: "local".to_owned(),
+                trust_level: "local-wasm".to_owned(),
+                signature_status: "unsigned".to_owned(),
+                requested_permissions: vec!["message.reply".to_owned()],
+                granted_permissions: vec!["message.reply".to_owned()],
+                config: BTreeMap::new(),
+                enabled: true,
+                installed_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        let mut plugins = StaticPluginHost::new(store.clone());
+        let error = load_plugins(&mut plugins, &store, None).await.unwrap_err();
+        assert!(error.to_string().contains("changed"));
+    }
+
+    #[tokio::test]
+    async fn managed_installation_loads_from_sqlite_registry() {
+        let directory = TestDirectory::new();
+        let package_path = directory.0.join("wasm-ping.bkm-plugin");
+        let package = base64::engine::general_purpose::STANDARD
+            .decode(
+                include_str!("../test-support/wasm-plugins/ping/component.bkm-plugin.b64").trim(),
+            )
+            .unwrap();
+        fs::write(&package_path, package).unwrap();
+        let validated = ValidatedPluginPackage::from_path(&package_path).unwrap();
+        let store = plugin_host::PluginStore::in_memory().unwrap();
+        store
+            .upsert_installation(&plugin_host::PluginInstallation {
+                plugin_id: "dev.bkm.wasm-ping".to_owned(),
+                metadata: plugin_api::PluginMetadata::single_locale(
+                    "en",
+                    "WASM Ping",
+                    "WASM ping fixture",
+                ),
+                instance_id: "dev.bkm.wasm-ping/managed".to_owned(),
+                version: "0.1.0".to_owned(),
+                package_path: package_path.display().to_string(),
+                package_sha256: validated.package_sha256().to_owned(),
+                source: "local".to_owned(),
+                trust_level: "local-wasm".to_owned(),
+                signature_status: "unsigned".to_owned(),
+                requested_permissions: vec!["message.reply".to_owned()],
+                granted_permissions: vec!["message.reply".to_owned()],
+                config: BTreeMap::new(),
+                enabled: true,
+                installed_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        let installation_file = directory.0.join("plugins.toml");
+        fs::write(
+            &installation_file,
+            "bundled = [\"help\", \"echo\", \"counter\"]\n",
+        )
+        .unwrap();
+        let mut plugins = StaticPluginHost::new(store.clone());
+        load_plugins(&mut plugins, &store, Some(&installation_file))
+            .await
+            .unwrap();
+        assert!(
+            plugins
+                .instance_manifest("dev.bkm.wasm-ping/managed")
+                .is_some()
         );
     }
 }

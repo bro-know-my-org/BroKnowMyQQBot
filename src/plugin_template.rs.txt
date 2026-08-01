@@ -1,0 +1,75 @@
+wit_bindgen::generate!({
+    path: "wit",
+    world: "plugin",
+});
+
+use bkm::plugin::types::{
+    Command, CommandPayload, Disposition, EventEnvelope, EventPayload, HandlerOutput, HealthStatus,
+    InitContext, MessageReplyCommand, MigrationOutput, PluginError, StateEntry,
+};
+use exports::bkm::plugin::{handler::Guest as HandlerGuest, lifecycle::Guest as LifecycleGuest};
+
+struct __CLASS_NAME__;
+
+impl LifecycleGuest for __CLASS_NAME__ {
+    fn validate_config(_config: Vec<bkm::plugin::types::ConfigEntry>) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn init(_context: InitContext) -> Result<(), PluginError> {
+        Ok(())
+    }
+
+    fn health() -> Result<HealthStatus, PluginError> {
+        Ok(HealthStatus::Healthy)
+    }
+
+    fn migrate_state(
+        _from_version: u32,
+        _to_version: u32,
+        _state: Vec<StateEntry>,
+    ) -> Result<MigrationOutput, PluginError> {
+        Ok(MigrationOutput {
+            state_ops: Vec::new(),
+        })
+    }
+
+    fn shutdown() -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+impl HandlerGuest for __CLASS_NAME__ {
+    fn on_event(event: EventEnvelope) -> Result<HandlerOutput, PluginError> {
+        let EventPayload::MessageCreated(message) = event.payload else {
+            return Ok(ignored());
+        };
+        if message.text.trim() != "/__COMMAND__" {
+            return Ok(ignored());
+        }
+        Ok(HandlerOutput {
+            disposition: Disposition::Continue,
+            state_ops: Vec::new(),
+            commands: vec![Command {
+                command_id: "reply".to_owned(),
+                idempotency_key: Some(format!("{}/reply", event.event_id)),
+                deadline_ms: Some(10_000),
+                payload: CommandPayload::MessageReply(MessageReplyCommand {
+                    content: "Hello from __CLASS_NAME__!".to_owned(),
+                }),
+            }],
+            diagnostics: Vec::new(),
+        })
+    }
+}
+
+fn ignored() -> HandlerOutput {
+    HandlerOutput {
+        disposition: Disposition::Ignore,
+        state_ops: Vec::new(),
+        commands: Vec::new(),
+        diagnostics: Vec::new(),
+    }
+}
+
+export!(__CLASS_NAME__);

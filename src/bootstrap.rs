@@ -77,10 +77,12 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = plugin_db.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut plugins =
-        StaticPluginHost::new(PluginStore::open(plugin_db)?).with_adapter(adapter.clone());
+    let plugin_store = PluginStore::open(plugin_db)?;
+    let mut plugins = StaticPluginHost::new(plugin_store.clone()).with_adapter(adapter.clone());
     let installation_file = config.plugins.installations.clone();
-    if let Err(error) = load_plugins(&mut plugins, installation_file.as_deref()).await {
+    if let Err(error) =
+        load_plugins(&mut plugins, &plugin_store, installation_file.as_deref()).await
+    {
         if let Err(shutdown_error) = plugins.shutdown().await {
             warn!(%shutdown_error, "plugin shutdown failed after plugin loading failure");
         }
@@ -201,7 +203,7 @@ fn required_env(name: &'static str) -> Result<String, AppError> {
 
 fn configured_credentials() -> Result<(String, String), AppError> {
     Ok((
-        required_env("BKM_QQ_OFFICIAL_APP_ID")?,
-        required_env("BKM_QQ_OFFICIAL_APP_SECRET")?,
+        required_env("BKMQB_QQ_OFFICIAL_APP_ID")?,
+        required_env("BKMQB_QQ_OFFICIAL_APP_SECRET")?,
     ))
 }
