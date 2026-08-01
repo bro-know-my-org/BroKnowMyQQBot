@@ -26,10 +26,15 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 const DEFAULT_MANIFEST: &str = r#"
 manifest_version = 1
 id = "dev.bkm.wasm-faults"
-name = "WASM Faults"
 version = "0.1.0"
 protocol = ">=1.0,<2.0"
 entry = "component.wasm"
+
+[metadata]
+default_locale = "en"
+
+[metadata.locales.en]
+name = "WASM Faults"
 
 [runtime]
 mode = "serial"
@@ -56,10 +61,15 @@ stop_propagation = false
 const TIMEOUT_MANIFEST: &str = r#"
 manifest_version = 1
 id = "dev.bkm.wasm-timeout"
-name = "WASM Timeout"
 version = "0.1.0"
 protocol = ">=1.0,<2.0"
 entry = "component.wasm"
+
+[metadata]
+default_locale = "en"
+
+[metadata.locales.en]
+name = "WASM Timeout"
 
 [runtime]
 mode = "serial"

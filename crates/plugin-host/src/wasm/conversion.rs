@@ -224,10 +224,6 @@ pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, P
                     .map_err(|error| PluginError::Permanent(error.to_string()))?,
             )
         }
-        types::CommandPayload::Opaque(opaque) => {
-            let payload = decode_json(&opaque.payload)?;
-            (opaque.kind, payload)
-        }
     };
     Ok(PluginCommand {
         command_id: command.command_id,

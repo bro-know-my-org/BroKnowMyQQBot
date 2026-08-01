@@ -1,0 +1,21 @@
+{
+  "disposition": "continue",
+  "state_ops": [
+    {
+      "operation": "put",
+      "key": "processed/fixture-event-1",
+      "value": [49],
+      "expected_revision": null
+    }
+  ],
+  "commands": [
+    {
+      "command_id": "reply",
+      "kind": "message.reply",
+      "idempotency_key": "fixture-event-1/reply",
+      "deadline_ms": 10000,
+      "payload": { "content": "fixture response" }
+    }
+  ],
+  "diagnostics": []
+}

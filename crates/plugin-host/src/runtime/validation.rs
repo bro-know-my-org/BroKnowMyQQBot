@@ -3,8 +3,7 @@
 use super::{
     Arc, BTreeMap, BTreeSet, Context, Disposition, Event, ExtensionPayload, HandlerOutput, HashSet,
     MAX_COMMANDS, MAX_CONFIG_SCHEMA_BYTES, MAX_EVENT_EXTENSION_BYTES, MAX_OUTPUT_BYTES,
-    MAX_STATE_OPS, PluginHostError, PluginManifest, RegisteredPlugin, StaticPlugin,
-    StoragePermission, Value,
+    MAX_STATE_OPS, PluginHostError, PluginManifest, RegisteredPlugin, StaticPlugin, Value,
 };
 
 pub(super) fn event_extensions(
@@ -211,6 +210,19 @@ pub(super) fn validate_output(
     }
     let mut command_ids = HashSet::new();
     for command in &output.commands {
+        if !matches!(
+            command.kind.as_str(),
+            "message.reply"
+                | "message.send"
+                | "http.request"
+                | "schedule.create"
+                | "schedule.cancel"
+        ) {
+            return Err(invalid(format!(
+                "command kind `{}` is not part of the BPP 1.0 baseline",
+                command.kind
+            )));
+        }
         if command.command_id.is_empty()
             || command.command_id.len() > 128
             || !command_ids.insert(&command.command_id)
@@ -246,35 +258,7 @@ pub(super) fn validate_output(
     Ok(())
 }
 pub(super) fn requested_capabilities(manifest: &PluginManifest) -> BTreeSet<String> {
-    let mut capabilities = manifest.permissions.actions.clone();
-    if !manifest.permissions.http.is_empty() {
-        capabilities.insert("http.request".to_owned());
-        capabilities.extend(
-            manifest
-                .permissions
-                .http
-                .iter()
-                .map(plugin_api::HttpPermission::capability),
-        );
-    }
-    if manifest.permissions.storage == StoragePermission::Private {
-        capabilities.insert("storage.private".to_owned());
-    }
-    if manifest.permissions.stop_propagation {
-        capabilities.insert("event.stop_propagation".to_owned());
-    }
-    if manifest.permissions.scheduler {
-        capabilities.insert("schedule.create".to_owned());
-        capabilities.insert("schedule.cancel".to_owned());
-    }
-    capabilities.extend(
-        manifest
-            .permissions
-            .event_extensions
-            .iter()
-            .map(|extension| format!("event.extension.{extension}")),
-    );
-    capabilities
+    manifest.requested_capabilities()
 }
 
 pub(super) const fn event_type(event: &Event) -> &'static str {

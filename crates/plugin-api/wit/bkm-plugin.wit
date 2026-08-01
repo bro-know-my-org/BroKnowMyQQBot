@@ -184,18 +184,12 @@ interface types {
         task-id: string,
     }
 
-    record opaque-command {
-        kind: string,
-        payload: encoded-value,
-    }
-
     variant command-payload {
         message-reply(message-reply-command),
         message-send(message-send-command),
         http-request(http-request-command),
         schedule-create(schedule-create-command),
         schedule-cancel(schedule-cancel-command),
-        opaque(opaque-command),
     }
 
     record command {

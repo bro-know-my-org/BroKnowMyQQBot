@@ -26,7 +26,7 @@ use plugin_api::{
     ActionCompleted, ActionStatus, BPP_VERSION, CommandDeclaration, Disposition, ExtensionPayload,
     HandlerOutput, HealthStatus, HostQueries, HttpRequest, InitContext, PluginCommand, PluginError,
     PluginEventEnvelope, PluginManifest, RuntimeMode, ScheduleCancel, ScheduleCreate,
-    ScheduleTriggered, StateOp, StateValue, StaticPlugin, StoragePermission,
+    ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -39,8 +39,8 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    HttpExecutionError, HttpExecutor, PluginStore, SecureHttpExecutor, StoreError,
-    storage::{OutboxOrigin, PendingCommand, ScheduledTask},
+    CommitOptions, HttpExecutionError, HttpExecutor, PluginStore, SecureHttpExecutor, StoreError,
+    storage::{DeliveryFailurePolicy, OutboxOrigin, PendingCommand, ScheduledTask},
 };
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -52,6 +52,10 @@ const MAX_CONFIG_SCHEMA_BYTES: usize = 256 * 1024;
 const MAX_EVENT_EXTENSION_BYTES: usize = 256 * 1024;
 const MAX_STATE_SCAN_ENTRIES: usize = 1024;
 const MAX_COMMAND_DEADLINE_MS: u64 = 30_000;
+const MAX_DELIVERY_ATTEMPTS: u32 = 3;
+const CIRCUIT_BREAKER_FAILURES: u32 = 3;
+const DELIVERY_RETRY_BASE_MS: u64 = 25;
+const ACTION_COMPLETION_DEPTH_NAMESPACE: &str = "dev.bkm.host/action-completion-depth";
 
 #[derive(Debug, Error)]
 pub enum PluginHostError {
@@ -69,6 +73,8 @@ pub enum PluginHostError {
     Init { plugin_id: String, message: String },
     #[error("plugin `{plugin_id}` invocation failed: {message}")]
     Invocation { plugin_id: String, message: String },
+    #[error("plugin `{plugin_id}` invocation failed transiently: {message}")]
+    TransientInvocation { plugin_id: String, message: String },
     #[error("plugin `{plugin_id}` guest trapped: {message}")]
     GuestTrap { plugin_id: String, message: String },
     #[error("plugin `{plugin_id}` exhausted a resource and trapped: {message}")]
@@ -191,10 +197,20 @@ impl StaticPluginHost {
                 generation: 0,
             }),
         });
-        supervised_init(&registered, config).await?;
-        registered.set_state(PluginInstanceState::Ready)?;
-        self.recover_pending_commands(&registered).await?;
-        self.recover_plugin_schedules(&registered)?;
+        if self.store.circuit_open(&registered.instance_id)? {
+            registered.set_state(PluginInstanceState::Disabled)?;
+            warn!(
+                plugin_id = %registered.manifest.id,
+                instance_id = registered.instance_id,
+                "registered plugin with an open persistent circuit"
+            );
+        } else {
+            supervised_init(&registered, config).await?;
+            registered.set_state(PluginInstanceState::Ready)?;
+            self.recover_pending_commands(&registered)?;
+            self.recover_pending_deliveries(&registered).await?;
+            self.recover_plugin_schedules(&registered)?;
+        }
         self.instances.insert(registered.instance_id.clone());
         for command in &registered.manifest.commands {
             self.command_names.insert(command.name.clone());
@@ -399,8 +415,7 @@ impl StaticPluginHost {
                     &format!("migration-{}", Uuid::new_v4()),
                     &operations,
                     &[],
-                    candidate.manifest.permissions.storage_quota_bytes,
-                    None,
+                    CommitOptions::new(candidate.manifest.permissions.storage_quota_bytes),
                 )?;
             }
             supervised_init(&candidate, config).await?;
@@ -472,93 +487,428 @@ impl StaticPluginHost {
         plugins.sort_by_key(|(priority, plugin)| (*priority, plugin.manifest.id.clone()));
 
         for (_, plugin) in plugins {
-            let Some(generation) = plugin.ready_generation()? else {
-                continue;
-            };
-            let _execution = plugin
-                .execution
-                .acquire(event_partition_key(event, context.event_id().as_str()))
-                .await?;
-            if !plugin.is_ready_generation(generation)? {
-                warn!(plugin_id = %plugin.manifest.id, "plugin lifecycle changed while invocation was queued");
-                continue;
-            }
             let result = async {
-                let (invocation_id, output) =
-                    self.invoke(plugin, &context, event, event_type).await?;
-                let stop = output.disposition == Disposition::Stop;
-                let completions = self
-                    .commit_and_execute(
-                        plugin,
-                        ExecutionOrigin::Event(&context),
-                        context.event_id().as_str(),
-                        &invocation_id,
-                        output,
-                    )
+                let Some(generation) = plugin.ready_generation()? else {
+                    return Ok(None);
+                };
+                let _execution = plugin
+                    .execution
+                    .acquire(event_partition_key(event, context.event_id().as_str()))
                     .await?;
-                self.deliver_action_completions(
-                    plugin,
-                    ExecutionOrigin::Event(&context),
-                    completions,
-                )
-                .await?;
-                Ok::<bool, PluginHostError>(stop)
+                if !plugin.is_ready_generation(generation)? {
+                    warn!(plugin_id = %plugin.manifest.id, "plugin lifecycle changed while invocation was queued");
+                    return Ok(None);
+                }
+                let envelope = Self::event_envelope(&context, event, event_type)?;
+                self.deliver_with_retry(plugin, ExecutionOrigin::Event(&context), envelope)
+                    .await
+                    .map(Some)
             }
             .await;
-            let stop = match result {
-                Ok(stop) => stop,
-                Err(error) => {
-                    if matches!(
-                        error,
-                        PluginHostError::GuestTrap { .. }
-                            | PluginHostError::ResourceExhaustedTrap { .. }
-                    ) {
-                        plugin.set_state(PluginInstanceState::Disabled)?;
-                    }
-                    error!(
-                        plugin_id = %plugin.manifest.id,
-                        instance_id = plugin.instance_id,
-                        error = %error,
-                        "isolated plugin failure"
-                    );
-                    false
-                }
-            };
-            if stop {
-                break;
+            match result {
+                Ok(Some(true)) => break,
+                Ok(Some(false) | None) => {}
+                Err(error) => error!(
+                    plugin_id = %plugin.manifest.id,
+                    instance_id = plugin.instance_id,
+                    error = %error,
+                    "isolated plugin host delivery failure"
+                ),
             }
         }
         Ok(())
     }
 
-    async fn invoke(
-        &self,
-        plugin: &RegisteredPlugin,
+    fn event_envelope(
         context: &Context,
         event: &Event,
         event_type: &str,
-    ) -> Result<(String, HandlerOutput), PluginHostError> {
+    ) -> Result<PluginEventEnvelope, PluginHostError> {
         let invocation_id = Uuid::new_v4().to_string();
         let now = now_ms();
-        let extensions = event_extensions(plugin, context)?;
-        let envelope = PluginEventEnvelope {
+        Ok(PluginEventEnvelope {
             protocol_version: BPP_VERSION.to_owned(),
             event_id: context.event_id().to_string(),
             delivery_id: Uuid::new_v4().to_string(),
-            invocation_id: invocation_id.clone(),
+            invocation_id,
             occurred_at_ms: context.occurred_at_ms(),
             received_at_ms: now,
             adapter_id: context.adapter_id().to_string(),
             event_type: event_type.to_owned(),
             trace_id: None,
             payload: serde_json::to_value(event).map_err(|error| PluginHostError::Invocation {
-                plugin_id: plugin.manifest.id.to_string(),
+                plugin_id: "event-envelope".to_owned(),
                 message: error.to_string(),
             })?,
-            extensions,
-        };
-        let output = self.invoke_envelope(plugin, &envelope).await?;
-        Ok((invocation_id, output))
+            extensions: Vec::new(),
+        })
+    }
+
+    async fn deliver_with_retry(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        origin: ExecutionOrigin<'_>,
+        envelope: PluginEventEnvelope,
+    ) -> Result<bool, PluginHostError> {
+        let (stop, completions) = self
+            .deliver_single_with_retry(plugin, origin, envelope)
+            .await?;
+        if let Err(error) = self
+            .deliver_action_completions(plugin, origin, completions)
+            .await
+        {
+            error!(
+                plugin_id = %plugin.manifest.id,
+                instance_id = plugin.instance_id,
+                error = %error,
+                "action-completion delivery will be recovered later"
+            );
+        }
+        Ok(stop)
+    }
+
+    async fn deliver_action_completions(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        origin: ExecutionOrigin<'_>,
+        completions: VecDeque<PluginEventEnvelope>,
+    ) -> Result<(), PluginHostError> {
+        let mut queue = completions;
+        while let Some(envelope) = queue.pop_front() {
+            let (_, nested) = self
+                .deliver_single_with_retry(plugin, origin, envelope)
+                .await?;
+            queue.extend(nested);
+            if plugin.state()? == PluginInstanceState::Disabled {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn deliver_single_with_retry(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        origin: ExecutionOrigin<'_>,
+        mut envelope: PluginEventEnvelope,
+    ) -> Result<(bool, VecDeque<PluginEventEnvelope>), PluginHostError> {
+        if self.store.circuit_open(&plugin.instance_id)? {
+            plugin.set_state(PluginInstanceState::Disabled)?;
+            return Ok((false, VecDeque::new()));
+        }
+        loop {
+            envelope.delivery_id = Uuid::new_v4().to_string();
+            envelope.invocation_id = Uuid::new_v4().to_string();
+            if let ExecutionOrigin::Event(context) = origin
+                && envelope.event_type != "action.completed"
+            {
+                envelope.extensions = event_extensions(plugin, context)?;
+            }
+            let outbox_origin = origin.outbox_origin(&envelope.event_id);
+            if self.reject_excessive_action_completion(plugin, &envelope, &outbox_origin)? {
+                return Ok((false, VecDeque::new()));
+            }
+            let Some(delivery) = self.store.begin_delivery(
+                &plugin.instance_id,
+                &envelope,
+                &outbox_origin,
+                now_ms(),
+            )?
+            else {
+                return Ok((false, VecDeque::new()));
+            };
+            let result = async {
+                let output = self.invoke_envelope(plugin, &envelope).await?;
+                let stop = output.disposition == Disposition::Stop;
+                let completions = self
+                    .commit_and_execute(
+                        plugin,
+                        origin,
+                        &envelope.event_id,
+                        &envelope.delivery_id,
+                        &envelope.invocation_id,
+                        output,
+                    )
+                    .await?;
+                Ok::<_, PluginHostError>((stop, completions))
+            }
+            .await;
+            match result {
+                Ok((stop, completions)) => {
+                    let completion_envelopes = Self::prepare_action_completion_envelopes(
+                        plugin,
+                        origin,
+                        completions,
+                        action_completion_depth(&envelope),
+                    )?;
+                    let completed_at_ms = now_ms();
+                    for completion in &completion_envelopes {
+                        self.store.enqueue_delivery(
+                            &plugin.instance_id,
+                            completion,
+                            &origin.outbox_origin(&completion.event_id),
+                            completed_at_ms,
+                        )?;
+                    }
+                    if !self.store.mark_delivery_succeeded(
+                        &plugin.instance_id,
+                        &envelope.event_id,
+                        &envelope.delivery_id,
+                        completed_at_ms,
+                    )? {
+                        return Ok((false, VecDeque::new()));
+                    }
+                    return Ok((stop, completion_envelopes));
+                }
+                Err(error) => {
+                    let Some(delay_ms) =
+                        self.record_delivery_failure(plugin, &envelope, delivery.attempt, &error)?
+                    else {
+                        let recovered =
+                            self.recover_committed_delivery(plugin, origin, &envelope)?;
+                        return Ok((false, recovered));
+                    };
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        }
+    }
+
+    fn reject_excessive_action_completion(
+        &self,
+        plugin: &RegisteredPlugin,
+        envelope: &PluginEventEnvelope,
+        outbox_origin: &OutboxOrigin,
+    ) -> Result<bool, PluginHostError> {
+        if envelope.event_type != "action.completed"
+            || action_completion_depth(envelope) <= MAX_ACTION_COMPLETION_CHAIN
+        {
+            return Ok(false);
+        }
+        let now = now_ms();
+        if let Some(delivery) =
+            self.store
+                .begin_delivery(&plugin.instance_id, envelope, outbox_origin, now)?
+        {
+            self.store.mark_delivery_failed(
+                &plugin.instance_id,
+                &envelope.event_id,
+                &envelope.delivery_id,
+                "action completion chain exceeded limit",
+                DeliveryFailurePolicy {
+                    next_attempt_ms: now,
+                    max_attempts: delivery.attempt,
+                    circuit_threshold: 1,
+                    counts_toward_circuit: true,
+                    now_ms: now,
+                },
+            )?;
+        }
+        error!(
+            plugin_id = %plugin.manifest.id,
+            instance_id = plugin.instance_id,
+            "disabled plugin after action completion chain exceeded limit"
+        );
+        plugin.set_state(PluginInstanceState::Disabled)?;
+        Ok(true)
+    }
+
+    fn record_delivery_failure(
+        &self,
+        plugin: &RegisteredPlugin,
+        envelope: &PluginEventEnvelope,
+        attempt: u32,
+        error: &PluginHostError,
+    ) -> Result<Option<u64>, PluginHostError> {
+        let retryable = delivery_error_retryable(error);
+        let delay_ms = delivery_retry_delay_ms(attempt);
+        let max_attempts = if retryable { MAX_DELIVERY_ATTEMPTS } else { 1 };
+        let fatal_trap = matches!(
+            error,
+            PluginHostError::GuestTrap { .. } | PluginHostError::ResourceExhaustedTrap { .. }
+        );
+        let failure_time = now_ms();
+        let failure = self.store.mark_delivery_failed(
+            &plugin.instance_id,
+            &envelope.event_id,
+            &envelope.delivery_id,
+            &error.to_string(),
+            DeliveryFailurePolicy {
+                next_attempt_ms: failure_time
+                    .saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX)),
+                max_attempts,
+                circuit_threshold: if fatal_trap {
+                    1
+                } else if retryable {
+                    CIRCUIT_BREAKER_FAILURES
+                } else {
+                    u32::MAX
+                },
+                counts_toward_circuit: fatal_trap || retryable,
+                now_ms: failure_time,
+            },
+        )?;
+        if !failure.updated {
+            return Ok(None);
+        }
+        let dead_letter = failure.dead_letter;
+        let circuit_open = failure.circuit_open;
+        error!(
+            plugin_id = %plugin.manifest.id,
+            instance_id = plugin.instance_id,
+            event_id = envelope.event_id,
+            attempt,
+            dead_letter,
+            circuit_open,
+            error = %error,
+            "isolated plugin delivery failure"
+        );
+        if fatal_trap || circuit_open {
+            plugin.set_state(PluginInstanceState::Disabled)?;
+        }
+        Ok((!dead_letter && !circuit_open && retryable).then_some(delay_ms))
+    }
+
+    fn prepare_action_completion_envelopes(
+        plugin: &RegisteredPlugin,
+        origin: ExecutionOrigin<'_>,
+        completions: VecDeque<ActionCompleted>,
+        parent_depth: usize,
+    ) -> Result<VecDeque<PluginEventEnvelope>, PluginHostError> {
+        if plugin.priority_for("action.completed", None).is_none() {
+            return Ok(VecDeque::new());
+        }
+        completions
+            .into_iter()
+            .map(|completion| {
+                Self::action_completion_envelope(origin, completion, parent_depth.saturating_add(1))
+            })
+            .collect()
+    }
+
+    fn recover_committed_delivery(
+        &self,
+        plugin: &RegisteredPlugin,
+        origin: ExecutionOrigin<'_>,
+        envelope: &PluginEventEnvelope,
+    ) -> Result<VecDeque<PluginEventEnvelope>, PluginHostError> {
+        for pending in self
+            .store
+            .pending_commands(&plugin.instance_id)?
+            .into_iter()
+            .filter(|pending| pending.invocation_id == envelope.invocation_id)
+        {
+            let completion = interrupted_completion(&pending);
+            let persisted =
+                serde_json::to_value(&completion).map_err(|error| PluginHostError::Invocation {
+                    plugin_id: plugin.manifest.id.to_string(),
+                    message: error.to_string(),
+                })?;
+            self.store.mark_command(
+                &pending.instance_id,
+                &pending.invocation_id,
+                &pending.command.command_id,
+                action_status_name(completion.status),
+                &persisted,
+            )?;
+        }
+        let mut recovered = VecDeque::new();
+        for (_, completion, _) in self
+            .store
+            .committed_command_results(&plugin.instance_id)?
+            .into_iter()
+            .filter(|(pending, _, _)| pending.invocation_id == envelope.invocation_id)
+        {
+            let completions = Self::prepare_action_completion_envelopes(
+                plugin,
+                origin,
+                VecDeque::from([completion]),
+                action_completion_depth(envelope),
+            )?;
+            for completion in &completions {
+                self.store.enqueue_delivery(
+                    &plugin.instance_id,
+                    completion,
+                    &origin.outbox_origin(&completion.event_id),
+                    now_ms(),
+                )?;
+            }
+            recovered.extend(completions);
+        }
+        self.store.finalize_committed_delivery(
+            &plugin.instance_id,
+            &envelope.event_id,
+            now_ms(),
+        )?;
+        Ok(recovered)
+    }
+
+    fn action_completion_envelope(
+        origin: ExecutionOrigin<'_>,
+        completion: ActionCompleted,
+        depth: usize,
+    ) -> Result<PluginEventEnvelope, PluginHostError> {
+        let event_id = format!(
+            "action/{}/{}",
+            completion.source_invocation_id, completion.command_id
+        );
+        let now = now_ms();
+        Ok(PluginEventEnvelope {
+            protocol_version: BPP_VERSION.to_owned(),
+            event_id,
+            delivery_id: Uuid::new_v4().to_string(),
+            invocation_id: Uuid::new_v4().to_string(),
+            occurred_at_ms: Some(now),
+            received_at_ms: now,
+            adapter_id: origin.adapter_id().to_owned(),
+            event_type: "action.completed".to_owned(),
+            trace_id: None,
+            payload: serde_json::to_value(completion).map_err(|error| {
+                PluginHostError::Invocation {
+                    plugin_id: "action-completed".to_owned(),
+                    message: error.to_string(),
+                }
+            })?,
+            extensions: vec![ExtensionPayload {
+                namespace: ACTION_COMPLETION_DEPTH_NAMESPACE.to_owned(),
+                schema_version: "1.0.0".to_owned(),
+                content_type: "text/plain".to_owned(),
+                data: depth.to_string().into_bytes(),
+            }],
+        })
+    }
+
+    async fn recover_pending_deliveries(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+    ) -> Result<(), PluginHostError> {
+        self.store
+            .requeue_running_deliveries(&plugin.instance_id, now_ms())?;
+        let mut pending = self
+            .store
+            .pending_deliveries(&plugin.instance_id, i64::MAX)?;
+        pending.sort_by_key(|delivery| (delivery.next_attempt_ms, delivery.event_id.clone()));
+        for pending in pending {
+            let recovery_wait_ms = u64::try_from(pending.next_attempt_ms.saturating_sub(now_ms()))
+                .unwrap_or_default()
+                .min(delivery_retry_delay_ms(pending.attempt.max(1)));
+            if recovery_wait_ms > 0 {
+                sleep(Duration::from_millis(recovery_wait_ms)).await;
+            }
+            let mut envelope = pending.envelope;
+            envelope.delivery_id = Uuid::new_v4().to_string();
+            envelope.invocation_id = Uuid::new_v4().to_string();
+            self.deliver_with_retry(
+                plugin,
+                ExecutionOrigin::Recovered(&pending.origin),
+                envelope,
+            )
+            .await?;
+            if plugin.state()? == PluginInstanceState::Disabled {
+                break;
+            }
+        }
+        Ok(())
     }
 
     async fn invoke_envelope(
@@ -595,6 +945,10 @@ impl StaticPluginHost {
                         message,
                     }
                 }
+                PluginError::Transient(message) => PluginHostError::TransientInvocation {
+                    plugin_id: plugin.manifest.id.to_string(),
+                    message,
+                },
                 error => PluginHostError::Invocation {
                     plugin_id: plugin.manifest.id.to_string(),
                     message: error.to_string(),
@@ -609,6 +963,7 @@ impl StaticPluginHost {
         plugin: &Arc<RegisteredPlugin>,
         origin: ExecutionOrigin<'_>,
         source_event_id: &str,
+        delivery_id: &str,
         invocation_id: &str,
         output: HandlerOutput,
     ) -> Result<VecDeque<ActionCompleted>, PluginHostError> {
@@ -621,13 +976,15 @@ impl StaticPluginHost {
                 "plugin diagnostic"
             );
         }
+        let outbox_origin = origin.outbox_origin(source_event_id);
         let commands = self.store.commit(
             &plugin.instance_id,
             invocation_id,
             &output.state_ops,
             &output.commands,
-            plugin.manifest.permissions.storage_quota_bytes,
-            Some(&origin.outbox_origin(source_event_id)),
+            CommitOptions::new(plugin.manifest.permissions.storage_quota_bytes)
+                .with_origin(&outbox_origin)
+                .with_delivery(source_event_id, delivery_id),
         )?;
         let mut completions = VecDeque::new();
         for command in commands {
@@ -720,57 +1077,6 @@ impl StaticPluginHost {
         Ok(completion)
     }
 
-    async fn deliver_action_completions(
-        &self,
-        plugin: &Arc<RegisteredPlugin>,
-        origin: ExecutionOrigin<'_>,
-        mut completions: VecDeque<ActionCompleted>,
-    ) -> Result<(), PluginHostError> {
-        if plugin.priority_for("action.completed", None).is_none() {
-            return Ok(());
-        }
-        let mut delivered = 0_usize;
-        while let Some(completion) = completions.pop_front() {
-            delivered += 1;
-            if delivered > MAX_ACTION_COMPLETION_CHAIN {
-                return Err(PluginHostError::InvalidOutput {
-                    plugin_id: plugin.manifest.id.to_string(),
-                    message: "action completion chain exceeds limit".to_owned(),
-                });
-            }
-            let invocation_id = Uuid::new_v4().to_string();
-            let event_id = format!(
-                "action/{}/{}",
-                completion.source_invocation_id, completion.command_id
-            );
-            let now = now_ms();
-            let envelope = PluginEventEnvelope {
-                protocol_version: BPP_VERSION.to_owned(),
-                event_id: event_id.clone(),
-                delivery_id: Uuid::new_v4().to_string(),
-                invocation_id: invocation_id.clone(),
-                occurred_at_ms: Some(now),
-                received_at_ms: now,
-                adapter_id: origin.adapter_id().to_owned(),
-                event_type: "action.completed".to_owned(),
-                trace_id: None,
-                payload: serde_json::to_value(completion).map_err(|error| {
-                    PluginHostError::Invocation {
-                        plugin_id: plugin.manifest.id.to_string(),
-                        message: error.to_string(),
-                    }
-                })?,
-                extensions: Vec::new(),
-            };
-            let output = self.invoke_envelope(plugin, &envelope).await?;
-            let nested = self
-                .commit_and_execute(plugin, origin, &event_id, &invocation_id, output)
-                .await?;
-            completions.extend(nested);
-        }
-        Ok(())
-    }
-
     fn execute_schedule_command(
         &self,
         plugin: &Arc<RegisteredPlugin>,
@@ -836,13 +1142,12 @@ impl StaticPluginHost {
         Ok(())
     }
 
-    async fn recover_pending_commands(
+    fn recover_pending_commands(
         &self,
         plugin: &Arc<RegisteredPlugin>,
     ) -> Result<(), PluginHostError> {
         for pending in self.store.pending_commands(&plugin.instance_id)? {
             let completion = interrupted_completion(&pending);
-            let origin = ExecutionOrigin::Recovered(&pending.origin);
             let persisted =
                 serde_json::to_value(&completion).map_err(|error| PluginHostError::Invocation {
                     plugin_id: plugin.manifest.id.to_string(),
@@ -855,9 +1160,28 @@ impl StaticPluginHost {
                 action_status_name(completion.status),
                 &persisted,
             )?;
-            self.deliver_action_completions(plugin, origin, VecDeque::from([completion]))
-                .await?;
         }
+        for (pending, completion, parent_envelope) in
+            self.store.committed_command_results(&plugin.instance_id)?
+        {
+            let origin = ExecutionOrigin::Recovered(&pending.origin);
+            let completions = Self::prepare_action_completion_envelopes(
+                plugin,
+                origin,
+                VecDeque::from([completion]),
+                action_completion_depth(&parent_envelope),
+            )?;
+            for envelope in &completions {
+                self.store.enqueue_delivery(
+                    &plugin.instance_id,
+                    envelope,
+                    &origin.outbox_origin(&envelope.event_id),
+                    now_ms(),
+                )?;
+            }
+        }
+        self.store
+            .finalize_committed_deliveries(&plugin.instance_id, now_ms())?;
         Ok(())
     }
 
@@ -941,14 +1265,13 @@ impl StaticPluginHost {
                     .to_owned(),
             });
         }
-        let invocation_id = Uuid::new_v4().to_string();
         let event_id = format!("schedule/{}/{}", task.instance_id, task.task_id);
         let now = now_ms();
         let envelope = PluginEventEnvelope {
             protocol_version: BPP_VERSION.to_owned(),
             event_id: event_id.clone(),
             delivery_id: Uuid::new_v4().to_string(),
-            invocation_id: invocation_id.clone(),
+            invocation_id: Uuid::new_v4().to_string(),
             occurred_at_ms: Some(task.run_at_ms),
             received_at_ms: now,
             adapter_id: task.adapter_id.clone(),
@@ -965,15 +1288,12 @@ impl StaticPluginHost {
             })?,
             extensions: Vec::new(),
         };
-        let output = self.invoke_envelope(plugin, &envelope).await?;
         let origin = ExecutionOrigin::Scheduled {
             adapter_id: &task.adapter_id,
         };
-        let completions = self
-            .commit_and_execute(plugin, origin, &event_id, &invocation_id, output)
-            .await?;
-        self.deliver_action_completions(plugin, origin, completions)
+        self.deliver_with_retry(plugin, origin, envelope)
             .await
+            .map(|_| ())
     }
 
     fn abort_schedule(&self, instance_id: &str, task_id: &str) -> Result<(), PluginError> {
@@ -1489,6 +1809,30 @@ async fn supervised_health(plugin: &RegisteredPlugin) -> Result<(), PluginHostEr
     }
 }
 
+const fn delivery_error_retryable(error: &PluginHostError) -> bool {
+    matches!(
+        error,
+        PluginHostError::TransientInvocation { .. }
+            | PluginHostError::Timeout { .. }
+            | PluginHostError::Panic { .. }
+    )
+}
+
+fn action_completion_depth(envelope: &PluginEventEnvelope) -> usize {
+    envelope
+        .extensions
+        .iter()
+        .find(|extension| extension.namespace == ACTION_COMPLETION_DEPTH_NAMESPACE)
+        .and_then(|extension| std::str::from_utf8(&extension.data).ok())
+        .and_then(|depth| depth.parse().ok())
+        .unwrap_or(0)
+}
+
+fn delivery_retry_delay_ms(attempt: u32) -> u64 {
+    let exponent = attempt.saturating_sub(1).min(10);
+    DELIVERY_RETRY_BASE_MS.saturating_mul(1_u64 << exponent)
+}
+
 fn now_ms() -> i64 {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1503,22 +1847,48 @@ mod tests {
         sync::{Arc, Mutex as StdMutex},
     };
 
+    use bot_core::MessageTarget;
     use builtin_plugins::PingPlugin;
     use plugin_api::{
-        Disposition, HandlerOutput, HostQueries, PluginCommand, PluginError, PluginEventEnvelope,
-        PluginManifest, StaticPlugin,
+        Disposition, ExtensionPayload, HandlerOutput, HostQueries, PluginCommand, PluginError,
+        PluginEventEnvelope, PluginManifest, StaticPlugin,
     };
     use serde_json::{Value, json};
 
+    use crate::{CommitOptions, OutboxOrigin, PluginStore};
+
     use super::{
-        InvocationGate, LifecycleState, PluginHostError, RegisteredPlugin, validate_config_schema,
-        validate_output, validation::redact_sensitive_fields,
+        ACTION_COMPLETION_DEPTH_NAMESPACE, InvocationGate, LifecycleState, PluginHostError,
+        RegisteredPlugin, StaticPluginHost, validate_config_schema, validate_output,
+        validation::redact_sensitive_fields,
     };
 
     #[derive(Debug)]
     struct SchemaPlugin {
         manifest: PluginManifest,
         schema: Value,
+    }
+
+    #[derive(Debug)]
+    struct CompletionRecoveryPlugin {
+        manifest: PluginManifest,
+        events: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl StaticPlugin for CompletionRecoveryPlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        async fn on_event(
+            &self,
+            event: &PluginEventEnvelope,
+            _queries: &dyn HostQueries,
+        ) -> Result<HandlerOutput, PluginError> {
+            self.events.lock().unwrap().push(event.event_type.clone());
+            Ok(HandlerOutput::default())
+        }
     }
 
     #[async_trait::async_trait]
@@ -1663,5 +2033,172 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("stop_propagation"));
+    }
+
+    #[tokio::test]
+    async fn committed_parent_recovers_unknown_completion_without_reinvocation() {
+        let store = PluginStore::in_memory().unwrap();
+        let instance_id = "dev.bkm.recovery/default";
+        let source_event = PluginEventEnvelope {
+            protocol_version: "1.0.0".to_owned(),
+            event_id: "event-1".to_owned(),
+            delivery_id: "delivery-1".to_owned(),
+            invocation_id: "invocation-1".to_owned(),
+            occurred_at_ms: None,
+            received_at_ms: 1,
+            adapter_id: "mock".to_owned(),
+            event_type: "message.created".to_owned(),
+            trace_id: None,
+            payload: json!({"text":"/ping"}),
+            extensions: Vec::new(),
+        };
+        let origin = OutboxOrigin {
+            source_event_id: source_event.event_id.clone(),
+            adapter_id: "mock".to_owned(),
+            reply_target: Some(MessageTarget::Group {
+                group_id: "group-1".to_owned(),
+            }),
+            source_message_id: Some("message-1".to_owned()),
+        };
+        store
+            .begin_delivery(instance_id, &source_event, &origin, 1)
+            .unwrap()
+            .unwrap();
+        store
+            .commit(
+                instance_id,
+                &source_event.invocation_id,
+                &[],
+                &[PluginCommand {
+                    command_id: "reply".to_owned(),
+                    kind: "message.reply".to_owned(),
+                    idempotency_key: None,
+                    deadline_ms: None,
+                    payload: json!({"content":"pong"}),
+                }],
+                CommitOptions::new(0)
+                    .with_origin(&origin)
+                    .with_delivery(&source_event.event_id, &source_event.delivery_id),
+            )
+            .unwrap();
+
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let plugin = Arc::new(CompletionRecoveryPlugin {
+            manifest: PluginManifest::from_toml(
+                r#"
+                    manifest_version = 1
+                    id = "dev.bkm.recovery"
+                    version = "0.1.0"
+                    protocol = ">=1.0,<2.0"
+
+                    [metadata]
+                    default_locale = "en"
+
+                    [metadata.locales.en]
+                    name = "Recovery"
+
+                    [[subscriptions]]
+                    id = "action-results"
+                    event = "action.completed"
+                "#,
+            )
+            .unwrap(),
+            events: events.clone(),
+        });
+        let mut host = StaticPluginHost::new(store.clone());
+        host.register_trusted(plugin, instance_id, BTreeMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(events.lock().unwrap().as_slice(), ["action.completed"]);
+        assert!(store.pending_commands(instance_id).unwrap().is_empty());
+        assert!(
+            store
+                .begin_delivery(
+                    instance_id,
+                    &PluginEventEnvelope {
+                        delivery_id: "delivery-2".to_owned(),
+                        invocation_id: "invocation-2".to_owned(),
+                        ..source_event
+                    },
+                    &origin,
+                    2,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_completion_depth_limit_is_persistent() {
+        let store = PluginStore::in_memory().unwrap();
+        let instance_id = "dev.bkm.recovery/default";
+        let envelope = PluginEventEnvelope {
+            protocol_version: "1.0.0".to_owned(),
+            event_id: "action/invocation/command".to_owned(),
+            delivery_id: "delivery-1".to_owned(),
+            invocation_id: "invocation-1".to_owned(),
+            occurred_at_ms: None,
+            received_at_ms: 1,
+            adapter_id: "mock".to_owned(),
+            event_type: "action.completed".to_owned(),
+            trace_id: None,
+            payload: json!({}),
+            extensions: vec![ExtensionPayload {
+                namespace: ACTION_COMPLETION_DEPTH_NAMESPACE.to_owned(),
+                schema_version: "1.0.0".to_owned(),
+                content_type: "text/plain".to_owned(),
+                data: b"65".to_vec(),
+            }],
+        };
+        store
+            .enqueue_delivery(
+                instance_id,
+                &envelope,
+                &origin_for_test(&envelope.event_id),
+                1,
+            )
+            .unwrap();
+
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let plugin = Arc::new(CompletionRecoveryPlugin {
+            manifest: PluginManifest::from_toml(
+                r#"
+                    manifest_version = 1
+                    id = "dev.bkm.recovery"
+                    version = "0.1.0"
+                    protocol = ">=1.0,<2.0"
+
+                    [metadata]
+                    default_locale = "en"
+
+                    [metadata.locales.en]
+                    name = "Recovery"
+
+                    [[subscriptions]]
+                    id = "action-results"
+                    event = "action.completed"
+                "#,
+            )
+            .unwrap(),
+            events: events.clone(),
+        });
+        let mut host = StaticPluginHost::new(store.clone());
+        host.register_trusted(plugin, instance_id, BTreeMap::new())
+            .await
+            .unwrap();
+
+        assert!(events.lock().unwrap().is_empty());
+        assert!(store.circuit_open(instance_id).unwrap());
+        assert_eq!(store.dead_letters(Some(instance_id)).unwrap().len(), 1);
+    }
+
+    fn origin_for_test(event_id: &str) -> OutboxOrigin {
+        OutboxOrigin {
+            source_event_id: event_id.to_owned(),
+            adapter_id: "mock".to_owned(),
+            reply_target: None,
+            source_message_id: None,
+        }
     }
 }

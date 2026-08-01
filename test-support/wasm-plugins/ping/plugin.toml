@@ -1,10 +1,15 @@
 manifest_version = 1
 id = "dev.bkm.wasm-ping"
-name = "WASM Ping"
 version = "0.1.0"
 protocol = ">=1.0,<2.0"
-description = "BPP Component Model ping equivalence fixture"
 entry = "component.wasm"
+
+[metadata]
+default_locale = "en"
+
+[metadata.locales.en]
+name = "WASM Ping"
+description = "BPP Component Model ping equivalence fixture"
 
 [runtime]
 mode = "serial"

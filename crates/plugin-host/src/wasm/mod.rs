@@ -187,16 +187,27 @@ impl std::fmt::Debug for WasmPlugin {
 
 impl WasmPlugin {
     pub async fn from_package(package: ValidatedPluginPackage) -> Result<Self, WasmPluginError> {
-        let manifest = package.manifest().clone();
-        let config_schema = package.config_schema().cloned();
-        let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.async_support(true);
-        config.consume_fuel(true);
-        config.epoch_interruption(true);
-        let engine = Engine::new(&config).map_err(WasmPluginError::Wasmtime)?;
-        let component =
-            Component::new(&engine, package.component()).map_err(WasmPluginError::Wasmtime)?;
+        let (manifest, config_schema, assets, engine, component) =
+            tokio::task::spawn_blocking(move || {
+                let manifest = package.manifest().clone();
+                let config_schema = package.config_schema().cloned();
+                let assets = package
+                    .files()
+                    .filter(|(path, _)| path.starts_with("assets/"))
+                    .map(|(path, data)| (path.to_owned(), data.to_vec()))
+                    .collect();
+                let mut config = Config::new();
+                config.wasm_component_model(true);
+                config.async_support(true);
+                config.consume_fuel(true);
+                config.epoch_interruption(true);
+                let engine = Engine::new(&config).map_err(WasmPluginError::Wasmtime)?;
+                let component = Component::new(&engine, package.component())
+                    .map_err(WasmPluginError::Wasmtime)?;
+                Ok::<_, WasmPluginError>((manifest, config_schema, assets, engine, component))
+            })
+            .await
+            .map_err(WasmPluginError::PreparationTask)??;
         let mut linker = Linker::new(&engine);
         Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(WasmPluginError::Wasmtime)?;
@@ -209,11 +220,6 @@ impl WasmPlugin {
             .tables(16)
             .trap_on_grow_failure(true)
             .build();
-        let assets = package
-            .files()
-            .filter(|(path, _)| path.starts_with("assets/"))
-            .map(|(path, data)| (path.to_owned(), data.to_vec()))
-            .collect();
         let mut store = Store::new(
             &engine,
             StoreData {
@@ -294,6 +300,8 @@ impl Drop for EpochDeadline {
 pub enum WasmPluginError {
     #[error("Wasmtime component operation failed")]
     Wasmtime(#[source] anyhow::Error),
+    #[error("Wasm plugin preparation task failed")]
+    PreparationTask(#[source] tokio::task::JoinError),
 }
 
 #[async_trait]

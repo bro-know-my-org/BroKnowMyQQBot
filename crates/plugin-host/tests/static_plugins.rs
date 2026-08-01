@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -25,8 +25,8 @@ use plugin_fixtures::{
     TimeoutFixturePlugin,
 };
 use plugin_host::{
-    HttpExecutionError, HttpExecutor, PluginHostError, PluginInstanceState, PluginStore,
-    SecureHttpExecutor, StaticPluginHost,
+    CommitOptions, HttpExecutionError, HttpExecutor, PluginHostError, PluginInstanceState,
+    PluginStore, SecureHttpExecutor, StaticPluginHost,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
@@ -38,6 +38,58 @@ struct MockHttpExecutor;
 struct ShutdownProbePlugin {
     inner: PingPlugin,
     calls: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct TransientProbePlugin {
+    inner: PingPlugin,
+    calls: Arc<AtomicUsize>,
+    attempt_ids: Arc<StdMutex<Vec<(String, String)>>>,
+    failures: usize,
+}
+
+fn assert_unique_attempt_ids(attempt_ids: &Arc<StdMutex<Vec<(String, String)>>>, expected: usize) {
+    let attempt_ids = attempt_ids.lock().unwrap();
+    assert_eq!(attempt_ids.len(), expected);
+    assert_eq!(
+        attempt_ids
+            .iter()
+            .map(|(delivery_id, _)| delivery_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        expected
+    );
+    assert_eq!(
+        attempt_ids
+            .iter()
+            .map(|(_, invocation_id)| invocation_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        expected
+    );
+}
+
+#[async_trait]
+impl StaticPlugin for TransientProbePlugin {
+    fn manifest(&self) -> &PluginManifest {
+        self.inner.manifest()
+    }
+
+    async fn on_event(
+        &self,
+        event: &PluginEventEnvelope,
+        queries: &dyn HostQueries,
+    ) -> Result<HandlerOutput, PluginError> {
+        self.attempt_ids
+            .lock()
+            .unwrap()
+            .push((event.delivery_id.clone(), event.invocation_id.clone()));
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call < self.failures {
+            return Err(PluginError::Transient("try again".to_owned()));
+        }
+        self.inner.on_event(event, queries).await
+    }
 }
 
 #[async_trait]
@@ -517,6 +569,157 @@ async fn timeout_and_panic_are_isolated_from_later_plugins() {
 }
 
 #[tokio::test]
+async fn transient_delivery_retries_with_new_attempts_and_succeeds() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let attempt_ids = Arc::new(StdMutex::new(Vec::new()));
+    let store = PluginStore::in_memory().unwrap();
+    let mut plugins = StaticPluginHost::new(store.clone());
+    plugins
+        .register_trusted(
+            Arc::new(TransientProbePlugin {
+                inner: PingPlugin::default(),
+                calls: calls.clone(),
+                attempt_ids: attempt_ids.clone(),
+                failures: 2,
+            }),
+            "dev.bkm.ping/retry-test",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (action_sender, mut actions) = mpsc::channel(1);
+    let adapter = Arc::new(MockAdapter {
+        id: AdapterId::new("mock"),
+        event: Mutex::new(Some(message_event("/ping"))),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+        outcome: ActionOutcome::Succeeded,
+        shutdown_after_send: false,
+    });
+    let runtime = RuntimeBuilder::new()
+        .adapter(adapter)
+        .handler(Arc::new(plugins))
+        .build()
+        .unwrap();
+
+    runtime.run(shutdown_signal).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_unique_attempt_ids(&attempt_ids, 3);
+    let Action::Reply(reply) = actions.recv().await.unwrap() else {
+        panic!("retrying plugin should eventually reply");
+    };
+    assert_eq!(reply.content, "pong");
+    assert!(
+        store
+            .dead_letters(Some("dev.bkm.ping/retry-test"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn dead_letter_recovery_replays_after_host_restart() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let attempt_ids = Arc::new(StdMutex::new(Vec::new()));
+    let store = PluginStore::in_memory().unwrap();
+    let plugin = Arc::new(TransientProbePlugin {
+        inner: PingPlugin::default(),
+        calls: calls.clone(),
+        attempt_ids: attempt_ids.clone(),
+        failures: 3,
+    });
+    let mut first_host = StaticPluginHost::new(store.clone());
+    first_host
+        .register_trusted(
+            plugin.clone(),
+            "dev.bkm.ping/recovery-test",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (action_sender, _actions) = mpsc::channel(1);
+    let adapter = Arc::new(MockAdapter {
+        id: AdapterId::new("mock"),
+        event: Mutex::new(Some(message_event("/ping"))),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+        outcome: ActionOutcome::Succeeded,
+        shutdown_after_send: true,
+    });
+    RuntimeBuilder::new()
+        .adapter(adapter)
+        .handler(Arc::new(first_host))
+        .build()
+        .unwrap()
+        .run(shutdown_signal)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        store
+            .dead_letters(Some("dev.bkm.ping/recovery-test"))
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut circuit_restart = StaticPluginHost::new(store.clone());
+    circuit_restart
+        .register_trusted(
+            plugin.clone(),
+            "dev.bkm.ping/recovery-test",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        circuit_restart
+            .instance_state("dev.bkm.ping/recovery-test")
+            .unwrap(),
+        Some(PluginInstanceState::Disabled)
+    );
+    assert_eq!(
+        store
+            .recover_dead_letters("dev.bkm.ping/recovery-test", 0)
+            .unwrap(),
+        1
+    );
+
+    let (shutdown_handle, _shutdown_signal) = shutdown_channel();
+    let (action_sender, mut actions) = mpsc::channel(1);
+    let adapter = Arc::new(MockAdapter {
+        id: AdapterId::new("mock"),
+        event: Mutex::new(None),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+        outcome: ActionOutcome::Succeeded,
+        shutdown_after_send: false,
+    });
+    let mut restarted = StaticPluginHost::new(store.clone()).with_adapter(adapter);
+    restarted
+        .register_trusted(plugin, "dev.bkm.ping/recovery-test", BTreeMap::new())
+        .await
+        .unwrap();
+    let action = tokio::time::timeout(std::time::Duration::from_secs(2), actions.recv())
+        .await
+        .expect("recovered delivery should emit an action before the timeout")
+        .expect("action channel should remain open");
+    let Action::Reply(reply) = action else {
+        panic!("recovered delivery should execute its original reply");
+    };
+    assert_eq!(reply.content, "pong");
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_unique_attempt_ids(&attempt_ids, 4);
+    assert!(
+        store
+            .dead_letters(Some("dev.bkm.ping/recovery-test"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn quota_failure_rolls_back_state_and_command() {
     let store = PluginStore::in_memory().unwrap();
     let mut plugins = StaticPluginHost::new(store.clone());
@@ -875,8 +1078,7 @@ async fn migration_host() -> (StaticPluginHost, PluginStore) {
                 expected_revision: None,
             }],
             &[],
-            1024,
-            None,
+            CommitOptions::new(1024),
         )
         .unwrap();
     let mut host = StaticPluginHost::new(store.clone());

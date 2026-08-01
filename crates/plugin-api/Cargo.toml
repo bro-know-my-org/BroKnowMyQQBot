@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+language-tags.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true

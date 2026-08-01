@@ -12,6 +12,8 @@ mod wasm;
 pub use http::{HttpExecutionError, HttpExecutor, SecureHttpExecutor};
 pub use package::{PluginPackageError, ValidatedPluginPackage};
 pub use runtime::{PluginHostError, PluginInstanceState, StaticPluginHost};
-pub use storage::{PluginStore, StoreError};
+pub use storage::{
+    CommitOptions, DeadLetter, OutboxOrigin, PluginInstallation, PluginStore, StoreError,
+};
 #[cfg(feature = "wasm")]
 pub use wasm::{WasmPlugin, WasmPluginError};

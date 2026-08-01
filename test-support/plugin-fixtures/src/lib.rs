@@ -14,8 +14,8 @@ use std::{
 use async_trait::async_trait;
 use plugin_api::{
     CommandDeclaration, Disposition, HandlerOutput, HostQueries, PluginCommand, PluginError,
-    PluginEventEnvelope, PluginId, PluginManifest, PluginPermissions, PluginRuntimeConfig,
-    RuntimeMode, StateOp, StaticPlugin, StoragePermission, Subscription,
+    PluginEventEnvelope, PluginId, PluginManifest, PluginMetadata, PluginPermissions,
+    PluginRuntimeConfig, RuntimeMode, StateOp, StaticPlugin, StoragePermission, Subscription,
 };
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -347,11 +347,10 @@ fn fixture_manifest(id: &str, name: &str, priority: i32, timeout_ms: u64) -> Plu
     PluginManifest {
         manifest_version: 1,
         id: PluginId::new(id).expect("fixture plugin ID must be valid"),
-        name: name.to_owned(),
+        metadata: PluginMetadata::single_locale("en", name, "Test-only plugin fixture"),
         version: "0.1.0".to_owned(),
         protocol: ">=1.0,<2.0".to_owned(),
         state_version: 1,
-        description: "Test-only plugin fixture".to_owned(),
         entry: "component.wasm".to_owned(),
         runtime: PluginRuntimeConfig {
             timeout_ms,

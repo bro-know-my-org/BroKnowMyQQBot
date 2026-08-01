@@ -1,0 +1,28 @@
+manifest_version = 1
+id = "dev.bkm.fixture"
+version = "1.0.0"
+protocol = ">=1.0,<2.0"
+
+[metadata]
+default_locale = "en"
+
+[metadata.locales.en]
+name = "Fixture"
+description = "BPP compatibility fixture"
+
+[[subscriptions]]
+id = "messages"
+event = "message.created"
+scopes = ["group", "private"]
+
+[[commands]]
+name = "fixture"
+description = "BPP compatibility fixture"
+
+[permissions]
+actions = ["message.reply"]
+event_extensions = []
+storage = "private"
+storage_quota_bytes = 4096
+scheduler = false
+stop_propagation = false

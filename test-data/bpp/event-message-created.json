@@ -1,0 +1,23 @@
+{
+  "protocol_version": "1.0.0",
+  "event_id": "fixture-event-1",
+  "delivery_id": "fixture-delivery-1",
+  "invocation_id": "fixture-invocation-1",
+  "occurred_at_ms": 1700000000000,
+  "received_at_ms": 1700000000100,
+  "adapter_id": "fixture-adapter",
+  "event_type": "message.created",
+  "trace_id": "fixture-trace-1",
+  "payload": {
+    "type": "message",
+    "data": {
+      "message_id": "fixture-message-1",
+      "target": { "type": "group", "group_id": "fixture-group-1" },
+      "sender": { "id": "fixture-user-1", "display_name": null },
+      "text": "/fixture",
+      "segments": [{ "type": "text", "text": "/fixture" }],
+      "reply_to": null
+    }
+  },
+  "extensions": []
+}

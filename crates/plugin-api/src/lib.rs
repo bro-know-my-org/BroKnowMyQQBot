@@ -8,8 +8,9 @@ mod protocol;
 
 pub use id::{PluginId, PluginIdError};
 pub use manifest::{
-    CommandDeclaration, HttpPermission, ManifestError, PluginManifest, PluginPermissions,
-    PluginRuntimeConfig, RuntimeMode, StoragePermission, Subscription,
+    CommandDeclaration, HttpPermission, LocalizedPluginMetadata, ManifestError, PluginManifest,
+    PluginMetadata, PluginPermissions, PluginRuntimeConfig, RuntimeMode, StoragePermission,
+    Subscription,
 };
 pub use protocol::{
     ActionCompleted, ActionStatus, Disposition, ExtensionPayload, HandlerOutput, HealthStatus,

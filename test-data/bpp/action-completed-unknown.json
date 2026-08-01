@@ -1,0 +1,11 @@
+{
+  "source_event_id": "fixture-event-1",
+  "source_invocation_id": "fixture-invocation-1",
+  "command_id": "reply",
+  "kind": "message.reply",
+  "status": "unknown",
+  "retryable": false,
+  "result": null,
+  "error_code": "result_unknown",
+  "error_message": "platform result could not be confirmed"
+}

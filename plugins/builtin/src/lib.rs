@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use plugin_api::{
     ActionCompleted, ActionStatus, CommandDeclaration, Disposition, HandlerOutput, HostQueries,
     HttpPermission, HttpRequest, HttpResponse, PluginCommand, PluginError, PluginEventEnvelope,
-    PluginId, PluginManifest, PluginPermissions, PluginRuntimeConfig, ScheduleCancel,
-    ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin, StoragePermission, Subscription,
+    PluginId, PluginManifest, PluginMetadata, PluginPermissions, PluginRuntimeConfig,
+    ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin, StoragePermission,
+    Subscription,
 };
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
@@ -35,11 +36,10 @@ fn message_plugin_manifest(
     PluginManifest {
         manifest_version: 1,
         id: PluginId::new(id).expect("built-in plugin ID must be valid"),
-        name: name.to_owned(),
+        metadata: PluginMetadata::single_locale("en", name, format!("Built-in {name} plugin")),
         version: "0.1.0".to_owned(),
         protocol: ">=1.0,<2.0".to_owned(),
         state_version: 1,
-        description: format!("Built-in {name} plugin"),
         entry: "component.wasm".to_owned(),
         runtime: PluginRuntimeConfig::default(),
         subscriptions: vec![Subscription {

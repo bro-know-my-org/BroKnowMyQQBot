@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use wit_parser::Resolve;
+use wit_parser::{Resolve, Type, TypeDefKind};
 
 #[test]
 fn formal_wit_contract_parses_with_expected_identity() {
@@ -24,4 +24,28 @@ fn formal_wit_contract_parses_with_expected_identity() {
     assert!(package.interfaces.contains_key("queries"));
     assert!(package.interfaces.contains_key("lifecycle"));
     assert!(package.interfaces.contains_key("handler"));
+    let types_id = package.interfaces["types"];
+    let types = &resolve.interfaces[types_id];
+    let command_payload_id = types.types["command-payload"];
+    let TypeDefKind::Variant(command_payload) = &resolve.types[command_payload_id].kind else {
+        panic!("BPP command-payload must be a variant");
+    };
+    let expected = [
+        ("message-reply", "message-reply-command"),
+        ("message-send", "message-send-command"),
+        ("http-request", "http-request-command"),
+        ("schedule-create", "schedule-create-command"),
+        ("schedule-cancel", "schedule-cancel-command"),
+    ];
+    assert_eq!(command_payload.cases.len(), expected.len());
+    for (case, (expected_case, expected_payload)) in command_payload.cases.iter().zip(expected) {
+        assert_eq!(case.name, expected_case);
+        let Some(Type::Id(payload_id)) = case.ty else {
+            panic!("BPP command `{expected_case}` must carry a typed payload");
+        };
+        assert_eq!(
+            resolve.types[payload_id].name.as_deref(),
+            Some(expected_payload)
+        );
+    }
 }

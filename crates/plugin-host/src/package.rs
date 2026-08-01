@@ -313,9 +313,14 @@ mod tests {
     const MANIFEST: &str = r#"
         manifest_version = 1
         id = "dev.bkm.package-fixture"
-        name = "Package Fixture"
         version = "0.1.0"
         protocol = ">=1.0,<2.0"
+
+        [metadata]
+        default_locale = "en"
+
+        [metadata.locales.en]
+        name = "Package Fixture"
     "#;
     const COMPONENT: &[u8] = b"\0asm\x0d\0\x01\0";
 
