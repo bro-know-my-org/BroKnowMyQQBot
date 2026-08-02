@@ -85,6 +85,7 @@ impl BotConfig {
     }
 
     fn apply_environment_overrides(&mut self) -> Result<(), ConfigError> {
+        apply_bool_override("BKMQB_QQ_ENABLED", &mut self.qq.enabled)?;
         if let Ok(value) = env::var("BKMQB_QQ_ENVIRONMENT") {
             self.qq.environment = value;
         }
@@ -102,6 +103,26 @@ impl BotConfig {
         if let Ok(value) = env::var("BKMQB_QQ_WEBHOOK_PATH") {
             self.qq.webhook.path = value;
         }
+        apply_bool_override("BKMQB_ONEBOT11_ENABLED", &mut self.onebot11.enabled)?;
+        if let Ok(value) = env::var("BKMQB_ONEBOT11_LISTEN") {
+            self.onebot11.listen = value;
+        }
+        apply_bool_override(
+            "BKMQB_ONEBOT11_ALLOW_INSECURE_REMOTE",
+            &mut self.onebot11.allow_insecure_remote,
+        )?;
+        apply_parse_override(
+            "BKMQB_ONEBOT11_ACTION_TIMEOUT_SECONDS",
+            &mut self.onebot11.action_timeout_seconds,
+        )?;
+        apply_parse_override(
+            "BKMQB_ONEBOT11_MAX_MESSAGE_BYTES",
+            &mut self.onebot11.max_message_bytes,
+        )?;
+        apply_parse_override(
+            "BKMQB_ONEBOT11_MAX_PENDING_ACTIONS",
+            &mut self.onebot11.max_pending_actions,
+        )?;
         if let Some(value) = env::var_os("BKMQB_PLUGIN_DB") {
             self.plugins.database = PathBuf::from(value);
         }
@@ -134,18 +155,31 @@ impl BotConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        if !matches!(self.qq.environment.as_str(), "production" | "sandbox") {
+        if !self.qq.enabled && !self.onebot11.enabled {
+            return Err(ConfigError::InvalidValue(
+                "at least one Adapter must be enabled".to_owned(),
+            ));
+        }
+        if self.qq.enabled && self.qq.check_only && self.onebot11.enabled {
+            return Err(ConfigError::InvalidValue(
+                "qq.check_only cannot be combined with an enabled OneBot 11 adapter".to_owned(),
+            ));
+        }
+        if self.qq.enabled && !matches!(self.qq.environment.as_str(), "production" | "sandbox") {
             return Err(ConfigError::InvalidValue(
                 "qq.environment must be `production` or `sandbox`".to_owned(),
             ));
         }
-        if !matches!(self.qq.transport.as_str(), "websocket" | "webhook") {
+        if self.qq.enabled && !matches!(self.qq.transport.as_str(), "websocket" | "webhook") {
             return Err(ConfigError::InvalidValue(
                 "qq.transport must be `websocket` or `webhook`".to_owned(),
             ));
         }
-        if self.qq.transport == "webhook" {
+        if self.qq.enabled && self.qq.transport == "webhook" {
             validate_webhook_config(&self.qq.webhook)?;
+        }
+        if self.onebot11.enabled {
+            validate_onebot11_config(&self.onebot11)?;
         }
         if self.runtime.event_concurrency == 0
             || self.runtime.event_concurrency > tokio::sync::Semaphore::MAX_PERMITS
@@ -204,6 +238,39 @@ impl BotConfig {
         atomic_write(&path, encoded.as_bytes(), 0o600)?;
         Ok(path)
     }
+}
+
+fn validate_onebot11_config(config: &model::OneBot11Config) -> Result<(), ConfigError> {
+    let listen = config.listen.parse::<std::net::SocketAddr>().map_err(|_| {
+        ConfigError::InvalidValue("onebot11.listen must be an IP socket address".to_owned())
+    })?;
+    if listen.port() == 0 {
+        return Err(ConfigError::InvalidValue(
+            "onebot11.listen must use a non-zero port".to_owned(),
+        ));
+    }
+    if !listen.ip().is_loopback() && !config.allow_insecure_remote {
+        return Err(ConfigError::InvalidValue(
+            "onebot11 non-loopback listen address requires allow_insecure_remote = true because the adapter does not terminate TLS"
+                .to_owned(),
+        ));
+    }
+    if config.action_timeout_seconds == 0 || config.action_timeout_seconds > 300 {
+        return Err(ConfigError::InvalidValue(
+            "onebot11.action_timeout_seconds must be between 1 and 300".to_owned(),
+        ));
+    }
+    if config.max_message_bytes == 0 || config.max_message_bytes > 16 * 1024 * 1024 {
+        return Err(ConfigError::InvalidValue(
+            "onebot11.max_message_bytes must be between 1 and 16777216".to_owned(),
+        ));
+    }
+    if config.max_pending_actions == 0 || config.max_pending_actions > 4096 {
+        return Err(ConfigError::InvalidValue(
+            "onebot11.max_pending_actions must be between 1 and 4096".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_log_capacity(kind: &str, file_mb: u64, total_mb: u64) -> Result<(), ConfigError> {
@@ -511,6 +578,19 @@ fn apply_bool_override(name: &'static str, target: &mut bool) -> Result<(), Conf
     Ok(())
 }
 
+fn apply_parse_override<T>(name: &'static str, target: &mut T) -> Result<(), ConfigError>
+where
+    T: std::str::FromStr,
+{
+    let Ok(value) = env::var(name) else {
+        return Ok(());
+    };
+    *target = value
+        .parse()
+        .map_err(|_| ConfigError::InvalidEnvironment { name, value })?;
+    Ok(())
+}
+
 fn parse_bool_environment(name: &'static str, value: &str) -> Result<bool, ConfigError> {
     let parsed = match value.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => true,
@@ -631,6 +711,60 @@ mod tests {
         let mut config = BotConfig::default();
         config.logging.console.language = "fr".to_owned();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_onebot_only_and_rejects_no_adapters() {
+        let mut config = BotConfig::default();
+        config.qq.enabled = false;
+        config.onebot11.enabled = true;
+        config.validate().unwrap();
+
+        config.onebot11.enabled = false;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn validates_onebot_limits_only_when_enabled() {
+        let mut config = BotConfig::default();
+        config.onebot11.listen = "not-a-socket".to_owned();
+        config.validate().unwrap();
+
+        config.qq.enabled = false;
+        config.onebot11.enabled = true;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
+    }
+
+    #[test]
+    fn remote_onebot_listener_requires_explicit_opt_in() {
+        let mut config = BotConfig::default();
+        config.qq.enabled = false;
+        config.onebot11.enabled = true;
+        config.onebot11.listen = "0.0.0.0:6700".to_owned();
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
+
+        config.onebot11.allow_insecure_remote = true;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn qq_check_only_rejects_mixed_adapter_mode() {
+        let mut config = BotConfig::default();
+        config.qq.check_only = true;
+        config.onebot11.enabled = true;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidValue(_))
+        ));
     }
 
     #[test]

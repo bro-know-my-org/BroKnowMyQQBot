@@ -1,6 +1,7 @@
 # Generated as config/bot.toml on first run. Do not put AppSecret or tokens here.
 
 [qq]
+enabled = true
 environment = "production"
 transport = "websocket"
 public_guild_messages = false
@@ -13,6 +14,15 @@ timestamp_tolerance_seconds = 300
 max_body_bytes = 1048576
 max_request_concurrency = 64
 request_timeout_seconds = 10
+
+[onebot11]
+enabled = false
+listen = "127.0.0.1:6700"
+# Set only for a trusted private network; prefer loopback behind a TLS reverse proxy.
+allow_insecure_remote = false
+action_timeout_seconds = 15
+max_message_bytes = 1048576
+max_pending_actions = 256
 
 [runtime]
 event_concurrency = 32

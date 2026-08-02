@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct BotConfig {
     pub(crate) qq: QqConfig,
+    pub(crate) onebot11: OneBot11Config,
     pub(crate) runtime: RuntimeConfig,
     pub(crate) plugins: PluginsConfig,
     pub(crate) logging: LoggingConfig,
@@ -16,6 +17,7 @@ pub(crate) struct BotConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct QqConfig {
+    pub(crate) enabled: bool,
     pub(crate) environment: String,
     pub(crate) transport: String,
     pub(crate) public_guild_messages: bool,
@@ -26,11 +28,36 @@ pub(crate) struct QqConfig {
 impl Default for QqConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             environment: "production".to_owned(),
             transport: "websocket".to_owned(),
             public_guild_messages: false,
             check_only: false,
             webhook: QqWebhookConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct OneBot11Config {
+    pub(crate) enabled: bool,
+    pub(crate) listen: String,
+    pub(crate) allow_insecure_remote: bool,
+    pub(crate) action_timeout_seconds: u64,
+    pub(crate) max_message_bytes: usize,
+    pub(crate) max_pending_actions: usize,
+}
+
+impl Default for OneBot11Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:6700".to_owned(),
+            allow_insecure_remote: false,
+            action_timeout_seconds: 15,
+            max_message_bytes: 1024 * 1024,
+            max_pending_actions: 256,
         }
     }
 }

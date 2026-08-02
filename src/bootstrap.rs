@@ -9,6 +9,7 @@ use crate::{
     logging,
     plugins::load_plugins,
 };
+use adapter_onebot11::{OneBot11Adapter, OneBot11Config};
 use adapter_qqbot::{QqWebSocketAdapter, QqWebSocketConfig, QqWebhookAdapter, QqWebhookConfig};
 use bot_core::{Adapter, RuntimeBuilder, shutdown_channel};
 use plugin_host::{PluginStore, StaticPluginHost};
@@ -27,6 +28,11 @@ enum AppError {
     MissingWebhookSecret,
 }
 
+struct AdapterSet {
+    adapters: Vec<Arc<dyn Adapter>>,
+    qq_api: Option<OpenApiClient>,
+}
+
 pub(crate) async fn run() -> ExitCode {
     match start().await {
         Ok(()) => ExitCode::SUCCESS,
@@ -40,45 +46,35 @@ pub(crate) async fn run() -> ExitCode {
 async fn start() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = BotConfig::load()?;
     let secrets_file = load_secret_environment()?;
-    let (app_id, app_secret) = match configured_credentials() {
-        Ok(credentials) => credentials,
-        Err(_error) if config::setup::is_interactive() => {
-            let path = secrets_file
-                .as_deref()
-                .ok_or("interactive setup requires a writable secrets file path")?;
-            config::setup::run(&mut config, path)?
-        }
-        Err(error) => return Err(error.into()),
+    let qq_credentials = if config.qq.enabled {
+        Some(match configured_credentials() {
+            Ok(credentials) => credentials,
+            Err(_error) if config::setup::is_interactive() => {
+                let path = secrets_file
+                    .as_deref()
+                    .ok_or("interactive setup requires a writable secrets file path")?;
+                config::setup::run(&mut config, path)?
+            }
+            Err(error) => return Err(error.into()),
+        })
+    } else {
+        None
     };
     let _logging_guards = logging::init(&config.logging)?;
     if let Some(path) = secrets_file {
         info!(path = %path.display(), "loaded local secrets environment file");
     }
 
-    let environment = match config.qq.environment.as_str() {
-        "sandbox" => OpenApiEnvironment::Sandbox,
-        "production" => OpenApiEnvironment::Production,
-        _ => unreachable!("configuration validation only accepts known QQ environments"),
-    };
-    let mut intents = Intents::empty().with_group_and_c2c();
-    if config.qq.public_guild_messages {
-        intents = intents.with_public_guild_messages();
-    }
-
-    let webhook_secret = (config.qq.transport == "webhook")
-        .then(|| SecretString::from(app_secret.clone().into_boxed_str()));
-    let tokens = TokenManager::new(
-        app_id.clone(),
-        SecretString::from(app_secret.into_boxed_str()),
-    )?;
-    let api = OpenApiClient::new(environment, tokens)?;
-    let adapter = build_qq_adapter(&config, app_id, webhook_secret, api.clone(), intents)?;
+    let AdapterSet { adapters, qq_api } = build_adapters(&config, qq_credentials).await?;
     let plugin_db = config.plugins.database.clone();
     if let Some(parent) = plugin_db.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let plugin_store = PluginStore::open(plugin_db)?;
-    let mut plugins = StaticPluginHost::new(plugin_store.clone()).with_adapter(adapter.clone());
+    let mut plugins = StaticPluginHost::new(plugin_store.clone());
+    for adapter in &adapters {
+        plugins = plugins.with_adapter(adapter.clone());
+    }
     let installation_file = config.plugins.installations.clone();
     if let Err(error) =
         load_plugins(&mut plugins, &plugin_store, installation_file.as_deref()).await
@@ -88,7 +84,10 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Err(error);
     }
-    if config.qq.check_only {
+    if config.qq.enabled && config.qq.check_only {
+        let api = qq_api
+            .as_ref()
+            .ok_or("QQ preflight client is unavailable")?;
         let gateway = match api.gateway().await {
             Ok(gateway) => gateway,
             Err(error) => {
@@ -105,12 +104,18 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
 
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let plugins = Arc::new(plugins);
-    let runtime = RuntimeBuilder::new()
+    let mut runtime_builder = RuntimeBuilder::new()
         .event_concurrency(config.runtime.event_concurrency)
-        .adapter(adapter)
-        .handler(plugins.clone())
-        .build()?;
-    info!(transport = %config.qq.transport, "starting BroKnowMyQQBot with QQ Official adapter");
+        .handler(plugins.clone());
+    for adapter in adapters {
+        runtime_builder = runtime_builder.adapter(adapter);
+    }
+    let runtime = runtime_builder.build()?;
+    info!(
+        qq_enabled = config.qq.enabled,
+        onebot11_enabled = config.onebot11.enabled,
+        "starting BroKnowMyQQBot adapters"
+    );
     let runtime_run = runtime.run(shutdown_signal);
     tokio::pin!(runtime_run);
     let runtime_result = tokio::select! {
@@ -135,6 +140,55 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     runtime_result?;
     info!("BroKnowMyQQBot stopped");
     Ok(())
+}
+
+async fn build_adapters(
+    config: &BotConfig,
+    qq_credentials: Option<(String, String)>,
+) -> Result<AdapterSet, Box<dyn std::error::Error>> {
+    let mut adapters = Vec::<Arc<dyn Adapter>>::new();
+    let mut qq_api = None;
+    if let Some((app_id, app_secret)) = qq_credentials {
+        let environment = match config.qq.environment.as_str() {
+            "sandbox" => OpenApiEnvironment::Sandbox,
+            "production" => OpenApiEnvironment::Production,
+            _ => unreachable!("configuration validation only accepts known QQ environments"),
+        };
+        let mut intents = Intents::empty().with_group_and_c2c();
+        if config.qq.public_guild_messages {
+            intents = intents.with_public_guild_messages();
+        }
+        let webhook_secret = (config.qq.transport == "webhook")
+            .then(|| SecretString::from(app_secret.clone().into_boxed_str()));
+        let tokens = TokenManager::new(
+            app_id.clone(),
+            SecretString::from(app_secret.into_boxed_str()),
+        )?;
+        let api = OpenApiClient::new(environment, tokens)?;
+        adapters.push(build_qq_adapter(
+            config,
+            app_id,
+            webhook_secret,
+            api.clone(),
+            intents,
+        )?);
+        qq_api = Some(api);
+    }
+    if config.onebot11.enabled {
+        let token = required_env("BKMQB_ONEBOT_ACCESS_TOKEN")?;
+        let adapter = OneBot11Adapter::bind(OneBot11Config {
+            id: bot_core::AdapterId::new("onebot11-reverse"),
+            listen: config.onebot11.listen.parse()?,
+            access_token: SecretString::from(token),
+            allow_insecure_remote: config.onebot11.allow_insecure_remote,
+            action_timeout: Duration::from_secs(config.onebot11.action_timeout_seconds),
+            max_message_bytes: config.onebot11.max_message_bytes,
+            max_pending_actions: config.onebot11.max_pending_actions,
+        })
+        .await?;
+        adapters.push(Arc::new(adapter));
+    }
+    Ok(AdapterSet { adapters, qq_api })
 }
 
 fn build_qq_adapter(
