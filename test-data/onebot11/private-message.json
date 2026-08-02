@@ -1,0 +1,12 @@
+{
+  "time": 1700000001,
+  "self_id": "10000",
+  "post_type": "message",
+  "message_type": "private",
+  "sub_type": "friend",
+  "message_id": "201",
+  "user_id": "401",
+  "message": "hello",
+  "raw_message": "hello",
+  "sender": { "nickname": "Tester" }
+}

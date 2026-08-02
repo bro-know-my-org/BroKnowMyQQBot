@@ -1,0 +1,9 @@
+{
+  "time": 1700000003,
+  "self_id": 10000,
+  "post_type": "request",
+  "request_type": "friend",
+  "user_id": 401,
+  "comment": "hello",
+  "flag": "request-1"
+}

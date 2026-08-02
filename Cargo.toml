@@ -1,8 +1,10 @@
 [workspace]
 members = [
     ".",
+    "crates/adapter-onebot11",
     "crates/adapter-qqbot",
     "crates/bot-core",
+    "crates/onebot-protocol",
     "crates/plugin-api",
     "crates/plugin-host",
     "crates/qqbot-protocol",
@@ -26,6 +28,7 @@ name = "bkmqb"
 path = "src/main.rs"
 
 [dependencies]
+adapter-onebot11 = { path = "crates/adapter-onebot11" }
 adapter-qqbot = { path = "crates/adapter-qqbot" }
 bot-core = { path = "crates/bot-core" }
 builtin-plugins = { path = "plugins/builtin" }
@@ -86,6 +89,7 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }

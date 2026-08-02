@@ -1,0 +1,17 @@
+{
+  "time": 1700000000,
+  "self_id": 10000,
+  "post_type": "message",
+  "message_type": "group",
+  "sub_type": "normal",
+  "message_id": 200,
+  "group_id": 300,
+  "user_id": 400,
+  "message": [
+    { "type": "at", "data": { "qq": "10000" } },
+    { "type": "text", "data": { "text": " /ping" } }
+  ],
+  "raw_message": "[CQ:at,qq=10000] /ping",
+  "sender": { "nickname": "Tester" },
+  "future_field": true
+}

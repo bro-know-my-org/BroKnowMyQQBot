@@ -1,0 +1,10 @@
+{
+  "time": 1700000002,
+  "self_id": 10000,
+  "post_type": "notice",
+  "notice_type": "group_increase",
+  "sub_type": "approve",
+  "group_id": 300,
+  "operator_id": 400,
+  "user_id": 401
+}

@@ -1,0 +1,7 @@
+{
+  "time": 1700000004,
+  "self_id": 10000,
+  "post_type": "meta_event",
+  "meta_event_type": "lifecycle",
+  "sub_type": "connect"
+}

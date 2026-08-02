@@ -1,0 +1,9 @@
+{
+  "status": "ok",
+  "retcode": 0,
+  "data": { "message_id": 202 },
+  "message": "",
+  "wording": "",
+  "echo": "fixture-echo",
+  "future_field": true
+}
