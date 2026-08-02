@@ -10,6 +10,7 @@ pub(crate) struct BotConfig {
     pub(crate) qq: QqConfig,
     pub(crate) onebot11: OneBot11Config,
     pub(crate) runtime: RuntimeConfig,
+    pub(crate) management: ManagementConfig,
     pub(crate) plugins: PluginsConfig,
     pub(crate) logging: LoggingConfig,
 }
@@ -89,13 +90,37 @@ impl Default for QqWebhookConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct RuntimeConfig {
+    pub(crate) queue_capacity: usize,
     pub(crate) event_concurrency: usize,
+    pub(crate) handler_timeout_seconds: u64,
+    pub(crate) shutdown_timeout_seconds: u64,
+    pub(crate) dedup_capacity: usize,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            queue_capacity: 32,
             event_concurrency: 32,
+            handler_timeout_seconds: 30,
+            shutdown_timeout_seconds: 20,
+            dedup_capacity: 16_384,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ManagementConfig {
+    pub(crate) enabled: bool,
+    pub(crate) listen: String,
+}
+
+impl Default for ManagementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:9090".to_owned(),
         }
     }
 }

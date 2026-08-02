@@ -260,9 +260,10 @@ impl Adapter for FaultSequenceAdapter {
 
     async fn run(
         &self,
-        events: mpsc::Sender<EventEnvelope>,
+        events: bot_core::EventSender,
         mut shutdown: ShutdownSignal,
     ) -> Result<(), AdapterError> {
+        events.mark_ready();
         for event in std::mem::take(&mut *self.events.lock().await) {
             events
                 .send(event)

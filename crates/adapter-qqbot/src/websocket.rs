@@ -7,8 +7,8 @@ use std::{
 
 use async_trait::async_trait;
 use bot_core::{
-    Action, ActionResult, Adapter, AdapterError, AdapterId, EventEnvelope, MessageTarget,
-    ShutdownSignal,
+    Action, ActionResult, Adapter, AdapterError, AdapterId, EventEnvelope, EventSendError,
+    EventSender, MessageTarget, ShutdownSignal,
 };
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
@@ -19,7 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::{
     net::TcpStream,
-    sync::{Mutex, mpsc},
+    sync::Mutex,
     time::{Instant, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tokio_tungstenite::{
@@ -86,7 +86,7 @@ impl QqWebSocketAdapter {
 
     async fn run_forever(
         &self,
-        events: mpsc::Sender<EventEnvelope>,
+        events: EventSender,
         mut shutdown: ShutdownSignal,
     ) -> Result<(), AdapterError> {
         let mut backoff = ReconnectBackoff::default();
@@ -94,11 +94,19 @@ impl QqWebSocketAdapter {
             if shutdown.is_shutdown() {
                 return Ok(());
             }
-            match self
+            events.mark_not_ready();
+            let connection_result = self
                 .run_connection(&events, &mut shutdown, &mut backoff)
-                .await
-            {
+                .await;
+            events.mark_not_ready();
+            match connection_result {
                 Ok(ConnectionExit::Shutdown) => return Ok(()),
+                Err(ConnectionError::EventAdapterMismatch { expected, actual }) => {
+                    return Err(AdapterError::EventAdapterMismatch { expected, actual });
+                }
+                Err(ConnectionError::EventQueueClosed) => {
+                    return Err(AdapterError::EventQueueClosed);
+                }
                 Err(error) if error.is_fatal() => {
                     return Err(AdapterError::Configuration(error.to_string()));
                 }
@@ -124,7 +132,7 @@ impl QqWebSocketAdapter {
 
     async fn run_connection(
         &self,
-        events: &mpsc::Sender<EventEnvelope>,
+        events: &EventSender,
         shutdown: &mut ShutdownSignal,
         backoff: &mut ReconnectBackoff,
     ) -> Result<ConnectionExit, ConnectionError> {
@@ -312,7 +320,7 @@ impl QqWebSocketAdapter {
     async fn handle_dispatch(
         &self,
         payload: GatewayPayload,
-        events: &mpsc::Sender<EventEnvelope>,
+        events: &EventSender,
     ) -> Result<bool, ConnectionError> {
         let event_type = payload.t.as_deref().unwrap_or("UNKNOWN");
         let dispatch_event_id = payload.id.as_deref().unwrap_or("-");
@@ -339,6 +347,9 @@ impl QqWebSocketAdapter {
         }
 
         let authenticated = matches!(event_type, "READY" | "RESUMED");
+        if authenticated {
+            events.mark_ready();
+        }
         let mut mapped = match map_dispatch(&self.config.adapter_id, &payload) {
             Ok(mapped) => mapped,
             Err(error) => {
@@ -375,10 +386,18 @@ impl QqWebSocketAdapter {
                 ),
                 _ => ("other", None),
             };
-            events.try_send(event).map_err(|error| match error {
-                mpsc::error::TrySendError::Closed(_) => ConnectionError::EventQueueClosed,
-                mpsc::error::TrySendError::Full(_) => ConnectionError::EventQueueBackpressure,
-            })?;
+            if let Err(error) = events.try_send(event) {
+                if let Some(seq) = payload.s {
+                    self.session.lock().await.rollback_dispatch(seq);
+                }
+                return Err(match error {
+                    EventSendError::QueueClosed => ConnectionError::EventQueueClosed,
+                    EventSendError::QueueFull => ConnectionError::EventQueueBackpressure,
+                    EventSendError::AdapterMismatch { expected, actual } => {
+                        ConnectionError::EventAdapterMismatch { expected, actual }
+                    }
+                });
+            }
             info!(
                 adapter_id = %self.config.adapter_id,
                 event_type = %event_type,
@@ -683,11 +702,7 @@ impl Adapter for QqWebSocketAdapter {
         "qq.official"
     }
 
-    async fn run(
-        &self,
-        events: mpsc::Sender<EventEnvelope>,
-        shutdown: ShutdownSignal,
-    ) -> Result<(), AdapterError> {
+    async fn run(&self, events: EventSender, shutdown: ShutdownSignal) -> Result<(), AdapterError> {
         self.run_forever(events, shutdown).await
     }
 
@@ -741,6 +756,11 @@ enum ConnectionError {
     EventQueueClosed,
     #[error("runtime event queue is full; reconnecting so the event can be replayed")]
     EventQueueBackpressure,
+    #[error("event Adapter mismatch: expected `{expected}`, received `{actual}`")]
+    EventAdapterMismatch {
+        expected: AdapterId,
+        actual: AdapterId,
+    },
     #[error("too many QQ Gateway events are awaiting successful handler completion")]
     UncommittedEventLimit,
     #[error("QQ Gateway dispatch sequence decreased from {last} to {received}")]
@@ -780,7 +800,9 @@ fn validate_gateway_url(value: &str) -> Result<(), ConnectionError> {
 impl ConnectionError {
     fn is_fatal(&self) -> bool {
         match self {
-            Self::FatalClose { .. } | Self::InvalidGatewayUrl(_) => true,
+            Self::FatalClose { .. }
+            | Self::InvalidGatewayUrl(_)
+            | Self::EventAdapterMismatch { .. } => true,
             Self::Api(error) => is_fatal_api_error(error),
             _ => false,
         }
@@ -867,6 +889,15 @@ impl SessionState {
             dispatch.completed = true;
         }
         self.advance_committed();
+    }
+
+    fn rollback_dispatch(&mut self, seq: u64) {
+        self.pending.retain(|dispatch| dispatch.seq != seq);
+        self.last_received = self
+            .pending
+            .back()
+            .map(|dispatch| dispatch.seq)
+            .or(self.last_committed);
     }
 
     fn advance_committed(&mut self) {
@@ -1022,6 +1053,28 @@ mod tests {
 
         state.mark_handled(old_delivery);
         assert_eq!(state.last_committed, Some(2));
+    }
+
+    #[test]
+    fn failed_queue_admission_allows_gateway_replay() {
+        let mut state = SessionState {
+            session_id: Some("session".to_owned()),
+            last_committed: Some(1),
+            ..SessionState::default()
+        };
+        let DispatchRecord::Accepted(Some(first_delivery)) =
+            state.record_dispatch(2, true).unwrap()
+        else {
+            panic!("original event must be accepted")
+        };
+        state.rollback_dispatch(2);
+
+        let DispatchRecord::Accepted(Some(replayed_delivery)) =
+            state.record_dispatch(2, true).unwrap()
+        else {
+            panic!("replayed event must be accepted after rollback")
+        };
+        assert_ne!(first_delivery, replayed_delivery);
     }
 
     #[test]

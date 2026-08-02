@@ -7,7 +7,7 @@ use axum::{
     http::HeaderMap,
     routing::{get, post},
 };
-use bot_core::{Adapter, shutdown_channel};
+use bot_core::{Adapter, EventSender, RuntimeObserver, shutdown_channel};
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{OpenApiClient, TokenManager};
 use reqwest::Client;
@@ -128,6 +128,8 @@ async fn reconnect_resumes_from_last_runtime_committed_sequence() {
         api,
     ));
     let (events_sender, mut events) = mpsc::channel(4);
+    let events_sender =
+        EventSender::new(events_sender, adapter.id().clone(), RuntimeObserver::new()).unwrap();
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let running_adapter = Arc::clone(&adapter);
     let adapter_task =

@@ -30,6 +30,7 @@ path = "src/main.rs"
 [dependencies]
 adapter-onebot11 = { path = "crates/adapter-onebot11" }
 adapter-qqbot = { path = "crates/adapter-qqbot" }
+axum.workspace = true
 bot-core = { path = "crates/bot-core" }
 builtin-plugins = { path = "plugins/builtin" }
 chrono.workspace = true
@@ -46,6 +47,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tower.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true

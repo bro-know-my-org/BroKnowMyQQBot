@@ -6,6 +6,7 @@ mod bootstrap;
 mod cli;
 mod config;
 mod logging;
+mod management;
 mod plugin_dev;
 mod plugins;
 

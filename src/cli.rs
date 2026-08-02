@@ -28,10 +28,31 @@ pub(crate) async fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error
     match command {
         "help" | "--help" | "-h" => print_help(),
         "version" | "--version" | "-V" => println!("bkmqb {}", env!("CARGO_PKG_VERSION")),
+        "config" => run_config(&arguments[1..])?,
         "plugin" => run_plugin(&arguments[1..]).await?,
         other => return Err(format!("unknown bkmqb command `{other}`; run `bkmqb help`").into()),
     }
     Ok(())
+}
+
+fn run_config(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match arguments.first().map(String::as_str) {
+        Some("check") if arguments.len() == 1 => {
+            // This command runs before any long-lived bot services start, so
+            // keep synchronous filesystem work on the CLI path instead of
+            // creating a non-cancellable Tokio blocking task.
+            BotConfig::check()?;
+            println!("configuration is valid; changes require a restart");
+            Ok(())
+        }
+        Some("help" | "--help" | "-h") | None => {
+            print_config_help();
+            Ok(())
+        }
+        Some(other) => {
+            Err(format!("unknown config command `{other}`; run `bkmqb config help`").into())
+        }
+    }
 }
 
 async fn run_plugin(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -824,8 +845,12 @@ fn now_ms() -> i64 {
 
 fn print_help() {
     println!(
-        "BroKnowMyQQBot command line\n\nUsage:\n  bkmqb\n  bkmqb plugin <command>\n  bkmqb version"
+        "BroKnowMyQQBot command line\n\nUsage:\n  bkmqb\n  bkmqb config check\n  bkmqb plugin <command>\n  bkmqb version"
     );
+}
+
+fn print_config_help() {
+    println!("Configuration management\n\nUsage:\n  bkmqb config check");
 }
 
 fn print_plugin_help() {

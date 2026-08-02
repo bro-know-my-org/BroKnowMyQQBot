@@ -3,10 +3,10 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -14,8 +14,8 @@ use std::{
 
 use async_trait::async_trait;
 use bot_core::{
-    Action, ActionResult, Adapter, AdapterError, AdapterId, EventEnvelope, MessageTarget,
-    ShutdownSignal,
+    Action, ActionResult, Adapter, AdapterError, AdapterId, EventEnvelope, EventSendError,
+    EventSender, MessageTarget, ShutdownSignal,
 };
 use futures_util::{Sink, SinkExt as _, StreamExt as _};
 use onebot_protocol::{ActionRequest, ActionResponse, MessageSegment, OneBotId, response_like};
@@ -27,7 +27,7 @@ use tokio::{
     io::AsyncWriteExt as _,
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc, oneshot},
-    task::JoinSet,
+    task::{JoinHandle, JoinSet},
     time::{Instant, interval, timeout},
 };
 use tokio_tungstenite::{
@@ -45,6 +45,11 @@ mod mapping;
 pub use mapping::{MappingError, map_event};
 
 const MAX_PENDING_HANDSHAKES: usize = 8;
+pub const MAX_PENDING_EVENTS_PER_CONNECTION: usize = 64;
+
+enum TextHandling {
+    Continue,
+}
 
 #[derive(Clone)]
 pub struct OneBot11Config {
@@ -98,11 +103,57 @@ struct PendingAction {
     response: oneshot::Sender<Result<ActionResponse, AdapterError>>,
 }
 
+#[derive(Default)]
+struct ConnectionState {
+    generation: u64,
+    outbound: Option<mpsc::Sender<OutboundAction>>,
+    event_queue_full: bool,
+    event_producer_waiting: bool,
+}
+
+struct ConnectionGuard {
+    connection: Arc<StdMutex<ConnectionState>>,
+    generation: u64,
+    events: EventSender,
+    active_slot: Arc<AtomicBool>,
+    forwarder_abort: tokio::task::AbortHandle,
+    unpublished: bool,
+}
+
+impl ConnectionGuard {
+    fn unpublish(&mut self) {
+        if self.unpublished {
+            return;
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if connection.generation == self.generation {
+            connection.outbound.take();
+            connection.event_queue_full = false;
+            connection.event_producer_waiting = false;
+        }
+        self.events.mark_not_ready();
+        self.unpublished = true;
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.unpublish();
+        self.active_slot.store(false, Ordering::Release);
+        self.forwarder_abort.abort();
+    }
+}
+
 pub struct OneBot11Adapter {
     config: OneBot11Config,
     local_addr: SocketAddr,
     listener: Mutex<Option<TcpListener>>,
-    active: Mutex<Option<mpsc::Sender<OutboundAction>>>,
+    connection: Arc<StdMutex<ConnectionState>>,
+    #[cfg(test)]
+    queue_backpressure: StdMutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl std::fmt::Debug for OneBot11Adapter {
@@ -148,7 +199,9 @@ impl OneBot11Adapter {
             config,
             local_addr,
             listener: Mutex::new(Some(listener)),
-            active: Mutex::new(None),
+            connection: Arc::new(StdMutex::new(ConnectionState::default())),
+            #[cfg(test)]
+            queue_backpressure: StdMutex::new(None),
         })
     }
 
@@ -156,34 +209,132 @@ impl OneBot11Adapter {
         self.local_addr
     }
 
+    #[cfg(test)]
+    fn set_queue_backpressure_notify(&self, notify: Arc<tokio::sync::Notify>) {
+        *self
+            .queue_backpressure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify);
+    }
+
+    fn start_event_forwarder(
+        &self,
+        events: EventSender,
+    ) -> (
+        mpsc::Sender<EventEnvelope>,
+        JoinHandle<Result<(), AdapterError>>,
+    ) {
+        // Reserve one envelope for the forwarder and one for a producer
+        // waiting on capacity while preserving the hard connection budget.
+        let (queued, receiver) = mpsc::channel(MAX_PENDING_EVENTS_PER_CONNECTION - 3);
+        let forwarder = tokio::spawn(forward_events(
+            receiver,
+            events,
+            Arc::clone(&self.connection),
+        ));
+        (queued, forwarder)
+    }
+
+    fn enqueue_local_event(
+        &self,
+        events: &mpsc::Sender<EventEnvelope>,
+        event: EventEnvelope,
+        pending_events: &mut VecDeque<EventEnvelope>,
+    ) -> Result<TextHandling, AdapterError> {
+        {
+            let mut connection = self
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match events.try_send(event) {
+                Ok(()) => {
+                    connection.event_queue_full = events.capacity() == 0;
+                    return Ok(TextHandling::Continue);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(AdapterError::EventQueueClosed);
+                }
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    pending_events.push_back(event);
+                    connection.event_queue_full = true;
+                    connection.event_producer_waiting = true;
+                }
+            }
+        }
+        #[cfg(test)]
+        if let Some(notify) = self
+            .queue_backpressure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            notify.notify_one();
+        }
+        Ok(TextHandling::Continue)
+    }
+
     async fn serve_connection(
         &self,
         socket: WebSocketStream<TcpStream>,
-        events: &mpsc::Sender<EventEnvelope>,
+        events: &EventSender,
         shutdown: &mut ShutdownSignal,
+        active_slot: Arc<AtomicBool>,
     ) -> Result<(), AdapterError> {
         let (outbound_sender, outbound_receiver) = mpsc::channel(self.config.max_pending_actions);
-        *self.active.lock().await = Some(outbound_sender);
+        let generation = {
+            let mut connection = self
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            connection.generation = connection.generation.wrapping_add(1);
+            connection.outbound = Some(outbound_sender);
+            connection.generation
+        };
+        let (queued_events, event_forwarder) = self.start_event_forwarder(events.clone());
+        let mut connection_guard = ConnectionGuard {
+            connection: Arc::clone(&self.connection),
+            generation,
+            events: events.clone(),
+            active_slot,
+            forwarder_abort: event_forwarder.abort_handle(),
+            unpublished: false,
+        };
+        events.mark_ready();
         info!(adapter_id = %self.config.id, "OneBot 11 reverse WebSocket connected");
         let result = self
-            .run_connection(socket, outbound_receiver, events, shutdown)
+            .run_connection(
+                socket,
+                outbound_receiver,
+                queued_events,
+                event_forwarder,
+                shutdown,
+                &mut connection_guard,
+            )
             .await;
-        self.active.lock().await.take();
         info!(adapter_id = %self.config.id, "OneBot 11 reverse WebSocket disconnected");
         result
     }
 
+    #[allow(clippy::too_many_lines)] // Keep socket, Action, and event teardown in one state machine.
     async fn run_connection(
         &self,
         socket: WebSocketStream<TcpStream>,
         mut outbound: mpsc::Receiver<OutboundAction>,
-        events: &mpsc::Sender<EventEnvelope>,
+        queued_events: mpsc::Sender<EventEnvelope>,
+        mut event_forwarder: JoinHandle<Result<(), AdapterError>>,
         shutdown: &mut ShutdownSignal,
+        connection_guard: &mut ConnectionGuard,
     ) -> Result<(), AdapterError> {
         let (mut writer, mut reader) = socket.split();
         let mut pending = HashMap::<String, PendingAction>::new();
         let mut deadline_tick = interval(Duration::from_millis(100));
-        let result = loop {
+        // Keep a hard per-connection memory bound. The reader remains available
+        // for Action responses while this buffer has room; once the absolute
+        // limit is reached we apply TCP backpressure instead of dropping events
+        // or growing memory without bound.
+        let mut event_forwarder_finished = false;
+        let mut pending_events = VecDeque::new();
+        let mut result = loop {
             tokio::select! {
                 () = shutdown.cancelled() => {
                     let _ = send_websocket_message(
@@ -197,6 +348,10 @@ impl OneBot11Adapter {
                 }
                 _ = deadline_tick.tick() => {
                     expire_pending(&mut pending);
+                }
+                forwarded = &mut event_forwarder => {
+                    event_forwarder_finished = true;
+                    break map_event_forwarder_join(forwarded);
                 }
                 outbound_action = outbound.recv() => {
                     let Some(outbound_action) = outbound_action else {
@@ -213,7 +368,22 @@ impl OneBot11Adapter {
                         break Err(error);
                     }
                 }
-                incoming = reader.next() => {
+                reserved = queued_events.reserve(), if !pending_events.is_empty() => {
+                    let Ok(permit) = reserved else {
+                        break Err(AdapterError::EventQueueClosed);
+                    };
+                    let event = pending_events
+                        .pop_front()
+                        .expect("pending event exists while reservation branch is enabled");
+                    permit.send(event);
+                    let mut connection = self
+                        .connection
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    connection.event_queue_full = queued_events.capacity() == 0;
+                    connection.event_producer_waiting = !pending_events.is_empty();
+                }
+                incoming = reader.next(), if pending_events.len() < 2 => {
                     let Some(incoming) = incoming else {
                         break Ok(());
                     };
@@ -225,8 +395,19 @@ impl OneBot11Adapter {
                     };
                     match incoming {
                         WebSocketMessage::Text(text) => {
-                            if let Err(error) = self.handle_text(&text, events, &mut pending) {
-                                break Err(error);
+                            match self.handle_text(
+                                &text,
+                                &queued_events,
+                                &mut pending_events,
+                                &mut pending,
+                            ) {
+                                Ok(TextHandling::Continue) => {
+                                    if pending_events.len() == 2 {
+                                        fail_unsent(&mut outbound);
+                                        fail_pending_unknown(&mut pending);
+                                    }
+                                }
+                                Err(error) => break Err(error),
                             }
                         }
                         WebSocketMessage::Binary(_) => {
@@ -250,9 +431,35 @@ impl OneBot11Adapter {
                 }
             }
         };
+        // Stop accepting Actions as soon as the socket loop ends. Event
+        // forwarding may remain backpressured while already accepted events
+        // drain, but no Action can be written during that interval.
+        connection_guard.unpublish();
         outbound.close();
         fail_unsent(&mut outbound);
         fail_pending_unknown(&mut pending);
+        while !pending_events.is_empty() {
+            let Ok(permit) = queued_events.reserve().await else {
+                if result.is_ok() {
+                    result = Err(AdapterError::EventQueueClosed);
+                }
+                break;
+            };
+            permit.send(
+                pending_events
+                    .pop_front()
+                    .expect("pending event exists while flushing"),
+            );
+        }
+        drop(queued_events);
+        if !event_forwarder_finished {
+            if let Err(error) = finish_event_forwarder(&mut event_forwarder).await {
+                warn!(adapter_id = %self.config.id, error = %error, "OneBot event forwarder failed while draining");
+                if result.is_ok() {
+                    result = Err(error);
+                }
+            }
+        }
         result
     }
 
@@ -260,8 +467,9 @@ impl OneBot11Adapter {
         &self,
         text: &Utf8Bytes,
         events: &mpsc::Sender<EventEnvelope>,
+        pending_events: &mut VecDeque<EventEnvelope>,
         pending: &mut HashMap<String, PendingAction>,
-    ) -> Result<(), AdapterError> {
+    ) -> Result<TextHandling, AdapterError> {
         let raw: Value = serde_json::from_str(text)
             .map_err(|error| AdapterError::Transport(format!("invalid OneBot JSON: {error}")))?;
         if response_like(&raw) {
@@ -273,36 +481,26 @@ impl OneBot11Adapter {
                         %error,
                         "ignored malformed OneBot action response"
                     );
-                    return Ok(());
+                    return Ok(TextHandling::Continue);
                 }
             };
             let Some(echo) = response.echo_key() else {
                 warn!(adapter_id = %self.config.id, "ignored OneBot response with invalid echo");
-                return Ok(());
+                return Ok(TextHandling::Continue);
             };
             if let Some(pending_action) = pending.remove(&echo) {
                 let _ = pending_action.response.send(Ok(response));
             } else {
                 debug!(adapter_id = %self.config.id, echo, "ignored unknown or duplicate OneBot echo");
             }
-            return Ok(());
+            return Ok(TextHandling::Continue);
         }
         match map_event(&self.config.id, raw) {
-            Ok(Some(event)) => match events.try_send(event) {
-                Ok(()) => Ok(()),
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        adapter_id = %self.config.id,
-                        "dropped OneBot event because the runtime queue is full"
-                    );
-                    Ok(())
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => Err(AdapterError::EventQueueClosed),
-            },
-            Ok(None) => Ok(()),
+            Ok(Some(event)) => self.enqueue_local_event(events, event, pending_events),
+            Ok(None) => Ok(TextHandling::Continue),
             Err(error) => {
                 warn!(adapter_id = %self.config.id, error = %error, "ignored invalid OneBot event");
-                Ok(())
+                Ok(TextHandling::Continue)
             }
         }
     }
@@ -369,7 +567,7 @@ impl Adapter for OneBot11Adapter {
 
     async fn run(
         &self,
-        events: mpsc::Sender<EventEnvelope>,
+        events: EventSender,
         mut shutdown: ShutdownSignal,
     ) -> Result<(), AdapterError> {
         let listener = self.listener.lock().await.take().ok_or_else(|| {
@@ -419,7 +617,12 @@ impl Adapter for OneBot11Adapter {
                             )));
                         }
                     };
-                    let connection = self.serve_connection(socket, &events, &mut shutdown);
+                    let connection = self.serve_connection(
+                        socket,
+                        &events,
+                        &mut shutdown,
+                        Arc::clone(&active_slot),
+                    );
                     tokio::pin!(connection);
                     loop {
                         tokio::select! {
@@ -437,7 +640,6 @@ impl Adapter for OneBot11Adapter {
                             }
                         }
                     }
-                    active_slot.store(false, Ordering::Release);
                 }
             }
         }
@@ -445,21 +647,34 @@ impl Adapter for OneBot11Adapter {
 
     async fn execute(&self, action: Action) -> Result<ActionResult, AdapterError> {
         let (action, params) = Self::action_request(action)?;
-        let sender = self.active.lock().await.clone().ok_or_else(|| {
-            AdapterError::Action("OneBot 11 reverse WebSocket is not connected".to_owned())
-        })?;
         let (response_sender, response_receiver) = oneshot::channel();
         let deadline = Instant::now() + self.config.action_timeout;
-        sender
-            .try_send(OutboundAction {
-                action,
-                params,
-                deadline,
-                response: response_sender,
-            })
-            .map_err(|error| {
-                AdapterError::Action(format!("OneBot Action queue unavailable: {error}"))
+        {
+            // Admission and connection retirement share this lock, so a
+            // sender snapshot cannot enqueue after the socket is unpublished.
+            let connection = self
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let sender = connection.outbound.as_ref().ok_or_else(|| {
+                AdapterError::Action("OneBot 11 reverse WebSocket is not connected".to_owned())
             })?;
+            if connection.event_queue_full || connection.event_producer_waiting {
+                return Err(AdapterError::Action(
+                    "OneBot event queue is backpressured; Action was not sent".to_owned(),
+                ));
+            }
+            sender
+                .try_send(OutboundAction {
+                    action,
+                    params,
+                    deadline,
+                    response: response_sender,
+                })
+                .map_err(|error| {
+                    AdapterError::Action(format!("OneBot Action queue unavailable: {error}"))
+                })?;
+        }
         let response = timeout(
             self.config
                 .action_timeout
@@ -480,6 +695,62 @@ impl Adapter for OneBot11Adapter {
                 .map_err(|error| AdapterError::Action(error.to_string()))?,
         })
     }
+}
+
+async fn forward_events(
+    mut queued: mpsc::Receiver<EventEnvelope>,
+    events: EventSender,
+    connection: Arc<StdMutex<ConnectionState>>,
+) -> Result<(), AdapterError> {
+    while let Some(event) = queued.recv().await {
+        {
+            let mut connection_state = connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            connection_state.event_queue_full = queued.capacity() == 0;
+        }
+        let permit = match events.reserve().await {
+            Ok(permit) => permit,
+            Err(EventSendError::QueueClosed) => return Err(AdapterError::EventQueueClosed),
+            Err(EventSendError::QueueFull) => {
+                return Err(AdapterError::Transport(
+                    "runtime event queue unexpectedly remained full after waiting".to_owned(),
+                ));
+            }
+            Err(EventSendError::AdapterMismatch { expected, actual }) => {
+                return Err(AdapterError::EventAdapterMismatch { expected, actual });
+            }
+        };
+        match permit.send(event) {
+            Ok(()) => {}
+            Err(EventSendError::QueueClosed) => return Err(AdapterError::EventQueueClosed),
+            Err(EventSendError::QueueFull) => {
+                return Err(AdapterError::Transport(
+                    "runtime event queue unexpectedly remained full after waiting".to_owned(),
+                ));
+            }
+            Err(EventSendError::AdapterMismatch { expected, actual }) => {
+                return Err(AdapterError::EventAdapterMismatch { expected, actual });
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn finish_event_forwarder(
+    forwarder: &mut JoinHandle<Result<(), AdapterError>>,
+) -> Result<(), AdapterError> {
+    map_event_forwarder_join(forwarder.await)
+}
+
+fn map_event_forwarder_join(
+    joined: Result<Result<(), AdapterError>, tokio::task::JoinError>,
+) -> Result<(), AdapterError> {
+    joined.unwrap_or_else(|error| {
+        Err(AdapterError::Transport(format!(
+            "OneBot event forwarding task failed: {error}"
+        )))
+    })
 }
 
 fn id_param(value: &str) -> Value {
@@ -708,8 +979,8 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use bot_core::{
-        Action, Adapter, AdapterId, Event, MessageTarget, ReplyAction, RuntimeBuilder,
-        SendMessageAction, shutdown_channel,
+        Action, Adapter, AdapterError, AdapterId, Event, EventEnvelope, EventSender, MessageTarget,
+        ReplyAction, RuntimeBuilder, RuntimeObserver, SendMessageAction, shutdown_channel,
     };
     use builtin_plugins::PingPlugin;
     use futures_util::{SinkExt as _, StreamExt as _};
@@ -744,6 +1015,19 @@ mod tests {
         )
     }
 
+    fn event_channel(capacity: usize) -> (EventSender, tokio::sync::mpsc::Receiver<EventEnvelope>) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+        (
+            EventSender::new(
+                sender,
+                AdapterId::new("onebot-test"),
+                RuntimeObserver::new(),
+            )
+            .unwrap(),
+            receiver,
+        )
+    }
+
     fn request(
         adapter: &OneBot11Adapter,
         token: &str,
@@ -774,7 +1058,7 @@ mod tests {
     async fn reverse_websocket_rejects_invalid_token() {
         let adapter = adapter().await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, _received) = event_channel(1);
         let running_adapter = adapter.clone();
         let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
 
@@ -802,7 +1086,7 @@ mod tests {
     async fn reverse_websocket_accepts_query_token() {
         let adapter = adapter().await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, _received) = event_channel(1);
         let running_adapter = adapter.clone();
         let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
 
@@ -818,7 +1102,7 @@ mod tests {
     async fn stalled_handshake_does_not_block_authorized_client() {
         let adapter = adapter().await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, _received) = event_channel(1);
         let running_adapter = adapter.clone();
         let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
         let _stalled = tokio::net::TcpStream::connect(adapter.local_addr())
@@ -917,7 +1201,7 @@ mod tests {
     async fn disconnect_marks_transmitted_action_result_unknown() {
         let adapter = adapter().await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, _received) = event_channel(1);
         let running_adapter = adapter.clone();
         let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
         let (mut socket, _) = connect_async(request(&adapter, "test-token"))
@@ -953,10 +1237,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborting_adapter_task_unpublishes_connection_and_fails_actions() {
+        let adapter = adapter().await;
+        let (_shutdown_handle, shutdown_signal) = shutdown_channel();
+        let (events, _received) = event_channel(1);
+        let running_adapter = adapter.clone();
+        let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
+        let (mut socket, _) = connect_async(request(&adapter, "test-token"))
+            .await
+            .unwrap();
+
+        let executing = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move {
+                adapter
+                    .execute(Action::SendMessage(SendMessageAction {
+                        target: MessageTarget::Private {
+                            user_id: "42".to_owned(),
+                        },
+                        content: "cancelled".to_owned(),
+                    }))
+                    .await
+            })
+        };
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            WebSocketMessage::Text(_)
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            adapter
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .outbound
+                .is_none()
+        );
+        assert!(matches!(
+            timeout(Duration::from_secs(1), executing)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            AdapterError::ActionUnknown(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn action_timeout_is_reported_as_unknown() {
         let adapter = adapter_with_timeout(Duration::from_millis(100)).await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, _received) = event_channel(1);
         let running_adapter = adapter.clone();
         let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
         let (mut socket, _) = connect_async(request(&adapter, "test-token"))
@@ -996,7 +1328,7 @@ mod tests {
     async fn unknown_and_duplicate_echoes_do_not_break_correlation() {
         let adapter = adapter().await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, _received) = event_channel(1);
         let running_adapter = adapter.clone();
         let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
         let (mut socket, _) = connect_async(request(&adapter, "test-token"))
@@ -1058,7 +1390,7 @@ mod tests {
     async fn saturated_event_queue_does_not_block_action_response() {
         let adapter = adapter().await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, received) = event_channel(1);
         events
             .try_send(
                 super::map_event(
@@ -1116,14 +1448,226 @@ mod tests {
             .unwrap();
 
         shutdown_handle.shutdown();
-        task.await.unwrap().unwrap();
+        let drain = tokio::spawn(async move {
+            let mut received = received;
+            while received.recv().await.is_some() {}
+        });
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drain.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filling_the_final_local_event_slot_rejects_new_actions() {
+        let adapter = adapter().await;
+        let (shutdown_handle, shutdown_signal) = shutdown_channel();
+        let (events, received) = event_channel(1);
+        events
+            .try_send(
+                super::map_event(
+                    &AdapterId::new("onebot-test"),
+                    serde_json::from_str(include_str!(
+                        "../../../test-data/onebot11/group-message.json"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+        let running_adapter = adapter.clone();
+        let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
+        let (mut socket, _) = connect_async(request(&adapter, "test-token"))
+            .await
+            .unwrap();
+        for _ in 0..super::MAX_PENDING_EVENTS_PER_CONNECTION - 1 {
+            socket
+                .send(WebSocketMessage::Text(
+                    include_str!("../../../test-data/onebot11/private-message.json").into(),
+                ))
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(1), async {
+            while !adapter
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .event_queue_full
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let error = adapter
+            .execute(Action::SendMessage(SendMessageAction {
+                target: MessageTarget::Private {
+                    user_id: "42".to_owned(),
+                },
+                content: "must-not-send".to_owned(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AdapterError::Action(message) if message.contains("backpressured"))
+        );
+
+        shutdown_handle.shutdown();
+        let drain = tokio::spawn(async move {
+            let mut received = received;
+            while received.recv().await.is_some() {}
+        });
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drain.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnected_socket_is_unpublished_before_accepted_events_finish_draining() {
+        let adapter = adapter().await;
+        let (shutdown_handle, shutdown_signal) = shutdown_channel();
+        let (events, mut received) = event_channel(1);
+        events
+            .try_send(
+                super::map_event(
+                    &AdapterId::new("onebot-test"),
+                    serde_json::from_str(include_str!(
+                        "../../../test-data/onebot11/group-message.json"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+        let running_adapter = adapter.clone();
+        let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
+        let (mut socket, _) = connect_async(request(&adapter, "test-token"))
+            .await
+            .unwrap();
+        socket
+            .send(WebSocketMessage::Text(
+                include_str!("../../../test-data/onebot11/private-message.json").into(),
+            ))
+            .await
+            .unwrap();
+        socket.close(None).await.unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if adapter
+                    .connection
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .outbound
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let error = adapter
+            .execute(Action::SendMessage(SendMessageAction {
+                target: MessageTarget::Private {
+                    user_id: "42".to_owned(),
+                },
+                content: "must-not-queue".to_owned(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AdapterError::Action(message) if message.contains("not connected"))
+        );
+
+        received.recv().await.unwrap();
+        received.recv().await.unwrap();
+        shutdown_handle.shutdown();
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_connection_blocked_on_its_local_event_queue() {
+        let adapter = adapter().await;
+        let saturated = Arc::new(tokio::sync::Notify::new());
+        adapter.set_queue_backpressure_notify(Arc::clone(&saturated));
+        let (shutdown_handle, shutdown_signal) = shutdown_channel();
+        let (events, received) = event_channel(1);
+        events
+            .try_send(
+                super::map_event(
+                    &AdapterId::new("onebot-test"),
+                    serde_json::from_str(include_str!(
+                        "../../../test-data/onebot11/group-message.json"
+                    ))
+                    .unwrap(),
+                )
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+        let running_adapter = adapter.clone();
+        let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
+        let (mut socket, _) = connect_async(request(&adapter, "test-token"))
+            .await
+            .unwrap();
+        for _ in 0..super::MAX_PENDING_EVENTS_PER_CONNECTION + 2 {
+            socket
+                .send(WebSocketMessage::Text(
+                    include_str!("../../../test-data/onebot11/private-message.json").into(),
+                ))
+                .await
+                .unwrap();
+        }
+        timeout(Duration::from_secs(1), saturated.notified())
+            .await
+            .unwrap();
+
+        let error = adapter
+            .execute(Action::SendMessage(SendMessageAction {
+                target: MessageTarget::Private {
+                    user_id: "42".to_owned(),
+                },
+                content: "must-not-send".to_owned(),
+            }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AdapterError::Action(message) if message.contains("backpressured"))
+        );
+
+        shutdown_handle.shutdown();
+        let drain = tokio::spawn(async move {
+            let mut received = received;
+            while received.recv().await.is_some() {}
+        });
+        timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drain.await.unwrap();
     }
 
     #[tokio::test]
     async fn malformed_response_like_json_does_not_close_connection() {
         let adapter = adapter().await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, _received) = event_channel(1);
         let running_adapter = adapter.clone();
         let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
         let (mut socket, _) = connect_async(request(&adapter, "test-token"))
@@ -1174,7 +1718,7 @@ mod tests {
     async fn additional_connection_is_rejected_and_reconnect_succeeds() {
         let adapter = adapter().await;
         let (shutdown_handle, shutdown_signal) = shutdown_channel();
-        let (events, _received) = tokio::sync::mpsc::channel(1);
+        let (events, _received) = event_channel(1);
         let running_adapter = adapter.clone();
         let task = tokio::spawn(async move { running_adapter.run(events, shutdown_signal).await });
         let (mut first, _) = connect_async(request(&adapter, "test-token"))

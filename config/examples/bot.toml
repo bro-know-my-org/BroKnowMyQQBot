@@ -25,7 +25,15 @@ max_message_bytes = 1048576
 max_pending_actions = 256
 
 [runtime]
+queue_capacity = 32
 event_concurrency = 32
+handler_timeout_seconds = 30
+shutdown_timeout_seconds = 20
+dedup_capacity = 16384
+
+[management]
+enabled = false
+listen = "127.0.0.1:9090"
 
 [plugins]
 database = "data/plugins.db"

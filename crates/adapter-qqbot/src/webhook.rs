@@ -2,8 +2,9 @@
 
 use std::{
     collections::HashMap,
+    future::IntoFuture as _,
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -18,14 +19,15 @@ use axum::{
     routing::post,
 };
 use bot_core::{
-    Action, ActionResult, Adapter, AdapterError, AdapterId, EventEnvelope, ShutdownSignal,
+    Action, ActionResult, Adapter, AdapterError, AdapterId, EventSendError, EventSender,
+    ShutdownSignal,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use qqbot_protocol::{GatewayPayload, OpCode, OpenApiClient};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, oneshot};
 use tower::{
     BoxError, ServiceBuilder,
     limit::ConcurrencyLimitLayer,
@@ -107,7 +109,7 @@ impl QqWebhookAdapter {
             timestamp_tolerance: config.timestamp_tolerance,
             request_timeout: config.request_timeout,
             max_body_bytes: config.max_body_bytes,
-            events: Mutex::new(None),
+            lifecycle: StdMutex::new(WebhookLifecycle::default()),
             seen_events: Mutex::new(SeenEvents::default()),
         });
         let actions =
@@ -120,6 +122,14 @@ impl QqWebhookAdapter {
     }
 
     fn router(&self) -> Router {
+        let generation = self
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .as_ref()
+            .map_or(0, |active| active.generation);
         Router::new()
             .route(&self.config.path, post(handle_callback))
             .layer(
@@ -131,7 +141,10 @@ impl QqWebhookAdapter {
                     ))
                     .layer(TimeoutLayer::new(self.config.request_timeout)),
             )
-            .with_state(self.state.clone())
+            .with_state(WebhookRequestState {
+                shared: self.state.clone(),
+                generation,
+            })
     }
 }
 
@@ -147,27 +160,61 @@ impl Adapter for QqWebhookAdapter {
 
     async fn run(
         &self,
-        events: mpsc::Sender<EventEnvelope>,
+        events: EventSender,
         mut shutdown: ShutdownSignal,
     ) -> Result<(), AdapterError> {
+        let (terminal_error, terminal_failure) = oneshot::channel();
+        let generation = {
+            let mut lifecycle = self
+                .state
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if lifecycle.active.is_some() {
+                return Err(AdapterError::Configuration(
+                    "QQ Webhook adapter is already running".to_owned(),
+                ));
+            }
+            lifecycle.next_generation = lifecycle.next_generation.wrapping_add(1);
+            let generation = lifecycle.next_generation;
+            lifecycle.active = Some(ActiveWebhookRun {
+                generation,
+                events: events.clone(),
+                terminal_error: Some(terminal_error),
+            });
+            generation
+        };
+        let _run_guard = WebhookRunGuard {
+            state: Arc::clone(&self.state),
+            generation,
+            events: events.clone(),
+        };
         let listener = tokio::net::TcpListener::bind(self.config.listen)
             .await
             .map_err(|error| AdapterError::Transport(error.to_string()))?;
-        *self.state.events.lock().await = Some(events);
         let address = listener
             .local_addr()
             .map_err(|error| AdapterError::Transport(error.to_string()))?;
+        events.mark_ready();
         info!(
             adapter_id = %self.config.adapter_id,
             listen = %address,
             path = %self.config.path,
             "QQ Webhook callback server is listening"
         );
-        let result = axum::serve(listener, self.router())
+        let server = axum::serve(listener, self.router())
             .with_graceful_shutdown(async move { shutdown.cancelled().await })
-            .await;
-        *self.state.events.lock().await = None;
-        result.map_err(|error| AdapterError::Transport(error.to_string()))
+            .into_future();
+        tokio::pin!(server);
+        let result = tokio::select! {
+            biased;
+            terminal = terminal_failure => terminal.map_or_else(
+                |_| Err(AdapterError::Transport("QQ Webhook terminal error channel closed".to_owned())),
+                Err,
+            ),
+            result = &mut server => result.map_err(|error| AdapterError::Transport(error.to_string())),
+        };
+        result
     }
 
     async fn execute(&self, action: Action) -> Result<ActionResult, AdapterError> {
@@ -183,8 +230,51 @@ struct WebhookState {
     timestamp_tolerance: Duration,
     request_timeout: Duration,
     max_body_bytes: usize,
-    events: Mutex<Option<mpsc::Sender<EventEnvelope>>>,
+    lifecycle: StdMutex<WebhookLifecycle>,
     seen_events: Mutex<SeenEvents>,
+}
+
+#[derive(Debug, Clone)]
+struct WebhookRequestState {
+    shared: Arc<WebhookState>,
+    generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct WebhookLifecycle {
+    next_generation: u64,
+    active: Option<ActiveWebhookRun>,
+}
+
+#[derive(Debug)]
+struct ActiveWebhookRun {
+    generation: u64,
+    events: EventSender,
+    terminal_error: Option<oneshot::Sender<AdapterError>>,
+}
+
+struct WebhookRunGuard {
+    state: Arc<WebhookState>,
+    generation: u64,
+    events: EventSender,
+}
+
+impl Drop for WebhookRunGuard {
+    fn drop(&mut self) {
+        self.events.mark_not_ready();
+        let mut lifecycle = self
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle
+            .active
+            .as_ref()
+            .is_some_and(|active| active.generation == self.generation)
+        {
+            lifecycle.active = None;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -266,7 +356,11 @@ enum Reservation {
     Saturated,
 }
 
-async fn handle_callback(State(state): State<Arc<WebhookState>>, request: Request) -> Response {
+async fn handle_callback(
+    State(request_state): State<WebhookRequestState>,
+    request: Request,
+) -> Response {
+    let state = request_state.shared;
     let (parts, body) = request.into_parts();
     let Ok(body) = to_bytes(body, state.max_body_bytes).await else {
         return callback_error(StatusCode::PAYLOAD_TOO_LARGE, "request body is too large");
@@ -284,7 +378,9 @@ async fn handle_callback(State(state): State<Arc<WebhookState>>, request: Reques
     };
     match payload.op {
         OpCode::CALLBACK_VALIDATION => validation_response(&state, &payload),
-        OpCode::DISPATCH => dispatch_response(&state, payload, timestamp).await,
+        OpCode::DISPATCH => {
+            dispatch_response(&state, request_state.generation, payload, timestamp).await
+        }
         _ => callback_error(StatusCode::BAD_REQUEST, "unsupported callback opcode"),
     }
 }
@@ -353,8 +449,10 @@ fn validation_response(state: &WebhookState, payload: &GatewayPayload) -> Respon
     .into_response()
 }
 
+#[allow(clippy::too_many_lines)] // Keep reservation and callback acknowledgement atomic and linear.
 async fn dispatch_response(
     state: &WebhookState,
+    request_generation: u64,
     payload: GatewayPayload,
     signed_at: u64,
 ) -> Response {
@@ -398,12 +496,6 @@ async fn dispatch_response(
     let Some(event) = mapped else {
         return ack_response();
     };
-    let Some(sender) = state.events.lock().await.clone() else {
-        return callback_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "runtime is not accepting events",
-        );
-    };
     let expires_at = signed_at
         .saturating_add(state.timestamp_tolerance.as_secs())
         .max(now.saturating_add(state.request_timeout.as_secs()));
@@ -427,12 +519,49 @@ async fn dispatch_response(
             );
         }
     }
-    if sender.try_send(event).is_err() {
-        seen_events.release(&event_id);
-        return callback_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "runtime event queue is unavailable",
-        );
+    let (delivery, terminal_error) = {
+        let mut lifecycle = state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(active) = lifecycle
+            .active
+            .as_mut()
+            .filter(|active| active.generation == request_generation)
+        else {
+            seen_events.release(&event_id);
+            return callback_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime is not accepting events",
+            );
+        };
+        let delivery = active.events.try_send(event);
+        let terminal_error = matches!(delivery, Err(EventSendError::AdapterMismatch { .. }))
+            .then(|| active.terminal_error.take())
+            .flatten();
+        (delivery, terminal_error)
+    };
+    match delivery {
+        Ok(()) => {}
+        Err(EventSendError::AdapterMismatch { expected, actual }) => {
+            seen_events.release(&event_id);
+            drop(seen_events);
+            if let Some(terminal_error) = terminal_error {
+                let _ =
+                    terminal_error.send(AdapterError::EventAdapterMismatch { expected, actual });
+            }
+            return callback_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "webhook adapter identity is invalid",
+            );
+        }
+        Err(EventSendError::QueueFull | EventSendError::QueueClosed) => {
+            seen_events.release(&event_id);
+            return callback_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime event queue is unavailable",
+            );
+        }
     }
     seen_events.accept(&event_id);
     info!(adapter_id = %state.adapter_id, event_id = %compact_id(&event_id), "accepted QQ Webhook event");
@@ -584,14 +713,15 @@ fn callback_error(status: StatusCode, message: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use axum::http::{Request, StatusCode};
+    use bot_core::{Adapter as _, EventSender, RuntimeObserver};
     use ed25519_dalek::Signer as _;
     use secrecy::SecretString;
     use serde_json::{Value, json};
     use tower::ServiceExt as _;
 
     use super::{
-        APP_ID_HEADER, Reservation, SIGNATURE_HEADER, SeenEvents, TIMESTAMP_HEADER, encode_hex,
-        is_literal_http_path,
+        APP_ID_HEADER, ActiveWebhookRun, Reservation, SIGNATURE_HEADER, SeenEvents,
+        TIMESTAMP_HEADER, encode_hex, is_literal_http_path,
     };
     use crate::webhook::{QqWebhookAdapter, QqWebhookConfig, derive_signing_key};
 
@@ -679,7 +809,17 @@ mod tests {
     async fn dispatch_is_enqueued_once_and_acknowledged() {
         let adapter = adapter();
         let (events, mut received) = tokio::sync::mpsc::channel(4);
-        *adapter.state.events.lock().await = Some(events);
+        let (terminal_error, _terminal_failure) = tokio::sync::oneshot::channel();
+        adapter
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = Some(ActiveWebhookRun {
+            generation: 1,
+            events: EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap(),
+            terminal_error: Some(terminal_error),
+        });
         let payload = json!({
             "id": "event-id",
             "op": 0,

@@ -119,6 +119,7 @@ fn adapter_command_error(error: &AdapterError) -> PluginError {
         }
         AdapterError::Configuration(_)
         | AdapterError::Action(_)
+        | AdapterError::EventAdapterMismatch { .. }
         | AdapterError::EventQueueClosed => PluginError::Permanent(error.to_string()),
     }
 }
@@ -144,6 +145,7 @@ fn context_command_error(error: &ContextError) -> PluginError {
         | ContextError::Adapter(
             AdapterError::Configuration(_)
             | AdapterError::Action(_)
+            | AdapterError::EventAdapterMismatch { .. }
             | AdapterError::EventQueueClosed,
         ) => PluginError::Permanent(error.to_string()),
     }

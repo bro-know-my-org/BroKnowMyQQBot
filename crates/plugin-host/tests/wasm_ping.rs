@@ -33,9 +33,10 @@ impl Adapter for MockAdapter {
 
     async fn run(
         &self,
-        events: mpsc::Sender<EventEnvelope>,
+        events: bot_core::EventSender,
         mut shutdown: ShutdownSignal,
     ) -> Result<(), AdapterError> {
+        events.mark_ready();
         if let Some(event) = self.event.lock().await.take() {
             events
                 .send(event)

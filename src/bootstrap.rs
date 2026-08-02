@@ -5,13 +5,15 @@
 use std::{env, process::ExitCode, sync::Arc, time::Duration};
 
 use crate::{
-    config::{self, BotConfig, load_secret_environment},
-    logging,
+    config::{self, BotConfig, ManagementConfig, load_secret_environment},
+    logging, management,
     plugins::load_plugins,
 };
 use adapter_onebot11::{OneBot11Adapter, OneBot11Config};
 use adapter_qqbot::{QqWebSocketAdapter, QqWebSocketConfig, QqWebhookAdapter, QqWebhookConfig};
-use bot_core::{Adapter, RuntimeBuilder, shutdown_channel};
+use bot_core::{
+    Adapter, MemoryDedupStore, Runtime, RuntimeBuilder, RuntimeObserver, shutdown_channel,
+};
 use plugin_host::{PluginStore, StaticPluginHost};
 use qqbot_protocol::{Intents, OpenApiClient, OpenApiEnvironment, TokenManager};
 use secrecy::SecretString;
@@ -102,10 +104,18 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let plugins = Arc::new(plugins);
+    let observer = RuntimeObserver::new();
+    let shutdown_timeout = Duration::from_secs(config.runtime.shutdown_timeout_seconds);
     let mut runtime_builder = RuntimeBuilder::new()
+        .queue_capacity(config.runtime.queue_capacity)
         .event_concurrency(config.runtime.event_concurrency)
+        .handler_timeout(Duration::from_secs(config.runtime.handler_timeout_seconds))
+        .shutdown_timeout(shutdown_timeout)
+        .dedup_store(Arc::new(MemoryDedupStore::try_new(
+            config.runtime.dedup_capacity,
+        )?))
+        .observer(observer.clone())
         .handler(plugins.clone());
     for adapter in adapters {
         runtime_builder = runtime_builder.adapter(adapter);
@@ -116,21 +126,8 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         onebot11_enabled = config.onebot11.enabled,
         "starting BroKnowMyQQBot adapters"
     );
-    let runtime_run = runtime.run(shutdown_signal);
-    tokio::pin!(runtime_run);
-    let runtime_result = tokio::select! {
-        result = &mut runtime_run => result,
-        signal = wait_for_shutdown_signal() => {
-            shutdown_handle.shutdown();
-            let result = runtime_run.await;
-            if let Err(error) = signal {
-                if result.is_ok() {
-                    return Err(error.into());
-                }
-            }
-            result
-        }
-    };
+    let runtime_result =
+        supervise_runtime(runtime, config.management, observer, shutdown_timeout).await;
     if let Err(error) = plugins.shutdown().await {
         if runtime_result.is_ok() {
             return Err(error.into());
@@ -139,6 +136,58 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     }
     runtime_result?;
     info!("BroKnowMyQQBot stopped");
+    Ok(())
+}
+
+async fn supervise_runtime(
+    runtime: Runtime,
+    management_config: ManagementConfig,
+    observer: RuntimeObserver,
+    shutdown_timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let runtime_run = runtime.run(shutdown_signal.clone());
+    let management_run = management::serve(
+        management_config,
+        observer,
+        shutdown_signal,
+        shutdown_timeout,
+    );
+    tokio::pin!(runtime_run);
+    tokio::pin!(management_run);
+    let (runtime_result, management_result, signal_result) = tokio::select! {
+        result = &mut runtime_run => {
+            shutdown_handle.shutdown();
+            let management_result = management_run.await;
+            (result, management_result, Ok(()))
+        },
+        result = &mut management_run => {
+            shutdown_handle.shutdown();
+            let runtime_result = runtime_run.await;
+            (runtime_result, result, Ok(()))
+        },
+        signal = wait_for_shutdown_signal() => {
+            shutdown_handle.shutdown();
+            let (runtime_result, management_result) =
+                tokio::join!(&mut runtime_run, &mut management_run);
+            (runtime_result, management_result, signal)
+        }
+    };
+    if let Err(error) = signal_result
+        && runtime_result.is_ok()
+        && management_result.is_ok()
+    {
+        return Err(error.into());
+    }
+    if let (Err(_runtime_error), Err(management_error)) = (&runtime_result, &management_result) {
+        warn!(error = %management_error, "management service also failed during runtime shutdown");
+    }
+    if let Err(error) = management_result
+        && runtime_result.is_ok()
+    {
+        return Err(error.into());
+    }
+    runtime_result?;
     Ok(())
 }
 

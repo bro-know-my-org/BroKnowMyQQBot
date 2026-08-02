@@ -5,7 +5,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use bot_core::{Adapter, AdapterError, shutdown_channel};
+use bot_core::{Adapter, AdapterError, EventSender, RuntimeObserver, shutdown_channel};
 use futures_util::{SinkExt as _, StreamExt as _};
 use qqbot_protocol::{OpenApiClient, TokenManager};
 use reqwest::Client;
@@ -53,6 +53,7 @@ fn api(base_url: Url, token_endpoint: Url) -> OpenApiClient {
 async fn run_until_error(adapter: QqWebSocketAdapter) -> AdapterError {
     let (_shutdown_handle, shutdown_signal) = shutdown_channel();
     let (events, _receiver) = mpsc::channel(1);
+    let events = EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap();
     timeout(
         std::time::Duration::from_secs(2),
         adapter.run(events, shutdown_signal),
