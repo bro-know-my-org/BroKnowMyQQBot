@@ -10,6 +10,7 @@ publish = false
 async-trait.workspace = true
 plugin-api = { path = "../../crates/plugin-api" }
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [lints]

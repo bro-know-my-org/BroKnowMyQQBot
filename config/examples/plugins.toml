@@ -1,5 +1,10 @@
 # Bundled Rust plugins enabled by default when no installation file is set.
-bundled = ["ping", "help", "echo", "counter"]
+bundled = ["ping", "help", "echo", "counter", "reminder"]
+
+# Enable permissionized administration only after configuring stable sender IDs:
+# bundled = ["ping", "help", "echo", "counter", "reminder", "admin"]
+# [bundled_config.admin]
+# owners = ["your-sender-id"]
 
 # Optional functional coverage plugins can be added explicitly:
 # bundled = ["ping", "help", "echo", "counter", "http-probe", "scheduler-probe", "qq-extension-probe"]

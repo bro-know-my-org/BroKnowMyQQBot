@@ -16,9 +16,11 @@ use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
 
 mod basic;
+mod business;
 mod probes;
 
 pub use basic::{CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin};
+pub use business::{AdminPlugin, ReminderPlugin};
 pub use probes::{
     ActionResultProbePlugin, ActiveSendProbePlugin, ConfigProbePlugin, HttpProbePlugin,
     QqExtensionProbePlugin, SchedulerProbePlugin,
@@ -155,6 +157,7 @@ pub fn default_plugin_configs() -> BTreeMap<String, BTreeMap<String, Value>> {
         ("dev.bkm.counter".to_owned(), BTreeMap::new()),
         ("dev.bkm.help".to_owned(), BTreeMap::new()),
         ("dev.bkm.echo".to_owned(), BTreeMap::new()),
+        ("dev.bkm.reminder".to_owned(), BTreeMap::new()),
     ])
 }
 
@@ -163,13 +166,15 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use plugin_api::{
-        ActionCompleted, ActionStatus, HostQueries, PluginEventEnvelope, StateValue, StaticPlugin,
+        ActionCompleted, ActionStatus, HostQueries, PluginEventEnvelope, StateOp, StateValue,
+        StaticPlugin,
     };
     use serde_json::{Value, json};
 
     use super::{
-        ActionResultProbePlugin, ActiveSendProbePlugin, ConfigProbePlugin, CounterPlugin,
-        EchoPlugin, HelpPlugin, HttpProbePlugin, PingPlugin, SchedulerProbePlugin,
+        ActionResultProbePlugin, ActiveSendProbePlugin, AdminPlugin, ConfigProbePlugin,
+        CounterPlugin, EchoPlugin, HelpPlugin, HttpProbePlugin, PingPlugin, ReminderPlugin,
+        SchedulerProbePlugin,
     };
 
     struct Queries {
@@ -215,7 +220,14 @@ mod tests {
             adapter_id: "test".to_owned(),
             event_type: "message.created".to_owned(),
             trace_id: None,
-            payload: json!({"type":"message","data":{"text":text}}),
+            payload: json!({
+                "type":"message",
+                "data":{
+                    "text":text,
+                    "sender":{"id":"owner-id"},
+                    "target":{"scope":"group","group_id":"group-id"}
+                }
+            }),
             extensions: Vec::new(),
         }
     }
@@ -500,5 +512,140 @@ mod tests {
             )]))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_plugin_enforces_owner_and_persists_delegation_with_audit() {
+        struct AdminQueries {
+            owners: Value,
+            state: BTreeMap<String, StateValue>,
+            capabilities: BTreeSet<String>,
+        }
+        impl HostQueries for AdminQueries {
+            fn config_get(&self, key: &str) -> Option<&Value> {
+                (key == "owners").then_some(&self.owners)
+            }
+            fn state_get(&self, key: &str) -> Option<&StateValue> {
+                self.state.get(key)
+            }
+            fn state_scan(&self, prefix: &str, limit: usize) -> Vec<(&str, &StateValue)> {
+                self.state
+                    .iter()
+                    .filter(|(key, _)| key.starts_with(prefix))
+                    .take(limit)
+                    .map(|(key, value)| (key.as_str(), value))
+                    .collect()
+            }
+            fn granted_capabilities(&self) -> &BTreeSet<String> {
+                &self.capabilities
+            }
+            fn invocation_time_ms(&self) -> i64 {
+                0
+            }
+        }
+        let queries = AdminQueries {
+            owners: json!(["owner-id"]),
+            state: BTreeMap::new(),
+            capabilities: BTreeSet::new(),
+        };
+        let output = AdminPlugin::default()
+            .on_event(&event("/admin grant user-2"), &queries)
+            .await
+            .unwrap();
+        assert_eq!(
+            output.commands[0].payload["content"],
+            "administrator granted"
+        );
+        assert_eq!(output.state_ops.len(), 2);
+
+        let denied = AdminPlugin::default()
+            .on_event(
+                &PluginEventEnvelope {
+                    payload: json!({
+                        "type":"message",
+                        "data":{
+                            "text":"/admin grant user-3",
+                            "sender":{"id":"ordinary"},
+                            "target":{"scope":"group","group_id":"group-id"}
+                        }
+                    }),
+                    ..event("ignored")
+                },
+                &queries,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            denied.commands[0].payload["content"],
+            "administrator permission required"
+        );
+    }
+
+    #[tokio::test]
+    async fn reminder_plugin_creates_owned_persistent_schedule() {
+        let output = ReminderPlugin::default()
+            .on_event(
+                &event("/remind 30 hydrate"),
+                &Queries {
+                    state: BTreeMap::new(),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.state_ops.len(), 2);
+        assert_eq!(output.commands[0].kind, "schedule.create");
+        assert_eq!(output.commands[0].payload["run_at_ms"], 30_000);
+        assert_eq!(output.commands[1].kind, "message.reply");
+        assert_eq!(
+            output.commands[0].payload["payload"]["target"]["group_id"],
+            "group-id"
+        );
+
+        let long_event = PluginEventEnvelope {
+            event_id: "x".repeat(512),
+            ..event("/remind 30 bounded")
+        };
+        let bounded = ReminderPlugin::default()
+            .on_event(
+                &long_event,
+                &Queries {
+                    state: BTreeMap::new(),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let StateOp::Put { key, .. } = &bounded.state_ops[0] else {
+            panic!("reminder task must be persisted")
+        };
+        assert!(key.len() <= 256);
+
+        let unknown = ActionCompleted {
+            source_event_id: long_event.event_id,
+            source_invocation_id: "invocation".to_owned(),
+            command_id: "schedule".to_owned(),
+            kind: "schedule.create".to_owned(),
+            status: ActionStatus::Unknown,
+            retryable: false,
+            result: None,
+            error_code: None,
+            error_message: None,
+        };
+        let retained = ReminderPlugin::default()
+            .on_event(
+                &PluginEventEnvelope {
+                    event_type: "action.completed".to_owned(),
+                    payload: serde_json::to_value(unknown).unwrap(),
+                    ..event("ignored")
+                },
+                &Queries {
+                    state: BTreeMap::new(),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(retained.state_ops.is_empty());
     }
 }

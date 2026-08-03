@@ -318,6 +318,7 @@ dependencies = [
  "async-trait",
  "plugin-api",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
 ]
 

@@ -13,8 +13,8 @@ use thiserror::Error;
 use tracing::info;
 
 use builtin_plugins::{
-    ActiveSendProbePlugin, CounterPlugin, EchoPlugin, HelpPlugin, HttpProbePlugin, PingPlugin,
-    QqExtensionProbePlugin, SchedulerProbePlugin,
+    ActiveSendProbePlugin, AdminPlugin, CounterPlugin, EchoPlugin, HelpPlugin, HttpProbePlugin,
+    PingPlugin, QqExtensionProbePlugin, ReminderPlugin, SchedulerProbePlugin,
 };
 use plugin_host::{PluginStore, StaticPluginHost, ValidatedPluginPackage, WasmPlugin};
 
@@ -24,6 +24,8 @@ const MAX_INSTALLATION_FILE_BYTES: usize = 1024 * 1024;
 #[serde(deny_unknown_fields)]
 struct PluginInstallations {
     bundled: Option<Vec<String>>,
+    #[serde(default)]
+    bundled_config: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default)]
     wasm: Vec<WasmPluginInstallation>,
 }
@@ -115,8 +117,12 @@ pub(crate) async fn load_plugins(
         || Ok(PluginInstallations::default()),
         PluginInstallations::from_path,
     )?;
-    let (include_help, mut declared_instances) =
-        register_bundled_plugins(plugins, installations.bundled).await?;
+    let (include_help, mut declared_instances) = register_bundled_plugins(
+        plugins,
+        installations.bundled,
+        &installations.bundled_config,
+    )
+    .await?;
     for installation in installations.wasm {
         if !installation.enabled {
             info!(
@@ -220,9 +226,10 @@ async fn register_help_plugin(
 async fn register_bundled_plugins(
     plugins: &mut StaticPluginHost,
     selected: Option<Vec<String>>,
+    configs: &BTreeMap<String, BTreeMap<String, Value>>,
 ) -> Result<(bool, BTreeSet<String>), Box<dyn std::error::Error>> {
     let selected = selected.unwrap_or_else(|| {
-        ["ping", "help", "echo", "counter"]
+        ["ping", "help", "echo", "counter", "reminder"]
             .map(str::to_owned)
             .to_vec()
     });
@@ -252,6 +259,14 @@ async fn register_bundled_plugins(
                     std::sync::Arc::new(CounterPlugin::default()),
                     "dev.bkm.counter/default",
                 ),
+                "admin" => (
+                    std::sync::Arc::new(AdminPlugin::default()),
+                    "dev.bkm.admin/default",
+                ),
+                "reminder" => (
+                    std::sync::Arc::new(ReminderPlugin::default()),
+                    "dev.bkm.reminder/default",
+                ),
                 "http-probe" => (
                     std::sync::Arc::new(HttpProbePlugin::default()),
                     "dev.bkm.http-probe/default",
@@ -271,7 +286,11 @@ async fn register_bundled_plugins(
                 _ => return Err(Box::new(PluginConfigError::UnknownBundled(name))),
             };
         plugins
-            .register_trusted(plugin, instance_id, BTreeMap::new())
+            .register_trusted(
+                plugin,
+                instance_id,
+                configs.get(&name).cloned().unwrap_or_default(),
+            )
             .await?;
         instance_ids.insert(instance_id.to_owned());
     }
@@ -374,6 +393,10 @@ mod tests {
     #[tokio::test]
     async fn bundled_selection_can_replace_static_ping() {
         let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
+        let configs = BTreeMap::from([(
+            "admin".to_owned(),
+            BTreeMap::from([("owners".to_owned(), serde_json::json!(["owner-id"]))]),
+        )]);
         let (include_help, instance_ids) = register_bundled_plugins(
             &mut plugins,
             Some(vec![
@@ -383,7 +406,10 @@ mod tests {
                 "scheduler-probe".to_owned(),
                 "qq-extension-probe".to_owned(),
                 "active-send-probe".to_owned(),
+                "admin".to_owned(),
+                "reminder".to_owned(),
             ]),
+            &configs,
         )
         .await
         .unwrap();
@@ -416,6 +442,12 @@ mod tests {
         assert!(
             plugins
                 .instance_manifest("dev.bkm.active-send-probe/default")
+                .is_some()
+        );
+        assert!(plugins.instance_manifest("dev.bkm.admin/default").is_some());
+        assert!(
+            plugins
+                .instance_manifest("dev.bkm.reminder/default")
                 .is_some()
         );
     }
