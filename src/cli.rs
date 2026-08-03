@@ -16,7 +16,7 @@ use plugin_host::{
 };
 use serde_json::Value;
 
-use crate::{config::BotConfig, plugin_dev};
+use crate::{browser, config::BotConfig, plugin_dev};
 
 const MAX_PLUGIN_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -29,6 +29,7 @@ pub(crate) async fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error
         "help" | "--help" | "-h" => print_help(),
         "version" | "--version" | "-V" => println!("bkmqb {}", env!("CARGO_PKG_VERSION")),
         "config" => run_config(&arguments[1..])?,
+        "browser" => browser::run(&arguments[1..]).await?,
         "plugin" => run_plugin(&arguments[1..]).await?,
         other => return Err(format!("unknown bkmqb command `{other}`; run `bkmqb help`").into()),
     }
@@ -845,7 +846,7 @@ fn now_ms() -> i64 {
 
 fn print_help() {
     println!(
-        "BroKnowMyQQBot command line\n\nUsage:\n  bkmqb\n  bkmqb config check\n  bkmqb plugin <command>\n  bkmqb version"
+        "BroKnowMyQQBot command line\n\nUsage:\n  bkmqb\n  bkmqb browser <command>\n  bkmqb config check\n  bkmqb plugin <command>\n  bkmqb version"
     );
 }
 

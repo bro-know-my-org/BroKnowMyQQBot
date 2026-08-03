@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod bootstrap;
+mod browser;
 mod cli;
 mod config;
 mod logging;
