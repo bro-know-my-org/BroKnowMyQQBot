@@ -276,10 +276,10 @@ fn external_schema_reference(schema: &Value) -> Option<String> {
         match value {
             Value::Object(object) => {
                 for keyword in ["$ref", "$dynamicRef", "$recursiveRef"] {
-                    if let Some(reference) = object.get(keyword).and_then(Value::as_str)
-                        && !reference.starts_with('#')
-                    {
-                        return Some(reference.to_owned());
+                    if let Some(reference) = object.get(keyword).and_then(Value::as_str) {
+                        if !reference.starts_with('#') {
+                            return Some(reference.to_owned());
+                        }
                     }
                 }
                 pending.extend(object.values());

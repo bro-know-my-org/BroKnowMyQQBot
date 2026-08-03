@@ -173,19 +173,18 @@ async fn supervise_runtime(
             (runtime_result, management_result, signal)
         }
     };
-    if let Err(error) = signal_result
-        && runtime_result.is_ok()
-        && management_result.is_ok()
-    {
-        return Err(error.into());
+    if runtime_result.is_ok() && management_result.is_ok() {
+        if let Err(error) = signal_result {
+            return Err(error.into());
+        }
     }
     if let (Err(_runtime_error), Err(management_error)) = (&runtime_result, &management_result) {
         warn!(error = %management_error, "management service also failed during runtime shutdown");
     }
-    if let Err(error) = management_result
-        && runtime_result.is_ok()
-    {
-        return Err(error.into());
+    if runtime_result.is_ok() {
+        if let Err(error) = management_result {
+            return Err(error.into());
+        }
     }
     runtime_result?;
     Ok(())

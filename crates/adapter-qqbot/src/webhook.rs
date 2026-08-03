@@ -322,10 +322,10 @@ impl SeenEvents {
     }
 
     fn accept(&mut self, event_id: &str) {
-        if let Some(record) = self.records.get_mut(event_id)
-            && record.state == SeenState::Pending
-        {
-            record.state = SeenState::Accepted;
+        if let Some(record) = self.records.get_mut(event_id) {
+            if record.state == SeenState::Pending {
+                record.state = SeenState::Accepted;
+            }
         }
     }
 

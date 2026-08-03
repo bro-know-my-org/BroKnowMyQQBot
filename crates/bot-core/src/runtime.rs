@@ -765,12 +765,13 @@ impl EventDispatcher {
                 drop(cancellation_guard);
             }
             let _ = finished_sender.send(());
-            if let Ok(mut tails) = partition_tails.lock()
-                && tails
+            if let Ok(mut tails) = partition_tails.lock() {
+                if tails
                     .get(&partition_key)
                     .is_some_and(|(current, _)| *current == generation)
-            {
-                tails.remove(&partition_key);
+                {
+                    tails.remove(&partition_key);
+                }
             }
         });
     }
@@ -1464,9 +1465,10 @@ async fn run_recovery_supervisor(
     let mut tasks = JoinSet::new();
     let mut commands_open = true;
     loop {
-        while tasks.len() < MAX_CONCURRENT_DEDUP_FINALIZATIONS
-            && let Some(claim) = pending.pop_front()
-        {
+        while tasks.len() < MAX_CONCURRENT_DEDUP_FINALIZATIONS {
+            let Some(claim) = pending.pop_front() else {
+                break;
+            };
             let context = context.clone();
             tasks.spawn(async move {
                 let retryable = recover_cancelled_claim(context, claim.duplicate()).await;
@@ -1825,14 +1827,14 @@ mod tests {
         }
 
         async fn handle(&self, context: Context, event: &Event) -> Result<(), HandlerError> {
-            if let Event::Message(message) = event
-                && message.text.trim() == "/ping"
-            {
-                context
-                    .reply("pong")
-                    .await
-                    .map_err(|error| HandlerError::Failed(error.to_string()))?;
-                self.shutdown.shutdown();
+            if let Event::Message(message) = event {
+                if message.text.trim() == "/ping" {
+                    context
+                        .reply("pong")
+                        .await
+                        .map_err(|error| HandlerError::Failed(error.to_string()))?;
+                    self.shutdown.shutdown();
+                }
             }
             Ok(())
         }

@@ -599,10 +599,10 @@ impl StaticPluginHost {
         loop {
             envelope.delivery_id = Uuid::new_v4().to_string();
             envelope.invocation_id = Uuid::new_v4().to_string();
-            if let ExecutionOrigin::Event(context) = origin
-                && envelope.event_type != "action.completed"
-            {
-                envelope.extensions = event_extensions(plugin, context)?;
+            if envelope.event_type != "action.completed" {
+                if let ExecutionOrigin::Event(context) = origin {
+                    envelope.extensions = event_extensions(plugin, context)?;
+                }
             }
             let outbox_origin = origin.outbox_origin(&envelope.event_id);
             if self.reject_excessive_action_completion(plugin, &envelope, &outbox_origin)? {

@@ -319,14 +319,14 @@ fn write_installation_and_cleanup(
         );
         return Err(error.into());
     }
-    if let Some(previous) = previous
-        && previous.package_path != installation.package_path
-    {
-        let _ = cleanup_unreferenced_managed_package(
-            store,
-            database,
-            Path::new(&previous.package_path),
-        );
+    if let Some(previous) = previous {
+        if previous.package_path != installation.package_path {
+            let _ = cleanup_unreferenced_managed_package(
+                store,
+                database,
+                Path::new(&previous.package_path),
+            );
+        }
     }
     Ok(())
 }
@@ -355,14 +355,14 @@ fn persist_managed_package(
     package_bytes: &[u8],
     expected_sha256: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(metadata) = fs::symlink_metadata(destination)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        return Err(format!(
-            "managed plugin destination `{}` must be a regular file",
-            destination.display()
-        )
-        .into());
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "managed plugin destination `{}` must be a regular file",
+                destination.display()
+            )
+            .into());
+        }
     }
     let directory = destination.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = None;

@@ -683,16 +683,16 @@ pub(crate) fn atomic_write(
             source,
         })?;
     }
-    if let Ok(metadata) = fs::symlink_metadata(path)
-        && (!metadata.file_type().is_file() || metadata.file_type().is_symlink())
-    {
-        return Err(ConfigError::Write {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "refusing to replace a non-regular file or symbolic link",
-            ),
-        });
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(ConfigError::Write {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "refusing to replace a non-regular file or symbolic link",
+                ),
+            });
+        }
     }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path

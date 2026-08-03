@@ -802,10 +802,10 @@ impl PluginStore {
              WHERE instance_id = ? AND event_id = ? AND status = 'committed'",
             params![now_ms, instance_id, event_id],
         )?;
-        if updated == 1
-            && let Some(health_generation) = health_generation
-        {
-            reset_health_if_generation(&transaction, instance_id, health_generation, now_ms)?;
+        if updated == 1 {
+            if let Some(health_generation) = health_generation {
+                reset_health_if_generation(&transaction, instance_id, health_generation, now_ms)?;
+            }
         }
         transaction.commit()?;
         Ok(updated == 1)

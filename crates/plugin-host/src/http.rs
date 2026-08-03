@@ -110,25 +110,24 @@ impl HttpExecutor for SecureHttpExecutor {
                 .await
                 .map_err(|error| HttpExecutionError::Transport(error.to_string()))?;
 
-            if matches!(method, Method::GET | Method::HEAD)
-                && response.status().is_redirection()
-                && let Some(location) = response.headers().get(LOCATION)
-            {
-                if redirects >= MAX_REDIRECTS {
-                    return Err(HttpExecutionError::Denied(
-                        "redirect limit exceeded".to_owned(),
-                    ));
+            if matches!(method, Method::GET | Method::HEAD) && response.status().is_redirection() {
+                if let Some(location) = response.headers().get(LOCATION) {
+                    if redirects >= MAX_REDIRECTS {
+                        return Err(HttpExecutionError::Denied(
+                            "redirect limit exceeded".to_owned(),
+                        ));
+                    }
+                    let location = location.to_str().map_err(|_| {
+                        HttpExecutionError::InvalidRequest(
+                            "redirect location is not valid UTF-8".to_owned(),
+                        )
+                    })?;
+                    url = url
+                        .join(location)
+                        .map_err(|error| HttpExecutionError::InvalidRequest(error.to_string()))?;
+                    redirects += 1;
+                    continue;
                 }
-                let location = location.to_str().map_err(|_| {
-                    HttpExecutionError::InvalidRequest(
-                        "redirect location is not valid UTF-8".to_owned(),
-                    )
-                })?;
-                url = url
-                    .join(location)
-                    .map_err(|error| HttpExecutionError::InvalidRequest(error.to_string()))?;
-                redirects += 1;
-                continue;
             }
 
             let response_limit = request.max_response_bytes.min(MAX_RESPONSE_BYTES);

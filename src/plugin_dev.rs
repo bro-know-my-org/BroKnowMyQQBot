@@ -317,14 +317,14 @@ async fn write_package(
     component_path: &Path,
     output: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Ok(metadata) = fs::symlink_metadata(output)
-        && (metadata.file_type().is_symlink() || !metadata.is_file())
-    {
-        return Err(format!(
-            "plugin package destination `{}` must be a regular file",
-            output.display()
-        )
-        .into());
+    if let Ok(metadata) = fs::symlink_metadata(output) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!(
+                "plugin package destination `{}` must be a regular file",
+                output.display()
+            )
+            .into());
+        }
     }
     let directory = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(directory)?;

@@ -1130,13 +1130,13 @@ impl SessionState {
         {
             return Ok(DispatchRecord::Duplicate);
         }
-        if let Some(last) = self.last_received
-            && seq < last
-        {
-            return Err(ConnectionError::InvalidDispatchSequence {
-                last,
-                received: seq,
-            });
+        if let Some(last) = self.last_received {
+            if seq < last {
+                return Err(ConnectionError::InvalidDispatchSequence {
+                    last,
+                    received: seq,
+                });
+            }
         }
         if has_event && self.pending.len() >= MAX_PENDING_DISPATCHES {
             return Err(ConnectionError::UncommittedEventLimit);

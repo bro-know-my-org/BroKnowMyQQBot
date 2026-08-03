@@ -379,18 +379,19 @@ impl OpenApiClient {
             });
         }
 
-        if let Some(body) = error_body.as_ref()
-            && let Some(code) = body.code()
-            && code != 0
-        {
-            return Err(ApiError::Platform {
-                code,
-                message: body
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "unknown QQ platform error".to_owned()),
-                trace_id: body.trace_id.clone().or(trace_header),
-            });
+        if let Some(body) = error_body.as_ref() {
+            if let Some(code) = body.code() {
+                if code != 0 {
+                    return Err(ApiError::Platform {
+                        code,
+                        message: body
+                            .message
+                            .clone()
+                            .unwrap_or_else(|| "unknown QQ platform error".to_owned()),
+                        trace_id: body.trace_id.clone().or(trace_header),
+                    });
+                }
+            }
         }
 
         Ok(bytes)

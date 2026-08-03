@@ -165,9 +165,7 @@ async fn run_validation_workers(mut jobs: mpsc::Receiver<ValidationJob>) {
     let mut tasks = JoinSet::new();
     loop {
         if tasks.len() >= MAX_CONCURRENT_CONFIG_CHECKS {
-            if let Some(joined) = tasks.join_next().await
-                && let Err(error) = joined
-            {
+            if let Some(Err(error)) = tasks.join_next().await {
                 warn!(error = %error, "configuration validation worker failed");
             }
             continue;
