@@ -22,6 +22,7 @@ pub(crate) struct QqConfig {
     pub(crate) environment: String,
     pub(crate) transport: String,
     pub(crate) public_guild_messages: bool,
+    pub(crate) extended_events: QqExtendedEvents,
     pub(crate) check_only: bool,
     pub(crate) webhook: QqWebhookConfig,
 }
@@ -33,9 +34,20 @@ impl Default for QqConfig {
             environment: "production".to_owned(),
             transport: "websocket".to_owned(),
             public_guild_messages: false,
+            extended_events: QqExtendedEvents::default(),
             check_only: false,
             webhook: QqWebhookConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(transparent)]
+pub(crate) struct QqExtendedEvents(pub(crate) bool);
+
+impl QqExtendedEvents {
+    pub(crate) const fn is_enabled(self) -> bool {
+        self.0
     }
 }
 

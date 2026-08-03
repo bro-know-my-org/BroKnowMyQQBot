@@ -545,8 +545,37 @@ impl OneBot11Adapter {
                 "delete_msg".to_owned(),
                 json!({"message_id": id_param(&message_id)}),
             )),
-            Action::Platform { name, payload } if name == "onebot11.send_msg" => {
-                Ok(("send_msg".to_owned(), payload))
+            Action::Platform { name, payload }
+                if matches!(
+                    name.as_str(),
+                    "onebot11.send_msg"
+                        | "onebot11.get_login_info"
+                        | "onebot11.get_stranger_info"
+                        | "onebot11.get_group_info"
+                        | "onebot11.get_group_member_info"
+                        | "onebot11.get_status"
+                        | "onebot11.get_version_info"
+                        | "onebot11.send_like"
+                        | "onebot11.set_group_kick"
+                        | "onebot11.set_group_ban"
+                        | "onebot11.set_group_whole_ban"
+                        | "onebot11.set_group_admin"
+                        | "onebot11.set_group_card"
+                        | "onebot11.set_group_leave"
+                        | "onebot11.set_friend_add_request"
+                        | "onebot11.set_group_add_request"
+                ) =>
+            {
+                let action = name
+                    .strip_prefix("onebot11.")
+                    .expect("allowlisted OneBot Action has prefix")
+                    .to_owned();
+                if !payload.is_object() {
+                    return Err(AdapterError::Action(format!(
+                        "OneBot platform Action `{name}` payload must be a JSON object"
+                    )));
+                }
+                Ok((action, payload))
             }
             Action::Platform { name, .. } => Err(AdapterError::Action(format!(
                 "unsupported OneBot 11 platform Action `{name}`"
@@ -1757,6 +1786,29 @@ mod tests {
         .unwrap();
         assert_eq!(action, "send_msg");
         assert_eq!(params["user_id"], "42");
+
+        let (action, params) = OneBot11Adapter::action_request(Action::Platform {
+            name: "onebot11.set_group_ban".to_owned(),
+            payload: json!({"group_id":"300","user_id":"42","duration":60}),
+        })
+        .unwrap();
+        assert_eq!(action, "set_group_ban");
+        assert_eq!(params["duration"], 60);
+
+        assert!(
+            OneBot11Adapter::action_request(Action::Platform {
+                name: "onebot11.set_group_ban".to_owned(),
+                payload: json!("invalid"),
+            })
+            .is_err()
+        );
+        assert!(
+            OneBot11Adapter::action_request(Action::Platform {
+                name: "onebot11.set_group_anonymous_ban".to_owned(),
+                payload: json!({}),
+            })
+            .is_err()
+        );
     }
 
     #[test]

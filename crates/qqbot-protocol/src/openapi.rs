@@ -10,7 +10,10 @@ use url::Url;
 use crate::{
     auth::{AuthError, TokenManager},
     gateway::{Gateway, GatewayBot},
-    message::{ChannelMessageRequest, MessageRequest, MessageResponse},
+    message::{
+        ChannelMessageRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
+        MessageResponse,
+    },
 };
 
 const PRODUCTION_BASE_URL: &str = "https://api.bot.qq.com/";
@@ -144,8 +147,111 @@ impl OpenApiClient {
         channel_id: &str,
         request: &ChannelMessageRequest,
     ) -> Result<MessageResponse, ApiError> {
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
         let url = self.endpoint(&["channels", channel_id, "messages"])?;
         self.post_json(url, request).await
+    }
+
+    pub async fn upload_c2c_media(
+        &self,
+        user_openid: &str,
+        request: &MediaUploadRequest,
+    ) -> Result<MediaUploadResponse, ApiError> {
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["v2", "users", user_openid, "files"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn upload_group_media(
+        &self,
+        group_openid: &str,
+        request: &MediaUploadRequest,
+    ) -> Result<MediaUploadResponse, ApiError> {
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "files"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn recall_c2c_message(
+        &self,
+        user_openid: &str,
+        message_id: &str,
+    ) -> Result<(), ApiError> {
+        let url = self.endpoint(&["v2", "users", user_openid, "messages", message_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn recall_group_message(
+        &self,
+        group_openid: &str,
+        message_id: &str,
+    ) -> Result<(), ApiError> {
+        let url = self.endpoint(&["v2", "groups", group_openid, "messages", message_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn recall_channel_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<(), ApiError> {
+        let url = self.endpoint(&["channels", channel_id, "messages", message_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn guilds(&self) -> Result<serde_json::Value, ApiError> {
+        let url = self.endpoint(&["users", "@me", "guilds"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn guild(&self, guild_id: &str) -> Result<serde_json::Value, ApiError> {
+        let url = self.endpoint(&["guilds", guild_id])?;
+        self.get_json(url).await
+    }
+
+    pub async fn guild_channels(&self, guild_id: &str) -> Result<serde_json::Value, ApiError> {
+        let url = self.endpoint(&["guilds", guild_id, "channels"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn channel(&self, channel_id: &str) -> Result<serde_json::Value, ApiError> {
+        let url = self.endpoint(&["channels", channel_id])?;
+        self.get_json(url).await
+    }
+
+    /// Sends a raw QQ channel-create document for fields not yet modeled by this crate.
+    pub async fn create_channel_raw(
+        &self,
+        guild_id: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ApiError> {
+        validate_channel_document(request, true)
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["guilds", guild_id, "channels"])?;
+        self.post_json(url, request).await
+    }
+
+    /// Sends a raw QQ channel-update document for fields not yet modeled by this crate.
+    pub async fn update_channel_raw(
+        &self,
+        channel_id: &str,
+        request: &serde_json::Value,
+    ) -> Result<serde_json::Value, ApiError> {
+        validate_channel_document(request, false)
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["channels", channel_id])?;
+        self.patch_json(url, request).await
+    }
+
+    pub async fn delete_channel(&self, channel_id: &str) -> Result<(), ApiError> {
+        let url = self.endpoint(&["channels", channel_id])?;
+        self.delete(url).await
     }
 
     fn endpoint(&self, segments: &[&str]) -> Result<Url, ApiError> {
@@ -180,6 +286,30 @@ impl OpenApiClient {
         Self::decode(response).await
     }
 
+    async fn patch_json<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let response = self
+            .send_authorized(|token| self.client.patch(url.clone()).qqbot_token(token).json(body))
+            .await?;
+        Self::decode(response).await
+    }
+
+    async fn delete(&self, url: Url) -> Result<(), ApiError> {
+        let response = self
+            .send_authorized(|token| self.client.delete(url.clone()).qqbot_token(token))
+            .await?;
+        let bytes = Self::decode_bytes(response).await?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map(|_| ())
+            .map_err(ApiError::Decode)
+    }
+
     async fn send_authorized<F>(&self, build: F) -> Result<Response, ApiError>
     where
         F: Fn(&str) -> reqwest::RequestBuilder,
@@ -200,10 +330,15 @@ impl OpenApiClient {
             .map_err(ApiError::Request)
     }
 
-    async fn decode<T>(mut response: Response) -> Result<T, ApiError>
+    async fn decode<T>(response: Response) -> Result<T, ApiError>
     where
         T: DeserializeOwned,
     {
+        let bytes = Self::decode_bytes(response).await?;
+        serde_json::from_slice(&bytes).map_err(ApiError::Decode)
+    }
+
+    async fn decode_bytes(mut response: Response) -> Result<Vec<u8>, ApiError> {
         let status = response.status();
         let retry_after = response
             .headers()
@@ -258,8 +393,28 @@ impl OpenApiClient {
             });
         }
 
-        serde_json::from_slice(&bytes).map_err(ApiError::Decode)
+        Ok(bytes)
     }
+}
+
+fn validate_channel_document(
+    request: &serde_json::Value,
+    require_name: bool,
+) -> Result<(), &'static str> {
+    let object = request
+        .as_object()
+        .ok_or("QQ channel request must be a JSON object")?;
+    if object.is_empty() {
+        return Err("QQ channel request must contain at least one field");
+    }
+    if let Some(name) = request.get("name") {
+        if name.as_str().is_none_or(str::is_empty) {
+            return Err("QQ channel name must be a non-empty string");
+        }
+    } else if require_name {
+        return Err("QQ channel create request must contain a non-empty name");
+    }
+    Ok(())
 }
 
 trait RequestBuilderExt {
@@ -298,7 +453,7 @@ mod tests {
         Json, Router,
         extract::{Path, State},
         http::{HeaderMap, StatusCode},
-        routing::{get, post},
+        routing::{delete, get, post},
     };
     use reqwest::Client;
     use secrecy::SecretString;
@@ -306,9 +461,9 @@ mod tests {
     use tokio::net::TcpListener;
     use url::Url;
 
-    use crate::{MessageRequest, auth::TokenManager};
+    use crate::{MediaFileType, MediaUploadRequest, MessageRequest, auth::TokenManager};
 
-    use super::OpenApiClient;
+    use super::{ApiError, OpenApiClient};
 
     #[derive(Clone)]
     struct StateData {
@@ -351,12 +506,112 @@ mod tests {
         (StatusCode::OK, Json(json!({"id":"sent-message"})))
     }
 
+    async fn group_media(Path(group): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+        assert_eq!(group, "group/id");
+        assert_eq!(body["file_type"], 1);
+        assert_eq!(body["url"], "https://example.com/image.png");
+        Json(json!({
+            "file_uuid":"file-uuid",
+            "file_info":"file-info",
+            "ttl":300
+        }))
+    }
+
+    async fn c2c_media(Path(user): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+        assert_eq!(user, "user/id");
+        assert_eq!(body["file_type"], 1);
+        Json(json!({
+            "file_uuid":"c2c-file-uuid",
+            "file_info":"c2c-file-info"
+        }))
+    }
+
+    async fn recall_group_message(Path((group, message)): Path<(String, String)>) -> StatusCode {
+        assert_eq!(group, "group/id");
+        assert_eq!(message, "message/id");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn recall_c2c_message(Path((user, message)): Path<(String, String)>) -> StatusCode {
+        assert_eq!(user, "user/id");
+        assert_eq!(message, "message/id");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn recall_channel_message(
+        Path((channel, message)): Path<(String, String)>,
+    ) -> Json<Value> {
+        assert_eq!(channel, "channel/id");
+        assert_eq!(message, "message/id");
+        Json(json!({"ok":true}))
+    }
+
+    async fn guilds() -> Json<Value> {
+        Json(json!([{"id":"guild/id"}]))
+    }
+
+    async fn guild(Path(guild): Path<String>) -> Json<Value> {
+        assert_eq!(guild, "guild/id");
+        Json(json!({"id":guild}))
+    }
+
+    async fn guild_channels(Path(guild): Path<String>) -> Json<Value> {
+        assert_eq!(guild, "guild/id");
+        Json(json!([{"id":"channel/id"}]))
+    }
+
+    async fn create_channel(Path(guild): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+        assert_eq!(guild, "guild/id");
+        assert_eq!(body["name"], "alerts");
+        Json(json!({"id":"channel/id","name":body["name"]}))
+    }
+
+    async fn channel(Path(channel): Path<String>) -> Json<Value> {
+        assert_eq!(channel, "channel/id");
+        Json(json!({"id":channel}))
+    }
+
+    async fn update_channel(Path(channel): Path<String>, Json(body): Json<Value>) -> Json<Value> {
+        assert_eq!(channel, "channel/id");
+        assert_eq!(body["name"], "renamed");
+        Json(json!({"id":channel,"name":body["name"]}))
+    }
+
+    async fn delete_channel(Path(channel): Path<String>) -> StatusCode {
+        assert_eq!(channel, "channel/id");
+        StatusCode::NO_CONTENT
+    }
+
     async fn client() -> (OpenApiClient, Arc<AtomicUsize>) {
         let token_calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route("/app/getAppAccessToken", post(token))
             .route("/gateway", get(gateway))
             .route("/v2/groups/{group}/messages", post(group_message))
+            .route("/v2/groups/{group}/files", post(group_media))
+            .route("/v2/users/{user}/files", post(c2c_media))
+            .route(
+                "/v2/groups/{group}/messages/{message}",
+                delete(recall_group_message),
+            )
+            .route(
+                "/v2/users/{user}/messages/{message}",
+                delete(recall_c2c_message),
+            )
+            .route(
+                "/channels/{channel}/messages/{message}",
+                delete(recall_channel_message),
+            )
+            .route("/users/@me/guilds", get(guilds))
+            .route("/guilds/{guild}", get(guild))
+            .route(
+                "/guilds/{guild}/channels",
+                get(guild_channels).post(create_channel),
+            )
+            .route(
+                "/channels/{channel}",
+                get(channel).patch(update_channel).delete(delete_channel),
+            )
             .with_state(StateData {
                 token_calls: Arc::clone(&token_calls),
             });
@@ -392,6 +647,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.id.as_deref(), Some("sent-message"));
+        let upload = client
+            .upload_group_media(
+                "group/id",
+                &MediaUploadRequest::from_url(
+                    MediaFileType::IMAGE,
+                    "https://example.com/image.png",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.file_info, "file-info");
+        let c2c_upload = client
+            .upload_c2c_media(
+                "user/id",
+                &MediaUploadRequest::from_url(
+                    MediaFileType::IMAGE,
+                    "https://example.com/image.png",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(c2c_upload.file_info, "c2c-file-info");
+        client
+            .recall_group_message("group/id", "message/id")
+            .await
+            .unwrap();
+        client
+            .recall_c2c_message("user/id", "message/id")
+            .await
+            .unwrap();
+        client
+            .recall_channel_message("channel/id", "message/id")
+            .await
+            .unwrap();
+        assert_eq!(client.guilds().await.unwrap()[0]["id"], "guild/id");
+        assert_eq!(client.guild("guild/id").await.unwrap()["id"], "guild/id");
+        assert_eq!(
+            client.guild_channels("guild/id").await.unwrap()[0]["id"],
+            "channel/id"
+        );
+        assert_eq!(
+            client
+                .create_channel_raw("guild/id", &json!({"name":"alerts"}))
+                .await
+                .unwrap()["name"],
+            "alerts"
+        );
+        assert_eq!(
+            client.channel("channel/id").await.unwrap()["id"],
+            "channel/id"
+        );
+        assert_eq!(
+            client
+                .update_channel_raw("channel/id", &json!({"name":"renamed"}))
+                .await
+                .unwrap()["name"],
+            "renamed"
+        );
+        client.delete_channel("channel/id").await.unwrap();
+        assert!(matches!(
+            client.create_channel_raw("guild/id", &json!({})).await,
+            Err(ApiError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            client.update_channel_raw("channel/id", &json!([])).await,
+            Err(ApiError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            client
+                .update_channel_raw("channel/id", &json!({"name":42}))
+                .await,
+            Err(ApiError::InvalidRequest(_))
+        ));
         assert_eq!(token_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -1,15 +1,41 @@
 //! QQ dispatch to platform-independent event mapping.
 
+use std::fmt::Write as _;
+
 use bot_core::{
     AdapterId, CommonMessage, Event, EventEnvelope, EventId, MessageSegment, MessageTarget, Sender,
 };
 use chrono::{DateTime, Utc};
 use qqbot_protocol::{GatewayPayload, QqMessage};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 const GROUP_EVENTS: &[&str] = &["GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"];
 const PRIVATE_EVENTS: &[&str] = &["C2C_MESSAGE_CREATE"];
 const CHANNEL_EVENTS: &[&str] = &["AT_MESSAGE_CREATE", "MESSAGE_CREATE"];
+const NOTICE_EVENTS: &[&str] = &[
+    "GUILD_CREATE",
+    "GUILD_UPDATE",
+    "GUILD_DELETE",
+    "CHANNEL_CREATE",
+    "CHANNEL_UPDATE",
+    "CHANNEL_DELETE",
+    "GUILD_MEMBER_ADD",
+    "GUILD_MEMBER_UPDATE",
+    "GUILD_MEMBER_REMOVE",
+    "MESSAGE_REACTION_ADD",
+    "MESSAGE_REACTION_REMOVE",
+    "GROUP_ADD_ROBOT",
+    "GROUP_DEL_ROBOT",
+    "GROUP_MSG_REJECT",
+    "GROUP_MSG_RECEIVE",
+    "FRIEND_ADD",
+    "FRIEND_DEL",
+    "C2C_MSG_REJECT",
+    "C2C_MSG_RECEIVE",
+    "MESSAGE_AUDIT_PASS",
+    "MESSAGE_AUDIT_REJECT",
+];
 
 #[derive(Debug, Error)]
 pub(crate) enum MappingError {
@@ -30,6 +56,8 @@ pub(crate) enum MappingError {
         #[source]
         source: chrono::ParseError,
     },
+    #[error("QQ notice dispatch `{event_type}` contains invalid data")]
+    InvalidNoticeData { event_type: String },
 }
 
 pub(crate) fn map_dispatch(
@@ -39,6 +67,9 @@ pub(crate) fn map_dispatch(
     let Some(event_type) = payload.t.as_deref() else {
         return Ok(None);
     };
+    if NOTICE_EVENTS.contains(&event_type) {
+        return map_notice(adapter, payload, event_type).map(Some);
+    }
     if !GROUP_EVENTS.contains(&event_type)
         && !PRIVATE_EVENTS.contains(&event_type)
         && !CHANNEL_EVENTS.contains(&event_type)
@@ -120,6 +151,67 @@ pub(crate) fn map_dispatch(
     }))
 }
 
+fn map_notice(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    if !payload.d.is_object() {
+        return Err(MappingError::InvalidNoticeData {
+            event_type: event_type.to_owned(),
+        });
+    }
+    let raw = serde_json::to_value(payload).unwrap_or_else(|_| payload.d.clone());
+    let event_id = payload
+        .id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(
+            || {
+                let sequence = payload.s.ok_or_else(|| MappingError::MissingField {
+                    event_type: event_type.to_owned(),
+                    field: "dispatch id or sequence",
+                })?;
+                let digest = Sha256::digest(
+                    serde_json::to_vec(&(event_type, &payload.d)).unwrap_or_default(),
+                );
+                let mut encoded = String::with_capacity(digest.len() * 2);
+                for byte in digest {
+                    let _ = write!(encoded, "{byte:02x}");
+                }
+                Ok(format!("qq:{event_type}:{sequence}:{encoded}"))
+            },
+            Ok,
+        )?;
+    let timestamp = match payload.d.get("timestamp") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(
+            DateTime::parse_from_rfc3339(value)
+                .map_err(|source| MappingError::InvalidTimestamp {
+                    event_type: event_type.to_owned(),
+                    source,
+                })?
+                .with_timezone(&Utc),
+        ),
+        Some(_) => {
+            return Err(MappingError::InvalidNoticeData {
+                event_type: event_type.to_owned(),
+            });
+        }
+    };
+    Ok(EventEnvelope {
+        id: EventId::new(event_id),
+        adapter: adapter.clone(),
+        delivery_id: None,
+        timestamp,
+        event: Event::Notice(serde_json::json!({
+            "type": event_type,
+            "data": payload.d,
+        })),
+        raw,
+    })
+}
+
 fn required(
     value: Option<String>,
     event_type: &str,
@@ -169,5 +261,77 @@ mod tests {
                 group_id: "group-id".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn maps_group_management_notice_with_stable_dispatch_id() {
+        let payload = GatewayPayload {
+            id: Some("notice-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "group_openid":"group-id",
+                "op_member_openid":"member-id",
+                "timestamp":"2026-08-03T10:00:00Z"
+            }),
+            s: Some(3),
+            t: Some("GROUP_ADD_ROBOT".to_owned()),
+        };
+
+        let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.id.as_str(), "notice-id");
+        let Event::Notice(notice) = envelope.event else {
+            panic!("expected notice event");
+        };
+        assert_eq!(notice["type"], "GROUP_ADD_ROBOT");
+        assert_eq!(notice["data"]["group_openid"], "group-id");
+    }
+
+    #[test]
+    fn derives_stable_notice_id_when_dispatch_id_is_absent() {
+        let payload = GatewayPayload {
+            id: None,
+            op: OpCode::DISPATCH,
+            d: json!({
+                "group_openid":"group-id",
+                "timestamp":"2026-08-03T10:00:00Z"
+            }),
+            s: Some(4),
+            t: Some("GROUP_MSG_RECEIVE".to_owned()),
+        };
+
+        let first = map_dispatch(&AdapterId::new("qq"), &payload)
+            .unwrap()
+            .unwrap();
+        let second = map_dispatch(&AdapterId::new("qq"), &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert!(first.id.as_str().starts_with("qq:GROUP_MSG_RECEIVE:4:"));
+
+        let mut next_delivery = payload;
+        next_delivery.s = Some(5);
+        let third = map_dispatch(&AdapterId::new("qq"), &next_delivery)
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.id, third.id);
+    }
+
+    #[test]
+    fn rejects_malformed_notice_timestamp() {
+        let mut payload = GatewayPayload {
+            id: Some("notice-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({"timestamp":"not-a-timestamp"}),
+            s: Some(6),
+            t: Some("GUILD_UPDATE".to_owned()),
+        };
+
+        assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
+        payload.d = json!({"timestamp":42});
+        assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
+        payload.d = json!([]);
+        assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
     }
 }

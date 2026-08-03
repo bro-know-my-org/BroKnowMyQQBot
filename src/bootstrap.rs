@@ -207,6 +207,12 @@ async fn build_adapters(
         if config.qq.public_guild_messages {
             intents = intents.with_public_guild_messages();
         }
+        if config.qq.extended_events.is_enabled() {
+            intents |= Intents::GUILDS
+                | Intents::GUILD_MEMBERS
+                | Intents::GUILD_MESSAGE_REACTIONS
+                | Intents::MESSAGE_AUDIT;
+        }
         let webhook_secret = (config.qq.transport == "webhook")
             .then(|| SecretString::from(app_secret.clone().into_boxed_str()));
         let tokens = TokenManager::new(

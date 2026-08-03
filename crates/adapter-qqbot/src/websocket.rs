@@ -12,10 +12,10 @@ use bot_core::{
 };
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
-    ApiError, AuthError, ChannelMessageRequest, GatewayPayload, Intents, MessageRequest,
-    MessageResponse, OpCode, OpenApiClient,
+    ApiError, AuthError, ChannelMessageRequest, GatewayPayload, Intents, MediaFileType,
+    MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     net::TcpStream,
@@ -452,6 +452,47 @@ pub(crate) struct QqActionExecutor {
     log_message_content: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct RichMessageAction {
+    target: MessageTarget,
+    body: Value,
+    #[serde(default)]
+    keyboard: Option<Value>,
+    #[serde(default)]
+    reply_to: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MediaUploadAction {
+    target: MessageTarget,
+    file_type: u8,
+    url: String,
+    #[serde(default)]
+    send: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildAction {
+    guild_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelAction {
+    channel_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateChannelAction {
+    guild_id: String,
+    body: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateChannelAction {
+    channel_id: String,
+    body: Value,
+}
+
 impl QqActionExecutor {
     pub(crate) fn new(
         adapter_id: AdapterId,
@@ -502,10 +543,8 @@ impl QqActionExecutor {
                         self.api
                             .send_channel_message(
                                 channel_id,
-                                &ChannelMessageRequest {
-                                    content: reply.content,
-                                    msg_id: Some(reply.source_message_id),
-                                },
+                                &ChannelMessageRequest::text(reply.content)
+                                    .with_reply_to(reply.source_message_id),
                             )
                             .await
                     }
@@ -532,19 +571,239 @@ impl QqActionExecutor {
                         self.api
                             .send_channel_message(
                                 channel_id,
-                                &ChannelMessageRequest {
-                                    content: message.content,
-                                    msg_id: None,
-                                },
+                                &ChannelMessageRequest::text(message.content),
                             )
                             .await
                     }
                 };
                 self.complete_message_action("message.send", message_scope, result, message_log)
             }
-            Action::Recall { .. } | Action::Platform { .. } => Err(AdapterError::Action(
-                "action is not implemented by the QQ MVP adapter".to_owned(),
-            )),
+            Action::Recall { target, message_id } => {
+                let result = match &target {
+                    MessageTarget::Group { group_id } => {
+                        self.api.recall_group_message(group_id, &message_id).await
+                    }
+                    MessageTarget::Private { user_id } => {
+                        self.api.recall_c2c_message(user_id, &message_id).await
+                    }
+                    MessageTarget::Channel { channel_id } => {
+                        self.api
+                            .recall_channel_message(channel_id, &message_id)
+                            .await
+                    }
+                };
+                self.complete_unit_action("message.recall", message_scope_name(&target), result)
+            }
+            Action::Platform { name, payload } => {
+                self.execute_platform_action(&name, payload).await
+            }
+        }
+    }
+
+    async fn execute_platform_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.message.markdown" | "qq.message.ark" => {
+                self.execute_rich_message(name, payload).await
+            }
+            "qq.media.upload" => self.execute_media_upload(payload).await,
+            "qq.guild.list" | "qq.guild.get" | "qq.channel.list" | "qq.channel.get"
+            | "qq.channel.create" | "qq.channel.update" | "qq.channel.delete" => {
+                self.execute_channel_action(name, payload).await
+            }
+            _ => Err(AdapterError::Action(format!(
+                "unsupported QQ platform Action `{name}`"
+            ))),
+        }
+    }
+
+    async fn execute_rich_message(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        let action: RichMessageAction = decode_platform_payload(name, payload)?;
+        require_object(name, "body", &action.body)?;
+        if let Some(keyboard) = &action.keyboard {
+            require_object(name, "keyboard", keyboard)?;
+        }
+        if name == "qq.message.ark" && action.keyboard.is_some() {
+            return Err(AdapterError::Action(
+                "qq.message.ark does not accept keyboard".to_owned(),
+            ));
+        }
+        let message_scope = message_scope_name(&action.target);
+        let RichMessageAction {
+            target,
+            body,
+            keyboard,
+            reply_to,
+        } = action;
+        let result = match target {
+            MessageTarget::Group { group_id } => {
+                let request = if name == "qq.message.markdown" {
+                    MessageRequest::markdown(body, keyboard)
+                } else {
+                    MessageRequest::ark(body)
+                };
+                let request = match reply_to.as_deref() {
+                    Some(reply) => request.with_reply_to(reply),
+                    None => request,
+                };
+                self.api.send_group_message(&group_id, &request).await
+            }
+            MessageTarget::Private { user_id } => {
+                let request = if name == "qq.message.markdown" {
+                    MessageRequest::markdown(body, keyboard)
+                } else {
+                    MessageRequest::ark(body)
+                };
+                let request = match reply_to.as_deref() {
+                    Some(reply) => request.with_reply_to(reply),
+                    None => request,
+                };
+                self.api.send_c2c_message(&user_id, &request).await
+            }
+            MessageTarget::Channel { channel_id } => {
+                let request = if name == "qq.message.markdown" {
+                    ChannelMessageRequest::markdown(body, keyboard)
+                } else {
+                    ChannelMessageRequest::ark(body)
+                };
+                let request = match reply_to.as_deref() {
+                    Some(reply) => request.with_reply_to(reply),
+                    None => request,
+                };
+                self.api.send_channel_message(&channel_id, &request).await
+            }
+        };
+        self.complete_message_action(
+            if name == "qq.message.markdown" {
+                "qq.message.markdown"
+            } else {
+                "qq.message.ark"
+            },
+            message_scope,
+            result,
+            None,
+        )
+    }
+
+    async fn execute_media_upload(&self, payload: Value) -> Result<ActionResult, AdapterError> {
+        let action: MediaUploadAction = decode_platform_payload("qq.media.upload", payload)?;
+        let file_type = MediaFileType::try_from(action.file_type)
+            .map_err(|message| AdapterError::Action(message.to_owned()))?;
+        let mut request = MediaUploadRequest::from_url(file_type, action.url);
+        request.srv_send_msg = action.send;
+        let response = match &action.target {
+            MessageTarget::Group { group_id } => {
+                self.api.upload_group_media(group_id, &request).await
+            }
+            MessageTarget::Private { user_id } => {
+                self.api.upload_c2c_media(user_id, &request).await
+            }
+            MessageTarget::Channel { .. } => {
+                return Err(AdapterError::Action(
+                    "QQ channel media upload is not supported by this endpoint".to_owned(),
+                ));
+            }
+        }
+        .map_err(|error| map_action_error(&error))?;
+        Ok(ActionResult {
+            message_id: None,
+            raw: serde_json::to_value(response).unwrap_or(Value::Null),
+        })
+    }
+
+    async fn execute_channel_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.guild.list" => self.complete_value_action(name, self.api.guilds().await),
+            "qq.guild.get" => {
+                let action: GuildAction = decode_platform_payload(name, payload)?;
+                self.complete_value_action(name, self.api.guild(&action.guild_id).await)
+            }
+            "qq.channel.list" => {
+                let action: GuildAction = decode_platform_payload(name, payload)?;
+                self.complete_value_action(name, self.api.guild_channels(&action.guild_id).await)
+            }
+            "qq.channel.get" => {
+                let action: ChannelAction = decode_platform_payload(name, payload)?;
+                self.complete_value_action(name, self.api.channel(&action.channel_id).await)
+            }
+            "qq.channel.create" => {
+                let action: CreateChannelAction = decode_platform_payload(name, payload)?;
+                require_object(name, "body", &action.body)?;
+                self.complete_value_action(
+                    name,
+                    self.api
+                        .create_channel_raw(&action.guild_id, &action.body)
+                        .await,
+                )
+            }
+            "qq.channel.update" => {
+                let action: UpdateChannelAction = decode_platform_payload(name, payload)?;
+                require_object(name, "body", &action.body)?;
+                self.complete_value_action(
+                    name,
+                    self.api
+                        .update_channel_raw(&action.channel_id, &action.body)
+                        .await,
+                )
+            }
+            "qq.channel.delete" => {
+                let action: ChannelAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.channel.delete",
+                    "channel",
+                    self.api.delete_channel(&action.channel_id).await,
+                )
+            }
+            _ => unreachable!("channel Action dispatcher only calls known names"),
+        }
+    }
+
+    fn complete_unit_action(
+        &self,
+        action_type: &'static str,
+        message_scope: &'static str,
+        result: Result<(), ApiError>,
+    ) -> Result<ActionResult, AdapterError> {
+        match result {
+            Ok(()) => {
+                info!(adapter_id = %self.adapter_id, action_type, message_scope, "QQ platform action succeeded");
+                Ok(ActionResult::default())
+            }
+            Err(error) => {
+                warn!(adapter_id = %self.adapter_id, action_type, message_scope, error = %error, "QQ platform action failed");
+                Err(map_action_error(&error))
+            }
+        }
+    }
+
+    fn complete_value_action(
+        &self,
+        action_type: &str,
+        result: Result<Value, ApiError>,
+    ) -> Result<ActionResult, AdapterError> {
+        match result {
+            Ok(raw) => {
+                info!(adapter_id = %self.adapter_id, action_type, "QQ platform action succeeded");
+                Ok(ActionResult {
+                    message_id: None,
+                    raw,
+                })
+            }
+            Err(error) => {
+                warn!(adapter_id = %self.adapter_id, action_type, error = %error, "QQ platform action failed");
+                Err(map_action_error(&error))
+            }
         }
     }
 
@@ -614,6 +873,22 @@ impl QqActionExecutor {
             }
         }
     }
+}
+
+fn decode_platform_payload<T>(name: &str, payload: Value) -> Result<T, AdapterError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(payload)
+        .map_err(|error| AdapterError::Action(format!("invalid {name} payload: {error}")))
+}
+
+fn require_object(name: &str, field: &str, value: &Value) -> Result<(), AdapterError> {
+    value.is_object().then_some(()).ok_or_else(|| {
+        AdapterError::Action(format!(
+            "invalid {name} payload: {field} must be a JSON object"
+        ))
+    })
 }
 
 const fn message_scope_name(target: &MessageTarget) -> &'static str {
@@ -1010,8 +1285,19 @@ fn reconnect_delay(minimum: Duration, maximum: Duration, attempt: u32) -> Durati
 #[cfg(test)]
 mod tests {
     use qqbot_protocol::{ApiError, AuthError};
+    use serde_json::json;
 
-    use super::{DispatchRecord, ReconnectBackoff, SessionState, is_fatal_api_error};
+    use super::{
+        DispatchRecord, ReconnectBackoff, SessionState, is_fatal_api_error, require_object,
+    };
+
+    #[test]
+    fn platform_document_fields_require_json_objects() {
+        require_object("qq.message.markdown", "body", &json!({"content":"ok"})).unwrap();
+        assert!(require_object("qq.message.markdown", "body", &json!(null)).is_err());
+        assert!(require_object("qq.channel.create", "body", &json!(["invalid"])).is_err());
+        assert!(require_object("qq.message.markdown", "keyboard", &json!("bad")).is_err());
+    }
 
     #[test]
     fn committed_sequence_only_advances_across_contiguous_completed_events() {

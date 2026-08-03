@@ -143,6 +143,7 @@ impl BotConfig {
             "BKMQB_QQ_PUBLIC_GUILD_MESSAGES",
             &mut self.qq.public_guild_messages,
         )?;
+        apply_bool_override("BKMQB_QQ_EXTENDED_EVENTS", &mut self.qq.extended_events.0)?;
         apply_bool_override("BKMQB_QQ_CHECK_ONLY", &mut self.qq.check_only)?;
         if let Ok(value) = env::var("BKMQB_QQ_WEBHOOK_LISTEN") {
             self.qq.webhook.listen = value;
@@ -902,6 +903,7 @@ mod tests {
                 [qq]
                 environment = "sandbox"
                 public_guild_messages = true
+                extended_events = true
                 check_only = true
 
                 [runtime]
@@ -935,6 +937,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.qq.environment, "sandbox");
         assert!(config.qq.public_guild_messages);
+        assert!(config.qq.extended_events.is_enabled());
         assert_eq!(config.runtime.event_concurrency, 8);
         assert_eq!(config.runtime.queue_capacity, 64);
         assert_eq!(config.runtime.handler_timeout_seconds, 12);
