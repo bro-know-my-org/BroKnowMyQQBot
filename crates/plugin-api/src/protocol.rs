@@ -104,6 +104,173 @@ pub struct HttpResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BrowserRun {
+    pub steps: Vec<BrowserStep>,
+    #[serde(default)]
+    pub viewport: BrowserViewport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_scheme: Option<BrowserColorScheme>,
+    #[serde(default)]
+    pub extra_headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserColorScheme {
+    Light,
+    Dark,
+    NoPreference,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserViewport {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_device_scale_factor")]
+    pub device_scale_factor: u8,
+}
+
+impl Default for BrowserViewport {
+    fn default() -> Self {
+        Self {
+            width: 1280,
+            height: 720,
+            device_scale_factor: 1,
+        }
+    }
+}
+
+const fn default_device_scale_factor() -> u8 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BrowserStep {
+    Navigate {
+        url: String,
+        #[serde(default)]
+        wait_until: BrowserWaitUntil,
+        #[serde(default = "default_browser_step_timeout_ms")]
+        timeout_ms: u64,
+    },
+    Click {
+        selector: String,
+        #[serde(default = "default_browser_step_timeout_ms")]
+        timeout_ms: u64,
+    },
+    Fill {
+        selector: String,
+        value: String,
+        #[serde(default = "default_browser_step_timeout_ms")]
+        timeout_ms: u64,
+    },
+    WaitFor {
+        selector: String,
+        #[serde(default = "default_browser_step_timeout_ms")]
+        timeout_ms: u64,
+    },
+    WaitForIdle {
+        #[serde(default = "default_browser_step_timeout_ms")]
+        timeout_ms: u64,
+    },
+    Wait {
+        duration_ms: u64,
+    },
+    ExtractText {
+        selector: String,
+        #[serde(default = "default_browser_step_timeout_ms")]
+        timeout_ms: u64,
+    },
+    Screenshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selector: Option<String>,
+        #[serde(default)]
+        full_page: bool,
+        #[serde(default)]
+        format: BrowserScreenshotFormat,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quality: Option<u8>,
+    },
+}
+
+const fn default_browser_step_timeout_ms() -> u64 {
+    10_000
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserWaitUntil {
+    Load,
+    #[default]
+    DomContentLoaded,
+    NetworkIdle,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserScreenshotFormat {
+    #[default]
+    Png,
+    Jpeg,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserRunResult {
+    pub final_url: String,
+    pub title: String,
+    pub extracted_text: Vec<String>,
+    pub assets: Vec<AssetReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssetReference {
+    pub asset_id: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    /// Informational wall-clock estimate; Host access control uses a monotonic TTL.
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaReply {
+    pub asset_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(default = "default_consume_asset")]
+    pub consume: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaSend {
+    pub target: PluginMessageTarget,
+    pub asset_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+    #[serde(default = "default_consume_asset")]
+    pub consume: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum PluginMessageTarget {
+    Group { group_id: String },
+    Private { user_id: String },
+    Channel { channel_id: String },
+}
+
+const fn default_consume_asset() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScheduleCreate {
     pub task_id: String,
     pub run_at_ms: i64,

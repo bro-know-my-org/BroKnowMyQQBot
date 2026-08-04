@@ -13,8 +13,8 @@ use thiserror::Error;
 use tracing::info;
 
 use builtin_plugins::{
-    ActiveSendProbePlugin, AdminPlugin, CounterPlugin, EchoPlugin, HelpPlugin, HttpProbePlugin,
-    PingPlugin, QqExtensionProbePlugin, ReminderPlugin, SchedulerProbePlugin,
+    ActiveSendProbePlugin, AdminPlugin, BrowserProbePlugin, CounterPlugin, EchoPlugin, HelpPlugin,
+    HttpProbePlugin, PingPlugin, QqExtensionProbePlugin, ReminderPlugin, SchedulerProbePlugin,
 };
 use plugin_host::{PluginStore, StaticPluginHost, ValidatedPluginPackage, WasmPlugin};
 
@@ -270,6 +270,10 @@ async fn register_bundled_plugins(
                 "http-probe" => (
                     std::sync::Arc::new(HttpProbePlugin::default()),
                     "dev.bkm.http-probe/default",
+                ),
+                "browser-probe" => (
+                    std::sync::Arc::new(BrowserProbePlugin::default()),
+                    "dev.bkm.browser-probe/default",
                 ),
                 "scheduler-probe" => (
                     std::sync::Arc::new(SchedulerProbePlugin::default()),

@@ -15,7 +15,7 @@ use std::{
 use async_trait::async_trait;
 use bot_core::{
     Action, ActionResult, Adapter, AdapterError, AdapterId, EventEnvelope, EventSendError,
-    EventSender, MessageTarget, ShutdownSignal,
+    EventSender, MediaAttachment, MessageTarget, ShutdownSignal,
 };
 use futures_util::{Sink, SinkExt as _, StreamExt as _};
 use onebot_protocol::{ActionRequest, ActionResponse, MessageSegment, OneBotId, response_like};
@@ -26,7 +26,7 @@ use subtle::ConstantTimeEq as _;
 use tokio::{
     io::AsyncWriteExt as _,
     net::{TcpListener, TcpStream},
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
     time::{Instant, interval, timeout},
 };
@@ -37,6 +37,10 @@ use tokio_tungstenite::{
         protocol::WebSocketConfig,
     },
 };
+
+const MAX_INLINE_MEDIA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUEUED_INLINE_MEDIA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONCURRENT_INLINE_MEDIA: usize = 8;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -96,11 +100,15 @@ struct OutboundAction {
     params: Value,
     deadline: Instant,
     response: oneshot::Sender<Result<ActionResponse, AdapterError>>,
+    media_budget: Option<OwnedSemaphorePermit>,
+    media_slot: Option<OwnedSemaphorePermit>,
 }
 
 struct PendingAction {
     deadline: Instant,
     response: oneshot::Sender<Result<ActionResponse, AdapterError>>,
+    _media_budget: Option<OwnedSemaphorePermit>,
+    _media_slot: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Default)]
@@ -152,6 +160,8 @@ pub struct OneBot11Adapter {
     local_addr: SocketAddr,
     listener: Mutex<Option<TcpListener>>,
     connection: Arc<StdMutex<ConnectionState>>,
+    media_budget: Arc<Semaphore>,
+    media_slots: Arc<Semaphore>,
     #[cfg(test)]
     queue_backpressure: StdMutex<Option<Arc<tokio::sync::Notify>>>,
 }
@@ -200,6 +210,8 @@ impl OneBot11Adapter {
             local_addr,
             listener: Mutex::new(Some(listener)),
             connection: Arc::new(StdMutex::new(ConnectionState::default())),
+            media_budget: Arc::new(Semaphore::new(MAX_QUEUED_INLINE_MEDIA_BYTES)),
+            media_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_INLINE_MEDIA)),
             #[cfg(test)]
             queue_backpressure: StdMutex::new(None),
         })
@@ -505,6 +517,7 @@ impl OneBot11Adapter {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn action_request(action: Action) -> Result<(String, Value), AdapterError> {
         match action {
             Action::Reply(reply) => {
@@ -541,6 +554,47 @@ impl OneBot11Adapter {
                     "OneBot 11 does not support the common channel target".to_owned(),
                 )),
             },
+            Action::ReplyMedia(reply) => {
+                let mut message = vec![
+                    MessageSegment::reply(&OneBotId::new(reply.source_message_id)),
+                    onebot_image_segment(&reply.attachment)?,
+                ];
+                if let Some(caption) = reply.caption.filter(|value| !value.is_empty()) {
+                    message.push(MessageSegment::text(caption));
+                }
+                match reply.target {
+                    MessageTarget::Group { group_id } => Ok((
+                        "send_group_msg".to_owned(),
+                        json!({"group_id": id_param(&group_id), "message": message}),
+                    )),
+                    MessageTarget::Private { user_id } => Ok((
+                        "send_private_msg".to_owned(),
+                        json!({"user_id": id_param(&user_id), "message": message}),
+                    )),
+                    MessageTarget::Channel { .. } => Err(AdapterError::Action(
+                        "OneBot 11 does not support the common channel target".to_owned(),
+                    )),
+                }
+            }
+            Action::SendMedia(send) => {
+                let mut message = vec![onebot_image_segment(&send.attachment)?];
+                if let Some(caption) = send.caption.filter(|value| !value.is_empty()) {
+                    message.push(MessageSegment::text(caption));
+                }
+                match send.target {
+                    MessageTarget::Group { group_id } => Ok((
+                        "send_group_msg".to_owned(),
+                        json!({"group_id": id_param(&group_id), "message": message}),
+                    )),
+                    MessageTarget::Private { user_id } => Ok((
+                        "send_private_msg".to_owned(),
+                        json!({"user_id": id_param(&user_id), "message": message}),
+                    )),
+                    MessageTarget::Channel { .. } => Err(AdapterError::Action(
+                        "OneBot 11 does not support the common channel target".to_owned(),
+                    )),
+                }
+            }
             Action::Recall { message_id, .. } => Ok((
                 "delete_msg".to_owned(),
                 json!({"message_id": id_param(&message_id)}),
@@ -674,8 +728,66 @@ impl Adapter for OneBot11Adapter {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(&self, action: Action) -> Result<ActionResult, AdapterError> {
-        let (action, params) = Self::action_request(action)?;
+        if matches!(
+            &action,
+            Action::ReplyMedia(reply) if matches!(reply.target, MessageTarget::Channel { .. })
+        ) || matches!(
+            &action,
+            Action::SendMedia(send) if matches!(send.target, MessageTarget::Channel { .. })
+        ) {
+            return Err(AdapterError::Action(
+                "OneBot 11 does not support the common channel target".to_owned(),
+            ));
+        }
+        let media_bytes = if let Some(attachment) = action_media_attachment(&action) {
+            validate_onebot_image_attachment(attachment)?;
+            Some(attachment.data().len())
+        } else {
+            None
+        };
+        let media_slot = if media_bytes.is_some() {
+            Some(
+                Arc::clone(&self.media_slots)
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        AdapterError::Action(
+                            "OneBot inline media concurrency limit reached".to_owned(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let media_budget = if let Some(media_bytes) = media_bytes {
+            let permits = u32::try_from(media_bytes).map_err(|_| {
+                AdapterError::Action("OneBot inline image exceeds the media budget".to_owned())
+            })?;
+            Some(
+                Arc::clone(&self.media_budget)
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| {
+                        AdapterError::Action(
+                            "OneBot inline media byte budget is exhausted".to_owned(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let ((action, params), media_budget, media_slot) = if media_bytes.is_none() {
+            (Self::action_request(action)?, None, None)
+        } else {
+            let (request, media_budget, media_slot) = tokio::task::spawn_blocking(move || {
+                (Self::action_request(action), media_budget, media_slot)
+            })
+            .await
+            .map_err(|error| {
+                AdapterError::Action(format!("OneBot inline media encoding task failed: {error}"))
+            })?;
+            (request?, media_budget, media_slot)
+        };
         let (response_sender, response_receiver) = oneshot::channel();
         let deadline = Instant::now() + self.config.action_timeout;
         {
@@ -699,6 +811,8 @@ impl Adapter for OneBot11Adapter {
                     params,
                     deadline,
                     response: response_sender,
+                    media_budget,
+                    media_slot,
                 })
                 .map_err(|error| {
                     AdapterError::Action(format!("OneBot Action queue unavailable: {error}"))
@@ -786,6 +900,39 @@ fn id_param(value: &str) -> Value {
     Value::String(value.to_owned())
 }
 
+fn onebot_image_segment(attachment: &MediaAttachment) -> Result<MessageSegment, AdapterError> {
+    validate_onebot_image_attachment(attachment)?;
+    Ok(MessageSegment::image_bytes(attachment.data()))
+}
+
+fn validate_onebot_image_attachment(attachment: &MediaAttachment) -> Result<(), AdapterError> {
+    if attachment.validated_image_mime().is_none() {
+        return Err(AdapterError::Action(format!(
+            "OneBot 11 inline media has an unsupported MIME type or mismatched image signature: `{}`",
+            attachment.mime_type()
+        )));
+    }
+    if attachment.data().is_empty() {
+        return Err(AdapterError::Action(
+            "OneBot 11 inline image data must not be empty".to_owned(),
+        ));
+    }
+    if attachment.data().len() > MAX_INLINE_MEDIA_BYTES {
+        return Err(AdapterError::Action(
+            "OneBot 11 inline image exceeds the 8 MiB limit".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn action_media_attachment(action: &Action) -> Option<&MediaAttachment> {
+    match action {
+        Action::ReplyMedia(reply) => Some(&reply.attachment),
+        Action::SendMedia(send) => Some(&send.attachment),
+        _ => None,
+    }
+}
+
 async fn send_websocket_message<S>(
     writer: &mut S,
     message: WebSocketMessage,
@@ -845,6 +992,8 @@ where
         PendingAction {
             deadline: outbound.deadline,
             response: outbound.response,
+            _media_budget: outbound.media_budget,
+            _media_slot: outbound.media_slot,
         },
     );
     let write_timeout = outbound.deadline.saturating_duration_since(Instant::now());
@@ -1008,8 +1157,9 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use bot_core::{
-        Action, Adapter, AdapterError, AdapterId, Event, EventEnvelope, EventSender, MessageTarget,
-        ReplyAction, RuntimeBuilder, RuntimeObserver, SendMessageAction, shutdown_channel,
+        Action, Adapter, AdapterError, AdapterId, Event, EventEnvelope, EventSender,
+        MediaAttachment, MessageTarget, ReplyAction, ReplyMediaAction, RuntimeBuilder,
+        RuntimeObserver, SendMediaAction, SendMessageAction, shutdown_channel,
     };
     use builtin_plugins::PingPlugin;
     use futures_util::{SinkExt as _, StreamExt as _};
@@ -1022,7 +1172,7 @@ mod tests {
         tungstenite::{Message as WebSocketMessage, client::IntoClientRequest as _},
     };
 
-    use super::{OneBot11Adapter, OneBot11Config};
+    use super::{MAX_INLINE_MEDIA_BYTES, OneBot11Adapter, OneBot11Config, onebot_image_segment};
 
     async fn adapter() -> Arc<OneBot11Adapter> {
         adapter_with_timeout(Duration::from_secs(2)).await
@@ -1833,6 +1983,91 @@ mod tests {
         .unwrap();
         assert_eq!(action, "delete_msg");
         assert_eq!(params["message_id"], "0007");
+    }
+
+    #[test]
+    fn common_media_requires_a_non_empty_image_attachment() {
+        let image = Action::SendMedia(SendMediaAction {
+            target: MessageTarget::Private {
+                user_id: "0042".to_owned(),
+            },
+            attachment: MediaAttachment::image("image/png", None, b"\x89PNG\r\n\x1a\n".to_vec())
+                .unwrap(),
+            caption: None,
+        });
+        let (action, params) = OneBot11Adapter::action_request(image).unwrap();
+        assert_eq!(action, "send_private_msg");
+        assert_eq!(params["message"][0]["type"], "image");
+        assert_eq!(
+            params["message"][0]["data"]["file"],
+            "base64://iVBORw0KGgo="
+        );
+
+        let (action, params) =
+            OneBot11Adapter::action_request(Action::ReplyMedia(ReplyMediaAction {
+                target: MessageTarget::Group {
+                    group_id: "0300".to_owned(),
+                },
+                source_message_id: "0007".to_owned(),
+                attachment: MediaAttachment::image(
+                    "image/png",
+                    None,
+                    b"\x89PNG\r\n\x1a\n".to_vec(),
+                )
+                .unwrap(),
+                caption: Some("caption".to_owned()),
+            }))
+            .unwrap();
+        assert_eq!(action, "send_group_msg");
+        assert_eq!(params["group_id"], "0300");
+        assert_eq!(params["message"][0]["type"], "reply");
+        assert_eq!(params["message"][0]["data"]["id"], "0007");
+        assert_eq!(params["message"][1]["type"], "image");
+        assert_eq!(params["message"][2]["type"], "text");
+        assert_eq!(params["message"][2]["data"]["text"], "caption");
+
+        assert!(
+            OneBot11Adapter::action_request(Action::SendMedia(SendMediaAction {
+                target: MessageTarget::Channel {
+                    channel_id: "channel".to_owned(),
+                },
+                attachment: MediaAttachment::image(
+                    "image/png",
+                    None,
+                    b"\x89PNG\r\n\x1a\n".to_vec(),
+                )
+                .unwrap(),
+                caption: None,
+            }))
+            .is_err()
+        );
+
+        assert!(MediaAttachment::image("video/mp4", None, vec![1]).is_err());
+        assert!(MediaAttachment::image("image/png", None, Vec::new()).is_err());
+        assert!(MediaAttachment::image("image/png", None, b"not an image".to_vec()).is_err());
+        let mut oversized = b"\x89PNG\r\n\x1a\n".to_vec();
+        oversized.resize(MAX_INLINE_MEDIA_BYTES + 1, 0);
+        assert!(MediaAttachment::image("image/png", None, oversized).is_err());
+    }
+
+    #[test]
+    fn common_media_accepts_each_supported_image_signature_and_the_size_boundary() {
+        for (mime_type, data) in [
+            ("image/png", b"\x89PNG\r\n\x1a\n".as_slice()),
+            ("image/jpeg", b"\xff\xd8\xffbody".as_slice()),
+            ("image/gif", b"GIF89abody".as_slice()),
+            ("image/webp", b"RIFF\0\0\0\0WEBP".as_slice()),
+        ] {
+            let attachment = MediaAttachment::image(mime_type, None, data.to_vec()).unwrap();
+            onebot_image_segment(&attachment).unwrap();
+        }
+
+        let mut boundary = b"\x89PNG\r\n\x1a\n".to_vec();
+        boundary.resize(MAX_INLINE_MEDIA_BYTES, 0);
+        onebot_image_segment(&MediaAttachment::image("image/png", None, boundary).unwrap())
+            .unwrap();
+
+        assert!(MediaAttachment::image("image/jpeg", None, b"\x89PNG\r\n\x1a\n".to_vec()).is_err());
     }
 
     #[test]

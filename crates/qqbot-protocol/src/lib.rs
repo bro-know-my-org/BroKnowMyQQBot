@@ -10,7 +10,7 @@ pub mod openapi;
 pub use auth::{AccessToken, AuthError, TokenManager};
 pub use gateway::{Gateway, GatewayBot, GatewayPayload, Intents, OpCode, SessionStartLimit};
 pub use message::{
-    ChannelMessageRequest, MediaFileType, MediaUploadRequest, MediaUploadResponse, MessageRequest,
-    MessageResponse, MessageType, QqMessage,
+    ChannelMessageRequest, InlineMediaUploadRequest, MediaFileType, MediaUploadRequest,
+    MediaUploadResponse, MessageRequest, MessageResponse, MessageType, QqMessage,
 };
 pub use openapi::{ApiError, OpenApiClient, OpenApiEnvironment};

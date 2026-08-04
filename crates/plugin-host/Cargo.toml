@@ -15,6 +15,7 @@ anyhow = { workspace = true, optional = true }
 async-trait.workspace = true
 bot-core = { path = "../bot-core" }
 futures-util.workspace = true
+hex.workspace = true
 jsonschema.workspace = true
 plugin-api = { path = "../plugin-api" }
 reqwest.workspace = true

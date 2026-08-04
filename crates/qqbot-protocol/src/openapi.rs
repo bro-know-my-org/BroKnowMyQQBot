@@ -11,8 +11,8 @@ use crate::{
     auth::{AuthError, TokenManager},
     gateway::{Gateway, GatewayBot},
     message::{
-        ChannelMessageRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
-        MessageResponse,
+        ChannelMessageRequest, InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse,
+        MessageRequest, MessageResponse,
     },
 };
 
@@ -174,6 +174,24 @@ impl OpenApiClient {
         request
             .validate()
             .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "files"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn upload_c2c_inline_media(
+        &self,
+        user_openid: &str,
+        request: &InlineMediaUploadRequest,
+    ) -> Result<MediaUploadResponse, ApiError> {
+        let url = self.endpoint(&["v2", "users", user_openid, "files"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn upload_group_inline_media(
+        &self,
+        group_openid: &str,
+        request: &InlineMediaUploadRequest,
+    ) -> Result<MediaUploadResponse, ApiError> {
         let url = self.endpoint(&["v2", "groups", group_openid, "files"])?;
         self.post_json(url, request).await
     }

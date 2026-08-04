@@ -23,10 +23,11 @@ use bot_core::{
 };
 use futures_util::FutureExt;
 use plugin_api::{
-    ActionCompleted, ActionStatus, BPP_VERSION, CommandDeclaration, Disposition, ExtensionPayload,
-    HandlerOutput, HealthStatus, HostQueries, HttpRequest, InitContext, PluginCommand, PluginError,
-    PluginEventEnvelope, PluginManifest, RuntimeMode, ScheduleCancel, ScheduleCreate,
-    ScheduleTriggered, StateOp, StateValue, StaticPlugin,
+    ActionCompleted, ActionStatus, BPP_VERSION, BrowserRun, BrowserStep, CommandDeclaration,
+    Disposition, ExtensionPayload, HandlerOutput, HealthStatus, HostQueries, HttpRequest,
+    InitContext, MediaReply, MediaSend, PluginCommand, PluginError, PluginEventEnvelope,
+    PluginManifest, RuntimeMode, ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp,
+    StateValue, StaticPlugin,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -39,12 +40,14 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    CommitOptions, HttpExecutionError, HttpExecutor, PluginStore, SecureHttpExecutor, StoreError,
+    AssetDigest, AssetStore, BrowserExecutionError, BrowserExecutor, CommitOptions,
+    HttpExecutionError, HttpExecutor, PluginStore, SecureHttpExecutor, StoreError,
+    UnavailableBrowserExecutor,
     storage::{DeliveryFailurePolicy, OutboxOrigin, PendingCommand, ScheduledTask},
 };
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_COMMANDS: usize = 32;
+pub(crate) const MAX_COMMANDS: usize = 32;
 const MAX_STATE_OPS: usize = 128;
 const MAX_ACTION_COMPLETION_CHAIN: usize = 64;
 const MAX_SCHEDULE_AHEAD_MS: i64 = 366 * 24 * 60 * 60 * 1_000;
@@ -109,6 +112,8 @@ pub struct StaticPluginHost {
     instances: BTreeSet<String>,
     command_names: BTreeSet<String>,
     http_executor: Arc<dyn HttpExecutor>,
+    browser_executor: Arc<dyn BrowserExecutor>,
+    assets: AssetStore,
     adapters: Arc<BTreeMap<String, Arc<dyn Adapter>>>,
     scheduled_tasks: Arc<StdMutex<HashMap<(String, String), AbortHandle>>>,
 }
@@ -123,6 +128,8 @@ impl std::fmt::Debug for StaticPluginHost {
             .field("instances", &self.instances)
             .field("command_names", &self.command_names)
             .field("http_executor", &"configured")
+            .field("browser_executor", &"configured")
+            .field("assets", &"configured")
             .field("adapter_count", &self.adapters.len())
             .field("scheduled_tasks", &"supervised")
             .finish()
@@ -138,6 +145,8 @@ impl StaticPluginHost {
             instances: BTreeSet::new(),
             command_names: BTreeSet::new(),
             http_executor: Arc::new(SecureHttpExecutor),
+            browser_executor: Arc::new(UnavailableBrowserExecutor),
+            assets: AssetStore::default(),
             adapters: Arc::new(BTreeMap::new()),
             scheduled_tasks: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -146,6 +155,12 @@ impl StaticPluginHost {
     #[must_use]
     pub fn with_http_executor(mut self, executor: Arc<dyn HttpExecutor>) -> Self {
         self.http_executor = executor;
+        self
+    }
+
+    #[must_use]
+    pub fn with_browser_executor(mut self, executor: Arc<dyn BrowserExecutor>) -> Self {
+        self.browser_executor = executor;
         self
     }
 
@@ -269,6 +284,7 @@ impl StaticPluginHost {
         match supervised_init(&plugin, config.clone()).await {
             Ok(()) => {
                 plugin.replace_config(config)?;
+                self.assets.remove_instance(instance_id);
                 plugin.set_state(PluginInstanceState::Ready)?;
                 Ok(())
             }
@@ -279,6 +295,7 @@ impl StaticPluginHost {
                 }
                 Err(rollback_error) => {
                     plugin.set_state(PluginInstanceState::Disabled)?;
+                    self.assets.remove_instance(instance_id);
                     Err(PluginHostError::Init {
                         plugin_id: plugin.manifest.id.to_string(),
                         message: format!(
@@ -391,7 +408,6 @@ impl StaticPluginHost {
             self.recover_plugin_schedules(&old)?;
             return Err(error);
         }
-
         let upgrade_result = async {
             if candidate.manifest.state_version != old.manifest.state_version {
                 let operations = supervised_migration(
@@ -442,6 +458,7 @@ impl StaticPluginHost {
         candidate.set_state(PluginInstanceState::Ready)?;
         self.plugins[index] = Arc::clone(&candidate);
         self.rebuild_command_names();
+        self.assets.remove_instance(instance_id);
         self.recover_plugin_schedules(&candidate)?;
         Ok(())
     }
@@ -462,6 +479,7 @@ impl StaticPluginHost {
             }
             Err(rollback_error) => {
                 old.set_state(PluginInstanceState::Disabled)?;
+                self.assets.remove_instance(&old.instance_id);
                 Err(PluginHostError::Migration {
                     plugin_id: old.manifest.id.to_string(),
                     message: format!(
@@ -594,6 +612,7 @@ impl StaticPluginHost {
     ) -> Result<(bool, VecDeque<PluginEventEnvelope>), PluginHostError> {
         if self.store.circuit_open(&plugin.instance_id)? {
             plugin.set_state(PluginInstanceState::Disabled)?;
+            self.assets.remove_instance(&plugin.instance_id);
             return Ok((false, VecDeque::new()));
         }
         loop {
@@ -710,6 +729,7 @@ impl StaticPluginHost {
             "disabled plugin after action completion chain exceeded limit"
         );
         plugin.set_state(PluginInstanceState::Disabled)?;
+        self.assets.remove_instance(&plugin.instance_id);
         Ok(true)
     }
 
@@ -765,6 +785,7 @@ impl StaticPluginHost {
         );
         if fatal_trap || circuit_open {
             plugin.set_state(PluginInstanceState::Disabled)?;
+            self.assets.remove_instance(&plugin.instance_id);
         }
         Ok((!dead_letter && !circuit_open && retryable).then_some(delay_ms))
     }
@@ -1014,6 +1035,9 @@ impl StaticPluginHost {
                         origin,
                         &command,
                         self.http_executor.as_ref(),
+                        self.browser_executor.as_ref(),
+                        &self.assets,
+                        &plugin.instance_id,
                         &plugin.manifest,
                         &plugin.granted_capabilities,
                         &self.adapters,
@@ -1365,7 +1389,10 @@ impl StaticPluginHost {
             match plugin.state()? {
                 PluginInstanceState::Ready => plugin.begin_draining()?,
                 PluginInstanceState::Draining => {}
-                PluginInstanceState::Disabled | PluginInstanceState::Stopped => continue,
+                PluginInstanceState::Disabled | PluginInstanceState::Stopped => {
+                    self.assets.remove_instance(&plugin.instance_id);
+                    continue;
+                }
             }
             let execution = plugin.execution.acquire_exclusive().await;
             match execution {
@@ -1385,6 +1412,7 @@ impl StaticPluginHost {
                     }
                 }
             }
+            self.assets.remove_instance(&plugin.instance_id);
         }
         first_error.map_or(Ok(()), Err)
     }

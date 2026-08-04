@@ -671,6 +671,7 @@ fn is_reserved_bundled_instance_id(instance_id: &str) -> bool {
             | "dev.bkm.echo/default"
             | "dev.bkm.counter/default"
             | "dev.bkm.http-probe/default"
+            | "dev.bkm.browser-probe/default"
             | "dev.bkm.scheduler-probe/default"
             | "dev.bkm.qq-extension-probe/default"
             | "dev.bkm.active-send-probe/default"

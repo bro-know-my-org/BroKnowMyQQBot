@@ -2,9 +2,18 @@
 
 #![forbid(unsafe_code)]
 
-use std::{env, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    env,
+    process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::{
+    browser::InstalledBrowserExecutor,
     config::{self, BotConfig, ManagementConfig, load_secret_environment},
     logging, management,
     plugins::load_plugins,
@@ -74,6 +83,9 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     }
     let plugin_store = PluginStore::open(plugin_db)?;
     let mut plugins = StaticPluginHost::new(plugin_store.clone());
+    if let Some(executor) = discover_browser_executor().await {
+        plugins = plugins.with_browser_executor(Arc::new(executor));
+    }
     for adapter in &adapters {
         plugins = plugins.with_adapter(adapter.clone());
     }
@@ -137,6 +149,39 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     runtime_result?;
     info!("BroKnowMyQQBot stopped");
     Ok(())
+}
+
+async fn discover_browser_executor() -> Option<InstalledBrowserExecutor> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let mut task = tokio::task::spawn_blocking(move || {
+        InstalledBrowserExecutor::discover_with_cancel(&worker_cancel)
+            .map_err(|error| error.to_string())
+    });
+    let discovery = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+    match discovery {
+        Ok(Ok(Ok(Some(executor)))) => Some(executor),
+        Ok(Ok(Ok(None))) => {
+            info!("optional Browser Runtime is not installed");
+            None
+        }
+        Ok(Ok(Err(error))) => {
+            warn!(error, "optional Browser Runtime is unavailable");
+            None
+        }
+        Ok(Err(error)) => {
+            warn!(error = %error, "optional Browser Runtime discovery task failed");
+            None
+        }
+        Err(_) => {
+            cancel.store(true, Ordering::Relaxed);
+            warn!("optional Browser Runtime discovery timed out");
+            if let Err(error) = task.await {
+                warn!(error = %error, "timed-out Browser Runtime discovery task failed to join");
+            }
+            None
+        }
+    }
 }
 
 async fn supervise_runtime(

@@ -17,7 +17,7 @@ fn formal_wit_contract_parses_with_expected_identity() {
     assert_eq!(package.name.name, "plugin");
     assert_eq!(
         package.name.version.as_ref().map(ToString::to_string),
-        Some("1.0.0".to_owned())
+        Some("1.1.0".to_owned())
     );
     assert!(package.worlds.contains_key("plugin"));
     assert!(package.interfaces.contains_key("types"));
@@ -33,7 +33,10 @@ fn formal_wit_contract_parses_with_expected_identity() {
     let expected = [
         ("message-reply", "message-reply-command"),
         ("message-send", "message-send-command"),
+        ("media-reply", "media-reply-command"),
+        ("media-send", "media-send-command"),
         ("http-request", "http-request-command"),
+        ("browser-run", "browser-run-command"),
         ("schedule-create", "schedule-create-command"),
         ("schedule-cancel", "schedule-cancel-command"),
     ];

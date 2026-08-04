@@ -9,6 +9,12 @@ mod storage;
 #[cfg(feature = "wasm")]
 mod wasm;
 
+pub(crate) use assets::AssetDigest;
+pub use assets::{AssetError, AssetStore, StoredAsset};
+pub use browser::{
+    BrowserArtifact, BrowserExecution, BrowserExecutionError, BrowserExecutor,
+    UnavailableBrowserExecutor,
+};
 pub use http::{HttpExecutionError, HttpExecutor, SecureHttpExecutor};
 pub use package::{PluginPackageError, ValidatedPluginPackage};
 pub use runtime::{PluginHostError, PluginInstanceState, StaticPluginHost};
@@ -17,3 +23,5 @@ pub use storage::{
 };
 #[cfg(feature = "wasm")]
 pub use wasm::{WasmPlugin, WasmPluginError};
+mod assets;
+mod browser;

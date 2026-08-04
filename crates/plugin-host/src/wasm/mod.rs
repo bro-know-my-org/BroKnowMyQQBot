@@ -17,9 +17,11 @@ use crate::ValidatedPluginPackage;
 use async_trait::async_trait;
 use bot_core::{Event, MessageSegment, MessageTarget};
 use plugin_api::{
-    ActionCompleted, HandlerOutput, HealthStatus, HostQueries, HttpRequest, InitContext,
-    PluginCommand, PluginDiagnostic, PluginError, PluginEventEnvelope, PluginManifest,
-    ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StateValue, StaticPlugin,
+    ActionCompleted, BrowserColorScheme, BrowserRun, BrowserScreenshotFormat, BrowserStep,
+    BrowserViewport, BrowserWaitUntil, HandlerOutput, HealthStatus, HostQueries, HttpRequest,
+    InitContext, MediaReply, MediaSend, PluginCommand, PluginDiagnostic, PluginError,
+    PluginEventEnvelope, PluginManifest, PluginMessageTarget, ScheduleCancel, ScheduleCreate,
+    ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 use serde_json::{Value, json};
 use thiserror::Error;

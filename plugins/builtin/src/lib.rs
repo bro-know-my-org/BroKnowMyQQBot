@@ -6,11 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use plugin_api::{
-    ActionCompleted, ActionStatus, CommandDeclaration, Disposition, HandlerOutput, HostQueries,
-    HttpPermission, HttpRequest, HttpResponse, PluginCommand, PluginError, PluginEventEnvelope,
-    PluginId, PluginManifest, PluginMetadata, PluginPermissions, PluginRuntimeConfig,
-    ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin, StoragePermission,
-    Subscription,
+    ActionCompleted, ActionStatus, BrowserPermission, BrowserRun, BrowserRunResult,
+    BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil, CommandDeclaration,
+    Disposition, HandlerOutput, HostQueries, HttpPermission, HttpRequest, HttpResponse, MediaReply,
+    PluginCommand, PluginError, PluginEventEnvelope, PluginId, PluginManifest, PluginMetadata,
+    PluginPermissions, PluginRuntimeConfig, ScheduleCancel, ScheduleCreate, ScheduleTriggered,
+    StateOp, StaticPlugin, StoragePermission, Subscription,
 };
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
@@ -22,8 +23,8 @@ mod probes;
 pub use basic::{CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin};
 pub use business::{AdminPlugin, ReminderPlugin};
 pub use probes::{
-    ActionResultProbePlugin, ActiveSendProbePlugin, ConfigProbePlugin, HttpProbePlugin,
-    QqExtensionProbePlugin, SchedulerProbePlugin,
+    ActionResultProbePlugin, ActiveSendProbePlugin, BrowserProbePlugin, ConfigProbePlugin,
+    HttpProbePlugin, QqExtensionProbePlugin, SchedulerProbePlugin,
 };
 
 fn message_plugin_manifest(
@@ -62,6 +63,7 @@ fn message_plugin_manifest(
             actions,
             event_extensions: BTreeSet::new(),
             http: Vec::new(),
+            browser: Vec::new(),
             storage: if storage {
                 StoragePermission::Private
             } else {

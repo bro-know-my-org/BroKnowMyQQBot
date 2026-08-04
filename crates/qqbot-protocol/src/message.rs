@@ -1,6 +1,9 @@
 //! QQ message event and send-message types used by the first end-to-end path.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
+
+const MAX_INLINE_MEDIA_BYTES: usize = 8 * 1024 * 1024;
 
 /// A QQ message type.
 ///
@@ -372,6 +375,49 @@ impl MediaUploadRequest {
     }
 }
 
+/// A QQ inline image upload whose wire payload is base64-encoded.
+///
+/// The raw input must carry a PNG, JPEG, GIF, or WebP signature and must not
+/// exceed 8 MiB. Fields stay private so every serializable value preserves
+/// these invariants.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InlineMediaUploadRequest {
+    file_type: MediaFileType,
+    file_data: String,
+    #[serde(default)]
+    srv_send_msg: bool,
+}
+
+impl InlineMediaUploadRequest {
+    pub fn from_bytes(file_type: MediaFileType, data: &[u8]) -> Result<Self, &'static str> {
+        if file_type != MediaFileType::IMAGE {
+            return Err("QQ inline media uploads support images only");
+        }
+        if data.is_empty() {
+            return Err("QQ inline media upload data must not be empty");
+        }
+        if data.len() > MAX_INLINE_MEDIA_BYTES {
+            return Err("QQ inline media upload data exceeds the 8 MiB limit");
+        }
+        if !has_supported_image_signature(data) {
+            return Err("QQ inline media upload data has an unsupported image signature");
+        }
+        Ok(Self {
+            file_type,
+            file_data: STANDARD.encode(data),
+            srv_send_msg: false,
+        })
+    }
+}
+
+fn has_supported_image_signature(data: &[u8]) -> bool {
+    data.starts_with(b"\x89PNG\r\n\x1a\n")
+        || data.starts_with(&[0xff, 0xd8, 0xff])
+        || data.starts_with(b"GIF87a")
+        || data.starts_with(b"GIF89a")
+        || data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MediaUploadResponse {
     pub file_uuid: String,
@@ -396,8 +442,8 @@ pub struct MessageResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelMessageRequest, MediaFileType, MediaUploadRequest, MessageRequest, MessageType,
-        QqMessage,
+        ChannelMessageRequest, InlineMediaUploadRequest, MAX_INLINE_MEDIA_BYTES, MediaFileType,
+        MediaUploadRequest, MessageRequest, MessageType, QqMessage,
     };
     use serde_json::json;
 
@@ -469,8 +515,25 @@ mod tests {
         .unwrap();
         assert_eq!(upload["file_type"], 1);
         assert_eq!(upload["srv_send_msg"], false);
+
+        let inline =
+            InlineMediaUploadRequest::from_bytes(MediaFileType::IMAGE, b"\x89PNG\r\n\x1a\n")
+                .unwrap();
+        let inline = serde_json::to_value(inline).unwrap();
+        assert_eq!(inline["file_data"], "iVBORw0KGgo=");
+        assert!(inline.get("url").is_none());
         assert!(MediaFileType::try_from(0).is_err());
         assert!(MediaFileType::try_from(5).is_err());
+        assert!(InlineMediaUploadRequest::from_bytes(MediaFileType::IMAGE, &[]).is_err());
+        assert!(
+            InlineMediaUploadRequest::from_bytes(
+                MediaFileType::IMAGE,
+                &vec![0; MAX_INLINE_MEDIA_BYTES + 1]
+            )
+            .is_err()
+        );
+        assert!(InlineMediaUploadRequest::from_bytes(MediaFileType::VIDEO, b"video").is_err());
+        assert!(InlineMediaUploadRequest::from_bytes(MediaFileType::IMAGE, b"not-image").is_err());
         assert!(
             MediaUploadRequest::from_url(MediaFileType::IMAGE, "file:///tmp/image.png")
                 .validate()

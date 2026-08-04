@@ -6,7 +6,7 @@ use std::{
 };
 
 use semver::{Version, VersionReq};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use url::Host;
 
@@ -74,6 +74,18 @@ impl PluginManifest {
                 host: BPP_VERSION.to_owned(),
             });
         }
+        let uses_bpp_1_1 = !self.permissions.browser.is_empty()
+            || self
+                .permissions
+                .actions
+                .iter()
+                .any(|action| matches!(action.as_str(), "media.reply" | "media.send"));
+        if uses_bpp_1_1
+            && (requirement.matches(&Version::new(1, 0, 0))
+                || requirement.matches(&Version::new(1, 0, u64::MAX)))
+        {
+            return Err(ManifestError::FeatureRequiresProtocol11);
+        }
         if self.runtime.max_concurrency == 0 {
             return Err(ManifestError::ZeroConcurrency);
         }
@@ -97,7 +109,10 @@ impl PluginManifest {
             ));
         }
         for action in &self.permissions.actions {
-            if !matches!(action.as_str(), "message.reply" | "message.send") {
+            if !matches!(
+                action.as_str(),
+                "message.reply" | "message.send" | "media.reply" | "media.send"
+            ) {
                 return Err(ManifestError::UnsupportedAction(action.clone()));
             }
         }
@@ -123,6 +138,9 @@ impl PluginManifest {
         for permission in &self.permissions.http {
             permission.validate()?;
         }
+        for permission in &self.permissions.browser {
+            permission.validate()?;
+        }
         Ok(())
     }
 
@@ -135,6 +153,15 @@ impl PluginManifest {
         if !self.permissions.http.is_empty() {
             capabilities.insert("http.request".to_owned());
             capabilities.extend(self.permissions.http.iter().map(HttpPermission::capability));
+        }
+        if !self.permissions.browser.is_empty() {
+            capabilities.insert("browser.run".to_owned());
+            capabilities.extend(
+                self.permissions
+                    .browser
+                    .iter()
+                    .flat_map(BrowserPermission::capabilities),
+            );
         }
         if self.permissions.storage == StoragePermission::Private {
             capabilities.insert("storage.private".to_owned());
@@ -394,6 +421,8 @@ pub struct PluginPermissions {
     #[serde(default)]
     pub http: Vec<HttpPermission>,
     #[serde(default)]
+    pub browser: Vec<BrowserPermission>,
+    #[serde(default)]
     pub storage: StoragePermission,
     #[serde(default)]
     pub storage_quota_bytes: u64,
@@ -401,6 +430,84 @@ pub struct PluginPermissions {
     pub scheduler: bool,
     #[serde(default)]
     pub stop_propagation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BrowserPermission {
+    #[serde(default = "default_https_scheme")]
+    pub scheme: String,
+    pub host: String,
+    #[serde(default = "default_https_port")]
+    pub port: u16,
+    #[serde(default = "default_http_path_prefixes")]
+    pub path_prefixes: BTreeSet<String>,
+    pub capabilities: BTreeSet<String>,
+}
+
+impl<'de> Deserialize<'de> for BrowserPermission {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WirePermission {
+            #[serde(default = "default_https_scheme")]
+            scheme: String,
+            host: String,
+            #[serde(default)]
+            port: Option<u16>,
+            #[serde(default = "default_http_path_prefixes")]
+            path_prefixes: BTreeSet<String>,
+            capabilities: BTreeSet<String>,
+        }
+
+        let wire = WirePermission::deserialize(deserializer)?;
+        let port = wire
+            .port
+            .unwrap_or(if wire.scheme == "http" { 80 } else { 443 });
+        Ok(Self {
+            scheme: wire.scheme,
+            host: wire.host,
+            port,
+            path_prefixes: wire.path_prefixes,
+            capabilities: wire.capabilities,
+        })
+    }
+}
+
+impl BrowserPermission {
+    pub fn capabilities(&self) -> impl Iterator<Item = String> + '_ {
+        self.capabilities.iter().map(|capability| {
+            format!(
+                "browser.origin.{}.{}:{}.{}",
+                self.scheme, self.host, self.port, capability
+            )
+        })
+    }
+
+    fn validate(&self) -> Result<(), ManifestError> {
+        if !matches!(self.scheme.as_str(), "http" | "https") {
+            return Err(ManifestError::InvalidBrowserPermission(
+                "scheme must be `http` or `https`".to_owned(),
+            ));
+        }
+        validate_public_host_and_paths(&self.host, self.port, &self.path_prefixes)
+            .map_err(ManifestError::InvalidBrowserPermission)?;
+        if self.capabilities.is_empty()
+            || self.capabilities.iter().any(|capability| {
+                !matches!(
+                    capability.as_str(),
+                    "navigate" | "interact" | "extract_text" | "screenshot"
+                )
+            })
+        {
+            return Err(ManifestError::InvalidBrowserPermission(
+                "capabilities must contain supported browser operations".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -421,26 +528,8 @@ impl HttpPermission {
     }
 
     fn validate(&self) -> Result<(), ManifestError> {
-        let Ok(Host::Domain(normalized)) = Host::parse(&self.host) else {
-            return Err(ManifestError::InvalidHttpPermission(
-                "host must be a DNS name, not an IP literal".to_owned(),
-            ));
-        };
-        if normalized != self.host
-            || has_dns_suffix(&normalized, "localhost")
-            || has_dns_suffix(&normalized, "local")
-            || has_dns_suffix(&normalized, "internal")
-            || has_dns_suffix(&normalized, "home.arpa")
-        {
-            return Err(ManifestError::InvalidHttpPermission(
-                "host must be a normalized public DNS name".to_owned(),
-            ));
-        }
-        if self.port == 0 {
-            return Err(ManifestError::InvalidHttpPermission(
-                "port must be non-zero".to_owned(),
-            ));
-        }
+        validate_public_host_and_paths(&self.host, self.port, &self.path_prefixes)
+            .map_err(ManifestError::InvalidHttpPermission)?;
         if self.methods.is_empty()
             || self.methods.iter().any(|method| {
                 !matches!(
@@ -453,19 +542,54 @@ impl HttpPermission {
                 "methods must use supported uppercase HTTP methods".to_owned(),
             ));
         }
-        if self.path_prefixes.is_empty()
-            || self.path_prefixes.iter().any(|path| {
-                !path.starts_with('/')
-                    || path.contains(['?', '#', '%'])
-                    || path.split('/').any(|segment| matches!(segment, "." | ".."))
-            })
-        {
-            return Err(ManifestError::InvalidHttpPermission(
-                "path prefixes must be canonical absolute URL paths".to_owned(),
-            ));
-        }
         Ok(())
     }
+}
+
+fn validate_public_host_and_paths(
+    host: &str,
+    port: u16,
+    path_prefixes: &BTreeSet<String>,
+) -> Result<(), String> {
+    let Ok(Host::Domain(normalized)) = Host::parse(host) else {
+        return Err("host must be a DNS name, not an IP literal".to_owned());
+    };
+    if normalized != host
+        || has_dns_suffix(&normalized, "localhost")
+        || has_dns_suffix(&normalized, "local")
+        || has_dns_suffix(&normalized, "internal")
+        || has_dns_suffix(&normalized, "home.arpa")
+    {
+        return Err("host must be a normalized public DNS name".to_owned());
+    }
+    if port == 0 {
+        return Err("port must be non-zero".to_owned());
+    }
+    if path_prefixes.is_empty()
+        || path_prefixes.iter().any(|path| {
+            !path.starts_with('/')
+                || path.len() > 2048
+                || path.contains(['?', '#', '%'])
+                || path.contains('\\')
+                || path.split('/').any(|segment| matches!(segment, "." | ".."))
+        })
+    {
+        return Err("path prefixes must be canonical absolute URL paths".to_owned());
+    }
+    Ok(())
+}
+
+#[must_use]
+pub fn url_path_matches_prefix(path: &str, prefix: &str) -> bool {
+    if path.contains(['?', '#', '%', '\\'])
+        || path.split('/').any(|segment| matches!(segment, "." | ".."))
+    {
+        return false;
+    }
+    prefix == "/"
+        || path == prefix
+        || (path.starts_with(prefix)
+            && (prefix.ends_with('/') || path.as_bytes().get(prefix.len()) == Some(&b'/')))
 }
 
 fn has_dns_suffix(host: &str, suffix: &str) -> bool {
@@ -477,6 +601,10 @@ fn has_dns_suffix(host: &str, suffix: &str) -> bool {
 
 const fn default_https_port() -> u16 {
     443
+}
+
+fn default_https_scheme() -> String {
+    "https".to_owned()
 }
 
 fn default_http_methods() -> BTreeSet<String> {
@@ -507,6 +635,8 @@ pub enum ManifestError {
     ProtocolRequirement(#[source] semver::Error),
     #[error("plugin requires BPP `{required}`, host provides `{host}`")]
     IncompatibleProtocol { required: String, host: String },
+    #[error("browser and media capabilities require a protocol range that excludes BPP 1.0")]
+    FeatureRequiresProtocol11,
     #[error("plugin max_concurrency must be greater than zero")]
     ZeroConcurrency,
     #[error("plugin max_concurrency {0} exceeds Host limit 1024")]
@@ -519,7 +649,7 @@ pub enum ManifestError {
     InvalidFuelLimit(u64),
     #[error("plugin storage quota {0} exceeds Host limit 67108864")]
     InvalidStorageQuota(u64),
-    #[error("plugin entry `{0}` is unsupported; BPP 1.0 requires `component.wasm`")]
+    #[error("plugin entry `{0}` is unsupported; BPP 1.x requires `component.wasm`")]
     InvalidEntry(String),
     #[error("plugin subscription must have non-empty id and event")]
     InvalidSubscription,
@@ -529,7 +659,9 @@ pub enum ManifestError {
     DuplicateCommand(String),
     #[error("invalid plugin HTTP permission: {0}")]
     InvalidHttpPermission(String),
-    #[error("unsupported BPP 1.0 action capability `{0}`")]
+    #[error("invalid plugin browser permission: {0}")]
+    InvalidBrowserPermission(String),
+    #[error("unsupported BPP action capability `{0}`")]
     UnsupportedAction(String),
     #[error("invalid plugin display metadata: {0}")]
     InvalidMetadata(String),
@@ -537,9 +669,12 @@ pub enum ManifestError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{LocalizedPluginMetadata, PluginManifest, PluginMetadata, is_canonical_locale};
+    use super::{
+        BrowserPermission, LocalizedPluginMetadata, ManifestError, PluginManifest, PluginMetadata,
+        is_canonical_locale, url_path_matches_prefix,
+    };
 
     #[test]
     fn accepts_canonical_bcp47_variants_and_extensions() {
@@ -643,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_actions_outside_bpp_1_0_baseline() {
+    fn rejects_unsupported_actions() {
         let error = PluginManifest::from_toml(
             r#"
                 manifest_version = 1
@@ -662,7 +797,7 @@ mod tests {
             "#,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("BPP 1.0 action"));
+        assert!(error.to_string().contains("unsupported BPP action"));
     }
 
     #[test]
@@ -708,6 +843,135 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("DNS name"));
+    }
+
+    #[test]
+    fn validates_browser_permissions_and_capabilities() {
+        let manifest = PluginManifest::from_toml(
+            r#"
+                manifest_version = 1
+                id = "dev.bkm.browser"
+                version = "1.0.0"
+                protocol = ">=1.1,<2.0"
+
+                [metadata]
+                default_locale = "en"
+
+                [metadata.locales.en]
+                name = "Browser"
+
+                [permissions]
+                actions = ["media.reply"]
+
+                [[permissions.browser]]
+                scheme = "https"
+                host = "example.com"
+                port = 443
+                path_prefixes = ["/"]
+                capabilities = ["navigate", "screenshot"]
+            "#,
+        )
+        .unwrap();
+        let capabilities = manifest.requested_capabilities();
+        assert!(capabilities.contains("browser.run"));
+        assert!(capabilities.contains("browser.origin.https.example.com:443.navigate"));
+        assert!(capabilities.contains("browser.origin.https.example.com:443.screenshot"));
+        assert!(capabilities.contains("media.reply"));
+
+        let http_permission: BrowserPermission = toml::from_str(
+            r#"
+                scheme = "http"
+                host = "example.com"
+                path_prefixes = ["/"]
+                capabilities = ["navigate"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(http_permission.port, 80);
+    }
+
+    #[test]
+    fn browser_permissions_require_bpp_1_1_and_strict_paths() {
+        let error = PluginManifest::from_toml(
+            r#"
+                manifest_version = 1
+                id = "dev.bkm.browser-old"
+                version = "1.0.0"
+                protocol = ">=1.0,<2.0"
+
+                [metadata]
+                default_locale = "en"
+
+                [metadata.locales.en]
+                name = "Browser Old"
+
+                [[permissions.browser]]
+                host = "example.com"
+                capabilities = ["navigate"]
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ManifestError::FeatureRequiresProtocol11));
+
+        let valid = BrowserPermission {
+            scheme: "https".to_owned(),
+            host: "example.com".to_owned(),
+            port: 443,
+            path_prefixes: BTreeSet::from(["/allowed".to_owned()]),
+            capabilities: BTreeSet::from(["navigate".to_owned()]),
+        };
+        valid.validate().unwrap();
+        assert!(url_path_matches_prefix("/allowed", "/allowed"));
+        assert!(url_path_matches_prefix("/allowed/page", "/allowed"));
+        assert!(!url_path_matches_prefix("/allowed-private", "/allowed"));
+        assert!(!url_path_matches_prefix(
+            "/allowed/%2e%2e/private",
+            "/allowed"
+        ));
+
+        for permission in [
+            BrowserPermission {
+                scheme: "ftp".to_owned(),
+                ..valid.clone()
+            },
+            BrowserPermission {
+                host: "127.0.0.1".to_owned(),
+                ..valid.clone()
+            },
+            BrowserPermission {
+                host: "service.local".to_owned(),
+                ..valid.clone()
+            },
+            BrowserPermission {
+                port: 0,
+                ..valid.clone()
+            },
+            BrowserPermission {
+                path_prefixes: BTreeSet::new(),
+                ..valid.clone()
+            },
+            BrowserPermission {
+                path_prefixes: BTreeSet::from(["relative".to_owned()]),
+                ..valid.clone()
+            },
+            BrowserPermission {
+                path_prefixes: BTreeSet::from(["/bad%2fpath".to_owned()]),
+                ..valid.clone()
+            },
+            BrowserPermission {
+                capabilities: BTreeSet::new(),
+                ..valid.clone()
+            },
+            BrowserPermission {
+                capabilities: BTreeSet::from(["evaluate".to_owned()]),
+                ..valid.clone()
+            },
+        ] {
+            assert!(matches!(
+                permission.validate(),
+                Err(ManifestError::InvalidBrowserPermission(_))
+            ));
+        }
     }
 
     #[test]

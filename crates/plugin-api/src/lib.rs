@@ -8,15 +8,17 @@ mod protocol;
 
 pub use id::{PluginId, PluginIdError};
 pub use manifest::{
-    CommandDeclaration, HttpPermission, LocalizedPluginMetadata, ManifestError, PluginManifest,
-    PluginMetadata, PluginPermissions, PluginRuntimeConfig, RuntimeMode, StoragePermission,
-    Subscription,
+    BrowserPermission, CommandDeclaration, HttpPermission, LocalizedPluginMetadata, ManifestError,
+    PluginManifest, PluginMetadata, PluginPermissions, PluginRuntimeConfig, RuntimeMode,
+    StoragePermission, Subscription, url_path_matches_prefix,
 };
 pub use protocol::{
-    ActionCompleted, ActionStatus, Disposition, ExtensionPayload, HandlerOutput, HealthStatus,
-    HostQueries, HttpRequest, HttpResponse, InitContext, PluginCommand, PluginDiagnostic,
-    PluginError, PluginEventEnvelope, ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp,
-    StateValue, StaticPlugin,
+    ActionCompleted, ActionStatus, AssetReference, BrowserColorScheme, BrowserRun,
+    BrowserRunResult, BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil,
+    Disposition, ExtensionPayload, HandlerOutput, HealthStatus, HostQueries, HttpRequest,
+    HttpResponse, InitContext, MediaReply, MediaSend, PluginCommand, PluginDiagnostic, PluginError,
+    PluginEventEnvelope, PluginMessageTarget, ScheduleCancel, ScheduleCreate, ScheduleTriggered,
+    StateOp, StateValue, StaticPlugin,
 };
 
-pub const BPP_VERSION: &str = "1.0.0";
+pub const BPP_VERSION: &str = "1.1.0";

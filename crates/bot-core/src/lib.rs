@@ -21,8 +21,9 @@ pub use metrics::{
     RuntimePhase,
 };
 pub use model::{
-    Action, ActionResult, AdapterId, CommonMessage, Event, EventEnvelope, EventId, MessageScope,
-    MessageSegment, MessageTarget, ReplyAction, SendMessageAction, Sender,
+    Action, ActionResult, AdapterId, CommonMessage, Event, EventEnvelope, EventId, MediaAttachment,
+    MessageScope, MessageSegment, MessageTarget, ReplyAction, ReplyMediaAction, SendMediaAction,
+    SendMessageAction, Sender,
 };
 pub use router::{
     CommandHandler, CommandInvocation, CommandRouter, EventFilter, EventKind, EventKindFilter,

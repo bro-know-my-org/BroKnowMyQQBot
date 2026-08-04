@@ -1,9 +1,12 @@
 //! Platform-independent event and action model.
 
-use std::fmt;
+use std::{fmt, marker::PhantomData};
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{self, SeqAccess, Visitor},
+};
 use serde_json::Value;
 
 macro_rules! string_id {
@@ -147,11 +150,175 @@ pub struct SendMessageAction {
     pub content: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MediaAttachment {
+    mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filename: Option<String>,
+    data: Vec<u8>,
+}
+
+impl MediaAttachment {
+    pub fn image(
+        mime_type: impl Into<String>,
+        filename: Option<String>,
+        data: Vec<u8>,
+    ) -> Result<Self, &'static str> {
+        let attachment = Self {
+            mime_type: mime_type.into(),
+            filename,
+            data,
+        };
+        attachment
+            .validated_image_mime()
+            .ok_or("media attachment must be a supported image of at most 8 MiB")?;
+        Ok(attachment)
+    }
+
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+
+    /// Returns the normalized supported image MIME type when it agrees with
+    /// the attachment's file signature.
+    pub fn validated_image_mime(&self) -> Option<&'static str> {
+        if self.data.is_empty() || self.data.len() > MAX_MEDIA_ATTACHMENT_BYTES {
+            return None;
+        }
+        let mime_type = self.mime_type.split(';').next().unwrap_or_default().trim();
+        if mime_type.eq_ignore_ascii_case("image/png")
+            && self.data.starts_with(b"\x89PNG\r\n\x1a\n")
+        {
+            Some("image/png")
+        } else if mime_type.eq_ignore_ascii_case("image/jpeg")
+            && self.data.starts_with(&[0xff, 0xd8, 0xff])
+        {
+            Some("image/jpeg")
+        } else if mime_type.eq_ignore_ascii_case("image/gif")
+            && (self.data.starts_with(b"GIF87a") || self.data.starts_with(b"GIF89a"))
+        {
+            Some("image/gif")
+        } else if mime_type.eq_ignore_ascii_case("image/webp")
+            && self.data.starts_with(b"RIFF")
+            && self.data.get(8..12) == Some(b"WEBP")
+        {
+            Some("image/webp")
+        } else {
+            None
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MediaAttachment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireAttachment {
+            mime_type: String,
+            #[serde(default)]
+            filename: Option<String>,
+            #[serde(deserialize_with = "deserialize_media_attachment_data")]
+            data: Vec<u8>,
+        }
+
+        let wire = WireAttachment::deserialize(deserializer)?;
+        Self::image(wire.mime_type, wire.filename, wire.data).map_err(de::Error::custom)
+    }
+}
+
+const MAX_MEDIA_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
+fn deserialize_media_attachment_data<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedBytesVisitor(PhantomData<Vec<u8>>);
+
+    impl<'de> Visitor<'de> for BoundedBytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "at most {MAX_MEDIA_ATTACHMENT_BYTES} bytes")
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value.len() > MAX_MEDIA_ATTACHMENT_BYTES {
+                return Err(E::custom("media attachment exceeds the 8 MiB limit"));
+            }
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            if value.len() > MAX_MEDIA_ATTACHMENT_BYTES {
+                return Err(E::custom("media attachment exceeds the 8 MiB limit"));
+            }
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let capacity = sequence
+                .size_hint()
+                .unwrap_or_default()
+                .min(MAX_MEDIA_ATTACHMENT_BYTES);
+            let mut data = Vec::with_capacity(capacity);
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                if data.len() == MAX_MEDIA_ATTACHMENT_BYTES {
+                    return Err(de::Error::custom(
+                        "media attachment exceeds the 8 MiB limit",
+                    ));
+                }
+                data.push(byte);
+            }
+            Ok(data)
+        }
+    }
+
+    deserializer.deserialize_byte_buf(BoundedBytesVisitor(PhantomData))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyMediaAction {
+    pub target: MessageTarget,
+    pub source_message_id: String,
+    pub attachment: MediaAttachment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendMediaAction {
+    pub target: MessageTarget,
+    pub attachment: MediaAttachment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Action {
     Reply(ReplyAction),
     SendMessage(SendMessageAction),
+    ReplyMedia(ReplyMediaAction),
+    SendMedia(SendMediaAction),
     Recall {
         target: MessageTarget,
         message_id: String,
@@ -172,7 +339,7 @@ pub struct ActionResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterId, MessageScope, MessageTarget};
+    use super::{AdapterId, MediaAttachment, MessageScope, MessageTarget};
 
     #[test]
     fn ids_remain_opaque_strings() {
@@ -186,5 +353,25 @@ mod tests {
             group_id: "opaque".to_owned(),
         };
         assert_eq!(target.scope(), MessageScope::Group);
+    }
+
+    #[test]
+    fn media_image_mime_must_match_the_file_signature() {
+        let png = MediaAttachment::image(
+            "Image/PNG; charset=binary",
+            None,
+            b"\x89PNG\r\n\x1a\nbody".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(png.validated_image_mime(), Some("image/png"));
+
+        assert!(MediaAttachment::image("image/png", None, b"not an image".to_vec()).is_err());
+        assert!(
+            serde_json::from_value::<MediaAttachment>(serde_json::json!({
+                "mime_type": "image/png",
+                "data": [1, 2, 3]
+            }))
+            .is_err()
+        );
     }
 }

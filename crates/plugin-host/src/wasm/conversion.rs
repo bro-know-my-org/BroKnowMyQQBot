@@ -1,10 +1,11 @@
 //! Conversion between BPP Rust types and generated WIT bindings.
 
 use super::{
-    ActionCompleted, BTreeMap, Event, HandlerOutput, HttpRequest, MemoryLimitExceeded,
-    MessageSegment, MessageTarget, PluginCommand, PluginDiagnostic, PluginError,
-    PluginEventEnvelope, ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StateValue,
-    StoreData, Value, json, types,
+    ActionCompleted, BTreeMap, BTreeSet, BrowserColorScheme, BrowserRun, BrowserScreenshotFormat,
+    BrowserStep, BrowserViewport, BrowserWaitUntil, Event, HandlerOutput, HttpRequest, MediaReply,
+    MediaSend, MemoryLimitExceeded, MessageSegment, MessageTarget, PluginCommand, PluginDiagnostic,
+    PluginError, PluginEventEnvelope, PluginMessageTarget, ScheduleCancel, ScheduleCreate,
+    ScheduleTriggered, StateOp, StateValue, StoreData, Value, json, types,
 };
 
 const MAX_ENCODED_VALUE_BYTES: usize = 1024 * 1024;
@@ -149,6 +150,23 @@ pub(super) fn wit_segment(segment: MessageSegment) -> types::MessageSegment {
 }
 
 pub(super) fn handler_output(output: types::HandlerOutput) -> Result<HandlerOutput, PluginError> {
+    if output.commands.len() > crate::runtime::MAX_COMMANDS {
+        return Err(PluginError::Permanent(
+            "plugin output exceeds the 32 command limit".to_owned(),
+        ));
+    }
+    let mut browser_bytes = 0_usize;
+    for command in &output.commands {
+        if let types::CommandPayload::BrowserRun(request) = &command.payload {
+            validate_wit_browser_request(request)?;
+            browser_bytes = browser_bytes.saturating_add(wit_browser_request_size(request));
+        }
+    }
+    if browser_bytes > MAX_ENCODED_VALUE_BYTES {
+        return Err(PluginError::Permanent(
+            "browser commands exceed the aggregate 1 MiB output limit".to_owned(),
+        ));
+    }
     Ok(HandlerOutput {
         disposition: match output.disposition {
             types::Disposition::Continue => plugin_api::Disposition::Continue,
@@ -169,6 +187,56 @@ pub(super) fn handler_output(output: types::HandlerOutput) -> Result<HandlerOutp
     })
 }
 
+fn wit_browser_request_size(request: &types::BrowserRunCommand) -> usize {
+    let mut size = 256_usize
+        .saturating_add(request.steps.len().saturating_mul(64))
+        .saturating_add(request.extra_headers.len().saturating_mul(64))
+        .saturating_add(
+            request
+                .user_agent
+                .as_ref()
+                .map_or(0, |value| json_string_upper_bound(value)),
+        )
+        .saturating_add(
+            request
+                .locale
+                .as_ref()
+                .map_or(0, |value| json_string_upper_bound(value)),
+        )
+        .saturating_add(
+            request
+                .timezone
+                .as_ref()
+                .map_or(0, |value| json_string_upper_bound(value)),
+        );
+    for header in &request.extra_headers {
+        size = size
+            .saturating_add(json_string_upper_bound(&header.name))
+            .saturating_add(json_string_upper_bound(&header.value));
+    }
+    for step in &request.steps {
+        size = size.saturating_add(match step {
+            types::BrowserStep::Navigate(step) => json_string_upper_bound(&step.url),
+            types::BrowserStep::Click(step) => json_string_upper_bound(&step.selector),
+            types::BrowserStep::Fill(step) => json_string_upper_bound(&step.selector)
+                .saturating_add(json_string_upper_bound(&step.value)),
+            types::BrowserStep::WaitFor(step) => json_string_upper_bound(&step.selector),
+            types::BrowserStep::ExtractText(step) => json_string_upper_bound(&step.selector),
+            types::BrowserStep::Screenshot(step) => step
+                .selector
+                .as_ref()
+                .map_or(0, |value| json_string_upper_bound(value)),
+            types::BrowserStep::WaitForIdle(_) | types::BrowserStep::Wait(_) => 0,
+        });
+    }
+    size
+}
+
+fn json_string_upper_bound(value: &str) -> usize {
+    value.len().saturating_mul(6).saturating_add(2)
+}
+
+#[allow(clippy::too_many_lines)]
 pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, PluginError> {
     let (kind, payload) = match command.payload {
         types::CommandPayload::MessageReply(reply) => (
@@ -181,6 +249,25 @@ pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, P
                 "target": core_target(send.target),
                 "content": send.content,
             }),
+        ),
+        types::CommandPayload::MediaReply(reply) => (
+            "media.reply".to_owned(),
+            serde_json::to_value(MediaReply {
+                asset_id: reply.asset_id,
+                caption: reply.caption,
+                consume: reply.consume,
+            })
+            .map_err(|error| PluginError::Permanent(error.to_string()))?,
+        ),
+        types::CommandPayload::MediaSend(send) => (
+            "media.send".to_owned(),
+            serde_json::to_value(MediaSend {
+                target: plugin_target(send.target),
+                asset_id: send.asset_id,
+                caption: send.caption,
+                consume: send.consume,
+            })
+            .map_err(|error| PluginError::Permanent(error.to_string()))?,
         ),
         types::CommandPayload::HttpRequest(request) => {
             let request = HttpRequest {
@@ -197,6 +284,42 @@ pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, P
             };
             (
                 "http.request".to_owned(),
+                serde_json::to_value(request)
+                    .map_err(|error| PluginError::Permanent(error.to_string()))?,
+            )
+        }
+        types::CommandPayload::BrowserRun(request) => {
+            validate_wit_browser_request(&request)?;
+            let mut header_names = BTreeSet::new();
+            let mut extra_headers = BTreeMap::new();
+            for header in request.extra_headers {
+                if !header_names.insert(header.name.to_ascii_lowercase()) {
+                    return Err(PluginError::Permanent(format!(
+                        "duplicate browser header `{}`",
+                        header.name
+                    )));
+                }
+                extra_headers.insert(header.name, header.value);
+            }
+            let request = BrowserRun {
+                steps: request.steps.into_iter().map(browser_step).collect(),
+                viewport: BrowserViewport {
+                    width: request.viewport.width,
+                    height: request.viewport.height,
+                    device_scale_factor: request.viewport.device_scale_factor,
+                },
+                user_agent: request.user_agent,
+                locale: request.locale,
+                timezone: request.timezone,
+                color_scheme: request.color_scheme.map(|scheme| match scheme {
+                    types::BrowserColorScheme::Light => BrowserColorScheme::Light,
+                    types::BrowserColorScheme::Dark => BrowserColorScheme::Dark,
+                    types::BrowserColorScheme::NoPreference => BrowserColorScheme::NoPreference,
+                }),
+                extra_headers,
+            };
+            (
+                "browser.run".to_owned(),
                 serde_json::to_value(request)
                     .map_err(|error| PluginError::Permanent(error.to_string()))?,
             )
@@ -232,6 +355,106 @@ pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, P
         deadline_ms: command.deadline_ms,
         payload,
     })
+}
+
+fn validate_wit_browser_request(request: &types::BrowserRunCommand) -> Result<(), PluginError> {
+    if request.steps.is_empty()
+        || request.steps.len() > 32
+        || request.extra_headers.len() > 32
+        || request
+            .user_agent
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024)
+        || request
+            .locale
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 64)
+        || request
+            .timezone
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 128)
+        || request
+            .extra_headers
+            .iter()
+            .any(|header| header.name.len() > 128 || header.value.len() > 4096)
+        || request.steps.iter().any(wit_browser_step_exceeds_limits)
+    {
+        return Err(PluginError::Permanent(
+            "browser request exceeds Host count or field-size limits".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn wit_browser_step_exceeds_limits(step: &types::BrowserStep) -> bool {
+    match step {
+        types::BrowserStep::Navigate(step) => step.url.len() > 2048,
+        types::BrowserStep::Click(step) => step.selector.len() > 1024,
+        types::BrowserStep::WaitFor(step) => step.selector.len() > 1024,
+        types::BrowserStep::ExtractText(step) => step.selector.len() > 1024,
+        types::BrowserStep::Fill(step) => {
+            step.selector.len() > 1024 || step.value.len() > 64 * 1024
+        }
+        types::BrowserStep::Screenshot(step) => step
+            .selector
+            .as_ref()
+            .is_some_and(|selector| selector.len() > 1024),
+        types::BrowserStep::WaitForIdle(_) | types::BrowserStep::Wait(_) => false,
+    }
+}
+
+fn browser_step(step: types::BrowserStep) -> BrowserStep {
+    match step {
+        types::BrowserStep::Navigate(step) => BrowserStep::Navigate {
+            url: step.url,
+            wait_until: match step.wait_until {
+                types::BrowserWaitUntil::Load => BrowserWaitUntil::Load,
+                types::BrowserWaitUntil::DomContentLoaded => BrowserWaitUntil::DomContentLoaded,
+                types::BrowserWaitUntil::NetworkIdle => BrowserWaitUntil::NetworkIdle,
+            },
+            timeout_ms: step.timeout_ms,
+        },
+        types::BrowserStep::Click(step) => BrowserStep::Click {
+            selector: step.selector,
+            timeout_ms: step.timeout_ms,
+        },
+        types::BrowserStep::Fill(step) => BrowserStep::Fill {
+            selector: step.selector,
+            value: step.value,
+            timeout_ms: step.timeout_ms,
+        },
+        types::BrowserStep::WaitFor(step) => BrowserStep::WaitFor {
+            selector: step.selector,
+            timeout_ms: step.timeout_ms,
+        },
+        types::BrowserStep::WaitForIdle(step) => BrowserStep::WaitForIdle {
+            timeout_ms: step.timeout_ms,
+        },
+        types::BrowserStep::Wait(step) => BrowserStep::Wait {
+            duration_ms: step.duration_ms,
+        },
+        types::BrowserStep::ExtractText(step) => BrowserStep::ExtractText {
+            selector: step.selector,
+            timeout_ms: step.timeout_ms,
+        },
+        types::BrowserStep::Screenshot(step) => BrowserStep::Screenshot {
+            selector: step.selector,
+            full_page: step.full_page,
+            format: match step.format {
+                types::BrowserScreenshotFormat::Png => BrowserScreenshotFormat::Png,
+                types::BrowserScreenshotFormat::Jpeg => BrowserScreenshotFormat::Jpeg,
+            },
+            quality: step.quality,
+        },
+    }
+}
+
+fn plugin_target(target: types::MessageTarget) -> PluginMessageTarget {
+    match target {
+        types::MessageTarget::Group(group_id) => PluginMessageTarget::Group { group_id },
+        types::MessageTarget::Private(user_id) => PluginMessageTarget::Private { user_id },
+        types::MessageTarget::Channel(channel_id) => PluginMessageTarget::Channel { channel_id },
+    }
 }
 
 pub(super) fn core_target(target: types::MessageTarget) -> MessageTarget {

@@ -6,6 +6,7 @@ bundled = [
     "echo",
     "counter",
     "http-probe",
+    "browser-probe",
     "scheduler-probe",
     "qq-extension-probe",
     "active-send-probe",

@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use plugin_api::{HttpPermission, HttpRequest, HttpResponse};
+use plugin_api::{HttpPermission, HttpRequest, HttpResponse, url_path_matches_prefix};
 use reqwest::{
     Method,
     header::{HeaderName, HeaderValue, LOCATION},
@@ -248,9 +248,7 @@ fn authorized_target(
 }
 
 fn path_matches(path: &str, prefix: &str) -> bool {
-    !path.contains('%')
-        && !path.split('/').any(|segment| matches!(segment, "." | ".."))
-        && (prefix == "/" || path == prefix || (prefix.ends_with('/') && path.starts_with(prefix)))
+    url_path_matches_prefix(path, prefix)
 }
 
 fn validate_request_header(name: &str) -> Result<(), HttpExecutionError> {

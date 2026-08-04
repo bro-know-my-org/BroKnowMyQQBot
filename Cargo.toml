@@ -30,7 +30,9 @@ path = "src/main.rs"
 [dependencies]
 adapter-onebot11 = { path = "crates/adapter-onebot11" }
 adapter-qqbot = { path = "crates/adapter-qqbot" }
+async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 bot-core = { path = "crates/bot-core" }
 builtin-plugins = { path = "plugins/builtin" }
 chrono.workspace = true
@@ -51,7 +53,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["io-util", "process"] }
 toml.workspace = true
 tower.workspace = true
 tracing.workspace = true
@@ -63,7 +65,6 @@ zip.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 
 [lints]
 workspace = true

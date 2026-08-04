@@ -13,26 +13,84 @@ use bot_core::{
     shutdown_channel,
 };
 use builtin_plugins::{
-    ActionResultProbePlugin, ConfigProbePlugin, HttpProbePlugin, PingPlugin,
+    ActionResultProbePlugin, BrowserProbePlugin, ConfigProbePlugin, HttpProbePlugin, PingPlugin,
     QqExtensionProbePlugin, SchedulerProbePlugin,
 };
 use plugin_api::{
-    ActionCompleted, ActionStatus, HandlerOutput, HostQueries, HttpPermission, HttpRequest,
-    HttpResponse, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin,
+    ActionCompleted, ActionStatus, BrowserPermission, BrowserRun, BrowserStep, HandlerOutput,
+    HostQueries, HttpPermission, HttpRequest, HttpResponse, PluginError, PluginEventEnvelope,
+    PluginManifest, StaticPlugin,
 };
 use plugin_fixtures::{
     MigrationFixturePlugin, PanicFixturePlugin, PartitionFixturePlugin, QuotaFixturePlugin,
     TimeoutFixturePlugin,
 };
 use plugin_host::{
-    CommitOptions, HttpExecutionError, HttpExecutor, PluginHostError, PluginInstanceState,
-    PluginStore, SecureHttpExecutor, StaticPluginHost,
+    BrowserArtifact, BrowserExecution, BrowserExecutionError, BrowserExecutor, CommitOptions,
+    HttpExecutionError, HttpExecutor, PluginHostError, PluginInstanceState, PluginStore,
+    SecureHttpExecutor, StaticPluginHost,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug)]
 struct MockHttpExecutor;
+
+#[derive(Debug)]
+struct MockBrowserExecutor;
+
+#[async_trait]
+impl BrowserExecutor for MockBrowserExecutor {
+    async fn execute(
+        &self,
+        permissions: &[BrowserPermission],
+        granted_capabilities: &std::collections::BTreeSet<String>,
+        request: &BrowserRun,
+    ) -> Result<BrowserExecution, BrowserExecutionError> {
+        let permission = permissions
+            .first()
+            .expect("browser probe must declare a permission");
+        assert_eq!(permission.scheme, "https");
+        assert_eq!(permission.host, "example.com");
+        assert_eq!(permission.port, 443);
+        assert_eq!(
+            permission.path_prefixes,
+            std::collections::BTreeSet::from(["/".to_owned()])
+        );
+        assert_eq!(
+            permission.capabilities,
+            std::collections::BTreeSet::from(["navigate".to_owned(), "screenshot".to_owned(),])
+        );
+        assert!(granted_capabilities.contains("browser.run"));
+        assert!(granted_capabilities.contains("browser.origin.https.example.com:443.navigate"));
+        assert!(granted_capabilities.contains("browser.origin.https.example.com:443.screenshot"));
+        assert!(matches!(
+            request.steps.as_slice(),
+            [
+                BrowserStep::Navigate { url, .. },
+                BrowserStep::Wait { duration_ms: 3_000 },
+                BrowserStep::Screenshot { .. },
+            ] if url == "https://example.com/"
+        ));
+        BrowserExecution::new(
+            "https://example.com/".to_owned(),
+            "Example Domain".to_owned(),
+            Vec::new(),
+            vec![
+                BrowserArtifact::new(
+                    "image/png".to_owned(),
+                    vec![
+                        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1,
+                        0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84,
+                        8, 215, 99, 248, 207, 192, 240, 31, 0, 5, 0, 1, 255, 137, 153, 61, 29, 0,
+                        0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+                    ],
+                )
+                .unwrap(),
+            ],
+        )
+    }
+}
 
 #[derive(Debug)]
 struct ShutdownProbePlugin {
@@ -345,6 +403,44 @@ async fn static_ping_plugin_runs_through_runtime_and_original_adapter() {
     };
     assert_eq!(reply.content, "pong");
     assert_eq!(reply.source_message_id, "source-message");
+}
+
+#[tokio::test]
+async fn browser_screenshot_is_stored_and_replied_as_media() {
+    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap())
+        .with_browser_executor(Arc::new(MockBrowserExecutor));
+    plugins
+        .register_trusted(
+            Arc::new(BrowserProbePlugin::default()),
+            "dev.bkm.browser-probe/test",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (action_sender, mut actions) = mpsc::channel(1);
+    let adapter = Arc::new(MockAdapter {
+        id: AdapterId::new("mock"),
+        event: Mutex::new(Some(message_event("/screenshot https://example.com/"))),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+        outcome: ActionOutcome::Succeeded,
+        shutdown_after_send: false,
+    });
+    let runtime = RuntimeBuilder::new()
+        .adapter(adapter)
+        .handler(Arc::new(plugins))
+        .build()
+        .unwrap();
+
+    runtime.run(shutdown_signal).await.unwrap();
+    let Action::ReplyMedia(reply) = actions.recv().await.unwrap() else {
+        panic!("expected media reply");
+    };
+    assert_eq!(reply.source_message_id, "source-message");
+    assert_eq!(reply.attachment.mime_type(), "image/png");
+    assert!(reply.attachment.data().starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(reply.attachment.data().len() > 8);
 }
 
 async fn run_qq_extension_probe(grant_raw_extension: bool) -> String {

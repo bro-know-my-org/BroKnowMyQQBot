@@ -2,24 +2,25 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
 use bot_core::{
     Action, ActionResult, Adapter, AdapterError, AdapterId, EventEnvelope, EventSendError,
-    EventSender, MessageTarget, ShutdownSignal,
+    EventSender, MediaAttachment, MessageTarget, ShutdownSignal,
 };
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
-    ApiError, AuthError, ChannelMessageRequest, GatewayPayload, Intents, MediaFileType,
-    MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient,
+    ApiError, AuthError, ChannelMessageRequest, GatewayPayload, InlineMediaUploadRequest, Intents,
+    MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     net::TcpStream,
-    sync::Mutex,
+    sync::{Mutex, Semaphore},
     time::{Instant, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tokio_tungstenite::{
@@ -29,6 +30,9 @@ use tokio_tungstenite::{
 use tracing::{debug, info, warn};
 
 use crate::mapping::{MappingError, map_dispatch};
+
+const MAX_INLINE_MEDIA_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUEUED_INLINE_MEDIA_BYTES: usize = 16 * 1024 * 1024;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(100);
@@ -450,6 +454,7 @@ pub(crate) struct QqActionExecutor {
     adapter_id: AdapterId,
     api: OpenApiClient,
     log_message_content: bool,
+    inline_media_budget: Arc<Semaphore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -503,9 +508,11 @@ impl QqActionExecutor {
             adapter_id,
             api,
             log_message_content,
+            inline_media_budget: Arc::new(Semaphore::new(MAX_QUEUED_INLINE_MEDIA_BYTES)),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn execute_action(
         &self,
         action: Action,
@@ -578,6 +585,19 @@ impl QqActionExecutor {
                 };
                 self.complete_message_action("message.send", message_scope, result, message_log)
             }
+            Action::ReplyMedia(reply) => {
+                self.execute_inline_media(
+                    reply.target,
+                    Some(reply.source_message_id),
+                    reply.attachment,
+                    reply.caption,
+                )
+                .await
+            }
+            Action::SendMedia(send) => {
+                self.execute_inline_media(send.target, None, send.attachment, send.caption)
+                    .await
+            }
             Action::Recall { target, message_id } => {
                 let result = match &target {
                     MessageTarget::Group { group_id } => {
@@ -598,6 +618,79 @@ impl QqActionExecutor {
                 self.execute_platform_action(&name, payload).await
             }
         }
+    }
+
+    async fn execute_inline_media(
+        &self,
+        target: MessageTarget,
+        reply_to: Option<String>,
+        attachment: MediaAttachment,
+        caption: Option<String>,
+    ) -> Result<ActionResult, AdapterError> {
+        if caption.as_deref().is_some_and(|value| !value.is_empty()) {
+            return Err(AdapterError::Action(
+                "QQ media messages do not support a caption in the same action".to_owned(),
+            ));
+        }
+        let file_type = image_file_type(&attachment)?;
+        if attachment.data().len() > MAX_INLINE_MEDIA_BYTES {
+            return Err(AdapterError::Action(
+                "QQ inline image exceeds the 8 MiB limit".to_owned(),
+            ));
+        }
+        let permits = u32::try_from(attachment.data().len()).map_err(|_| {
+            AdapterError::Action("QQ inline image exceeds the media budget".to_owned())
+        })?;
+        let budget = Arc::clone(&self.inline_media_budget)
+            .try_acquire_many_owned(permits)
+            .map_err(|_| {
+                AdapterError::Action("QQ inline media byte budget is exhausted".to_owned())
+            })?;
+        let data = attachment.into_data();
+        let (request, _budget) = tokio::task::spawn_blocking(move || {
+            (
+                InlineMediaUploadRequest::from_bytes(file_type, &data),
+                budget,
+            )
+        })
+        .await
+        .map_err(|error| {
+            AdapterError::Action(format!("QQ inline media encoding task failed: {error}"))
+        })?;
+        let request = request.map_err(|error| AdapterError::Action(error.to_owned()))?;
+        let action_kind = if reply_to.is_some() {
+            "media.reply"
+        } else {
+            "media.send"
+        };
+        let upload = match &target {
+            MessageTarget::Group { group_id } => {
+                self.api.upload_group_inline_media(group_id, &request).await
+            }
+            MessageTarget::Private { user_id } => {
+                self.api.upload_c2c_inline_media(user_id, &request).await
+            }
+            MessageTarget::Channel { .. } => {
+                return Err(AdapterError::Action(
+                    "QQ channel inline media is not supported".to_owned(),
+                ));
+            }
+        }
+        .map_err(|error| map_action_error(&error))?;
+        let message = match reply_to {
+            Some(message_id) => MessageRequest::media(upload.file_info).with_reply_to(message_id),
+            None => MessageRequest::media(upload.file_info),
+        };
+        let result = match &target {
+            MessageTarget::Group { group_id } => {
+                self.api.send_group_message(group_id, &message).await
+            }
+            MessageTarget::Private { user_id } => {
+                self.api.send_c2c_message(user_id, &message).await
+            }
+            MessageTarget::Channel { .. } => unreachable!("channel target returned above"),
+        };
+        self.complete_message_action(action_kind, message_scope_name(&target), result, None)
     }
 
     async fn execute_platform_action(
@@ -897,6 +990,18 @@ const fn message_scope_name(target: &MessageTarget) -> &'static str {
         MessageTarget::Private { .. } => "private",
         MessageTarget::Channel { .. } => "channel",
     }
+}
+
+fn image_file_type(attachment: &MediaAttachment) -> Result<MediaFileType, AdapterError> {
+    attachment
+        .validated_image_mime()
+        .map(|_| MediaFileType::IMAGE)
+        .ok_or_else(|| {
+            AdapterError::Action(format!(
+                "QQ inline media has an unsupported MIME type or mismatched image signature: `{}`",
+                attachment.mime_type()
+            ))
+        })
 }
 
 pub(crate) fn compact_id(value: &str) -> String {
@@ -1284,11 +1389,13 @@ fn reconnect_delay(minimum: Duration, maximum: Duration, attempt: u32) -> Durati
 
 #[cfg(test)]
 mod tests {
-    use qqbot_protocol::{ApiError, AuthError};
+    use bot_core::MediaAttachment;
+    use qqbot_protocol::{ApiError, AuthError, MediaFileType};
     use serde_json::json;
 
     use super::{
-        DispatchRecord, ReconnectBackoff, SessionState, is_fatal_api_error, require_object,
+        DispatchRecord, ReconnectBackoff, SessionState, image_file_type, is_fatal_api_error,
+        require_object,
     };
 
     #[test]
@@ -1297,6 +1404,20 @@ mod tests {
         assert!(require_object("qq.message.markdown", "body", &json!(null)).is_err());
         assert!(require_object("qq.channel.create", "body", &json!(["invalid"])).is_err());
         assert!(require_object("qq.message.markdown", "keyboard", &json!("bad")).is_err());
+    }
+
+    #[test]
+    fn common_media_accepts_only_bytes_matching_a_supported_image_mime() {
+        let png = MediaAttachment::image(
+            "Image/PNG; charset=binary",
+            None,
+            b"\x89PNG\r\n\x1a\n".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(image_file_type(&png).unwrap(), MediaFileType::IMAGE);
+
+        assert!(MediaAttachment::image("video/mp4", None, b"video".to_vec()).is_err());
+        assert!(MediaAttachment::image("image/png", None, b"not an image".to_vec()).is_err());
     }
 
     #[test]

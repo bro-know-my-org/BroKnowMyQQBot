@@ -104,6 +104,18 @@ impl MessageSegment {
         }
     }
 
+    pub fn image_bytes(data: &[u8]) -> Self {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+        Self {
+            kind: "image".to_owned(),
+            data: BTreeMap::from([(
+                "file".to_owned(),
+                Value::String(format!("base64://{}", STANDARD.encode(data))),
+            )]),
+        }
+    }
+
     pub fn text_value(&self) -> Option<&str> {
         (self.kind == "text")
             .then(|| self.data.get("text").and_then(Value::as_str))
@@ -351,7 +363,7 @@ pub enum ProtocolError {
 mod tests {
     use serde_json::json;
 
-    use super::{ActionResponse, Event, Message, OneBotId, response_like};
+    use super::{ActionResponse, Event, Message, MessageSegment, OneBotId, response_like};
 
     const GROUP_MESSAGE: &str = include_str!("../../../test-data/onebot11/group-message.json");
     const PRIVATE_MESSAGE: &str = include_str!("../../../test-data/onebot11/private-message.json");
@@ -367,6 +379,13 @@ mod tests {
         assert_eq!(numeric.as_str(), "12345");
         assert_eq!(textual.as_str(), "00123");
         assert_eq!(textual.to_json(), json!("00123"));
+    }
+
+    #[test]
+    fn image_bytes_use_the_onebot_base64_uri_shape() {
+        let segment = MessageSegment::image_bytes(b"png");
+        assert_eq!(segment.kind, "image");
+        assert_eq!(segment.data["file"], "base64://cG5n");
     }
 
     #[test]

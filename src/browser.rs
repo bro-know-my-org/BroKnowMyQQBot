@@ -4,21 +4,28 @@ use std::{
     env, fs,
     io::{self, Cursor, Read as _, Write as _},
     path::{Component, Path, PathBuf},
+    process::Stdio,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::read::GzDecoder;
 use fs2::FileExt as _;
+use plugin_api::{BrowserPermission, BrowserRun};
+use plugin_host::{BrowserArtifact, BrowserExecution, BrowserExecutionError, BrowserExecutor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::{process::Command, time::timeout};
+use tokio::{io::AsyncWriteExt as _, process::Command, time::timeout};
+use tracing::warn;
 
 const NODE_VERSION: &str = "22.23.2";
 const PLAYWRIGHT_VERSION: &str = "1.62.1";
 const PLAYWRIGHT_SHA256: &str = "954be1e183d0ddb9748fe0d2d08b0b66a9210c74dd75c397aeb70303b9f08a00";
 const PLAYWRIGHT_TREE_SHA256: &str =
     "56d9c79a81caabc7754771f96672d649425f27690565c25e832d95a15a830948";
-const WORKER_SHA256: &str = "42ab76b5b0a1e90dde3bf76f269b23fd117ea3439257d49c2c1d60e5e87a030e";
+const WORKER_SHA256: &str = "4b21217082446249702e1c17516e1dea83acab6909a87cee8bf6272b06e90480";
 const CHROMIUM_VERSION: &str = "151.0.7922.34";
 const CHROMIUM_REVISION: &str = "1234";
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
@@ -32,14 +39,303 @@ const BROWSER_DOWNLOAD_ATTEMPTS: usize = 3;
 
 type InstallResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+#[derive(Debug, Clone)]
+struct BrowserHomeSelection {
+    path: PathBuf,
+    fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InstalledBrowserExecutor {
+    runtime: PathBuf,
+    inline_worker: Option<&'static str>,
+}
+
+impl InstalledBrowserExecutor {
+    pub(crate) fn discover_with_cancel(
+        cancel: &AtomicBool,
+    ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
+        let home = browser_home()?;
+        let Some(runtime) = active_runtime(&home)? else {
+            return Ok(None);
+        };
+        validate_runtime_with_cancel(&runtime, Some(cancel)).map_err(io::Error::other)?;
+        Ok(Some(Self {
+            runtime,
+            inline_worker: None,
+        }))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerArtifact {
+    mime_type: String,
+    data_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerResult {
+    final_url: String,
+    title: String,
+    extracted_text: Vec<String>,
+    artifacts: Vec<WorkerArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResolvedBrowserPermission<'a> {
+    scheme: &'a str,
+    host: &'a str,
+    port: u16,
+    path_prefixes: &'a std::collections::BTreeSet<String>,
+    capabilities: &'a std::collections::BTreeSet<String>,
+    resolved_ip: std::net::IpAddr,
+}
+
+#[async_trait]
+impl BrowserExecutor for InstalledBrowserExecutor {
+    #[allow(clippy::too_many_lines)]
+    async fn execute(
+        &self,
+        permissions: &[BrowserPermission],
+        granted_capabilities: &std::collections::BTreeSet<String>,
+        request: &BrowserRun,
+    ) -> Result<BrowserExecution, BrowserExecutionError> {
+        if !granted_capabilities.contains("browser.run") {
+            return Err(BrowserExecutionError::Denied(
+                "browser.run is not granted".to_owned(),
+            ));
+        }
+        if request.steps.len() > 32
+            || request.viewport.width < 320
+            || request.viewport.width > 3840
+            || request.viewport.height < 240
+            || request.viewport.height > 2160
+            || !(1..=3).contains(&request.viewport.device_scale_factor)
+        {
+            return Err(BrowserExecutionError::InvalidRequest(
+                "browser steps or viewport exceed Host limits".to_owned(),
+            ));
+        }
+        let permissions = permissions
+            .iter()
+            .filter_map(|permission| {
+                let capabilities = permission
+                    .capabilities
+                    .iter()
+                    .filter(|capability| {
+                        granted_capabilities.contains(&format!(
+                            "browser.origin.{}.{}:{}.{}",
+                            permission.scheme, permission.host, permission.port, capability
+                        ))
+                    })
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                (!capabilities.is_empty()).then(|| BrowserPermission {
+                    scheme: permission.scheme.clone(),
+                    host: permission.host.clone(),
+                    port: permission.port,
+                    path_prefixes: permission.path_prefixes.clone(),
+                    capabilities,
+                })
+            })
+            .collect::<Vec<_>>();
+        if permissions.is_empty() {
+            return Err(BrowserExecutionError::Denied(
+                "no browser host permissions are granted".to_owned(),
+            ));
+        }
+        let mut resolved_permissions = Vec::with_capacity(permissions.len());
+        for permission in &permissions {
+            let addresses = tokio::net::lookup_host((permission.host.as_str(), permission.port))
+                .await
+                .map_err(|error| BrowserExecutionError::Denied(error.to_string()))?;
+            let public_addresses = addresses
+                .map(|address| address.ip())
+                .filter(|address| is_public_ip(*address))
+                .collect::<Vec<_>>();
+            let address = public_addresses
+                .iter()
+                .copied()
+                .find(std::net::IpAddr::is_ipv4)
+                .or_else(|| public_addresses.first().copied())
+                .ok_or_else(|| {
+                    BrowserExecutionError::Denied(format!(
+                        "browser host `{}` did not resolve to a public address",
+                        permission.host
+                    ))
+                })?;
+            resolved_permissions.push(ResolvedBrowserPermission {
+                scheme: &permission.scheme,
+                host: &permission.host,
+                port: permission.port,
+                path_prefixes: &permission.path_prefixes,
+                capabilities: &permission.capabilities,
+                resolved_ip: address,
+            });
+        }
+        let input = serde_json::to_vec(&serde_json::json!({
+            "request": request,
+            "permissions": resolved_permissions,
+        }))
+        .map_err(|error| BrowserExecutionError::InvalidRequest(error.to_string()))?;
+        let mut child = Command::new(node_executable(&self.runtime));
+        if let Some(source) = self.inline_worker {
+            child.arg("-e").arg(source);
+        } else {
+            child.arg(self.runtime.join("worker.js"));
+        }
+        child
+            .env("PLAYWRIGHT_BROWSERS_PATH", self.runtime.join("browsers"))
+            .current_dir(&self.runtime)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = child
+            .spawn()
+            .map_err(|error| BrowserExecutionError::Unavailable(error.to_string()))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| BrowserExecutionError::Worker("worker stdin is unavailable".to_owned()))?
+            .write_all(&input)
+            .await
+            .map_err(|error| BrowserExecutionError::Worker(error.to_string()))?;
+        let output = timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .map_err(|_| {
+                BrowserExecutionError::ResourceExhausted(
+                    "task timed out after 30 seconds".to_owned(),
+                )
+            })?
+            .map_err(|error| BrowserExecutionError::Worker(error.to_string()))?;
+        if !output.status.success() {
+            return Err(BrowserExecutionError::Worker(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        if output.stdout.len() > 12 * 1024 * 1024 {
+            return Err(BrowserExecutionError::ResourceExhausted(
+                "worker output exceeds 12 MiB".to_owned(),
+            ));
+        }
+        let result: WorkerResult = serde_json::from_slice(&output.stdout)
+            .map_err(|error| BrowserExecutionError::Worker(error.to_string()))?;
+        let artifacts = result
+            .artifacts
+            .into_iter()
+            .map(|artifact| {
+                let data = STANDARD
+                    .decode(artifact.data_base64)
+                    .map_err(|error| BrowserExecutionError::Worker(error.to_string()))?;
+                BrowserArtifact::new(artifact.mime_type, data)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        BrowserExecution::new(
+            result.final_url,
+            result.title,
+            result.extracted_text,
+            artifacts,
+        )
+    }
+}
+
+fn is_public_ip(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            let octets = address.octets();
+            !(address.is_unspecified()
+                || address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_multicast()
+                || octets[0] >= 224
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19)))
+        }
+        std::net::IpAddr::V6(address) => {
+            if let Some(address) = address.to_ipv4() {
+                return is_public_ip(std::net::IpAddr::V4(address));
+            }
+            let segments = address.segments();
+            !(address.is_unspecified()
+                || address.is_loopback()
+                || address.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
 fn installer_result<T>(result: InstallResult<T>) -> Result<T, io::Error> {
     result.map_err(io::Error::other)
 }
 
 const WORKER_SOURCE: &str = r"'use strict';
+const net = require('node:net');
 const { chromium } = require('./playwright');
 
-async function main() {
+function publicAddress(address) {
+  const embedded = embeddedIpv4(address);
+  if (embedded) return publicAddress(embedded);
+  if (net.isIP(address) === 4) {
+    const p = address.split('.').map(Number);
+    return !(p[0] === 0 || p[0] === 10 || p[0] === 127 || p[0] >= 224 ||
+      (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||
+      (p[0] === 169 && p[1] === 254) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+      (p[0] === 192 && p[1] === 168) || (p[0] === 198 && (p[1] === 18 || p[1] === 19)));
+  }
+  if (net.isIP(address) === 6) {
+    const value = address.toLowerCase();
+    return !(value === '::' || value === '::1' || value.startsWith('fc') ||
+      value.startsWith('fd') || value.startsWith('fe8') || value.startsWith('fe9') ||
+      value.startsWith('fea') || value.startsWith('feb') || value.startsWith('ff'));
+  }
+  return false;
+}
+
+function embeddedIpv4(address) {
+  if (net.isIP(address) !== 6) return null;
+  const value = address.toLowerCase();
+  let tail = null;
+  if (value.startsWith('::ffff:')) tail = value.slice(7);
+  else if (value.startsWith('::')) tail = value.slice(2);
+  if (!tail) return null;
+  if (net.isIP(tail) === 4) return tail;
+  const parts = tail.split(':');
+  if (parts.length < 1 || parts.length > 2 || parts.some(part => !/^[0-9a-f]{1,4}$/.test(part))) return null;
+  while (parts.length < 2) parts.unshift('0');
+  const high = Number.parseInt(parts[0], 16);
+  const low = Number.parseInt(parts[1], 16);
+  return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
+}
+
+function pathMatches(path, prefix) {
+  if (path.includes('%') || path.includes('\\') || path.split('/').some(segment => segment === '.' || segment === '..')) return false;
+  return prefix === '/' || path === prefix || (path.startsWith(prefix) && (prefix.endsWith('/') || path[prefix.length] === '/'));
+}
+
+function permissionFor(url, permissions, capability) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error('unsupported URL scheme');
+  if (net.isIP(parsed.hostname)) throw new Error('IP literal URLs are denied');
+  const port = Number(parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+  const scheme = parsed.protocol.slice(0, -1);
+  const permission = permissions.find(item => item.scheme === scheme && item.host === parsed.hostname.toLowerCase() &&
+    item.port === port && item.path_prefixes.some(prefix => pathMatches(parsed.pathname, prefix)) &&
+    item.capabilities.includes(capability));
+  if (!permission) throw new Error(`URL is not authorized for ${capability}: ${parsed.origin}${parsed.pathname}`);
+  return { parsed, permission };
+}
+
+async function validateNetwork(url, permissions) {
+  const { parsed, permission } = permissionFor(url, permissions, 'navigate');
+  if (!publicAddress(permission.resolved_ip)) {
+    throw new Error(`URL has no pinned public address: ${parsed.hostname}`);
+  }
+}
+
+async function selfCheck() {
   const browser = await chromium.launch({ headless: true });
   try {
     const context = await browser.newContext();
@@ -47,15 +343,145 @@ async function main() {
     await page.setContent('<!doctype html><title>bkmqb browser check</title><p>ok</p>');
     const title = await page.title();
     process.stdout.write(JSON.stringify({ ok: title === 'bkmqb browser check', browser: browser.version() }));
-  } finally {
-    await browser.close();
-  }
+  } finally { await browser.close(); }
 }
 
-main().catch(error => {
+async function execute(input) {
+  const request = input.request;
+  const permissions = input.permissions;
+  if (!Array.isArray(request.steps) || request.steps.length < 1 || request.steps.length > 32) throw new Error('browser task must contain 1 to 32 steps');
+  const headers = request.extra_headers || {};
+  for (const name of Object.keys(headers)) {
+    if (['authorization', 'cookie', 'host', 'proxy-authorization'].includes(name.toLowerCase())) throw new Error(`forbidden browser header: ${name}`);
+  }
+  const resolverRules = permissions.map(item => `MAP ${item.host} ${item.resolved_ip}`).join(',');
+  const browser = await chromium.launch({
+    headless: true,
+    args: [`--host-resolver-rules=${resolverRules},EXCLUDE localhost`],
+  });
+  try {
+    const viewport = request.viewport || { width: 1280, height: 720, device_scale_factor: 1 };
+    const context = await browser.newContext({
+      viewport: { width: viewport.width, height: viewport.height },
+      deviceScaleFactor: viewport.device_scale_factor || 1,
+      userAgent: request.user_agent || undefined,
+      locale: request.locale || undefined,
+      timezoneId: request.timezone || undefined,
+      colorScheme: request.color_scheme === 'no_preference' ? 'no-preference' : (request.color_scheme || undefined),
+      extraHTTPHeaders: headers,
+      acceptDownloads: false,
+      serviceWorkers: 'block',
+    });
+    let requestCount = 0;
+    let resourceError = null;
+    await context.route('**/*', async route => {
+      requestCount += 1;
+      if (requestCount > 256) {
+        resourceError = new Error('browser request count exceeds 256');
+        await route.abort('blockedbyclient');
+        return;
+      }
+      try { await validateNetwork(route.request().url(), permissions); await route.continue(); }
+      catch (error) { await route.abort('blockedbyclient'); }
+    });
+    const page = await context.newPage();
+    await page.routeWebSocket('**/*', webSocket => {
+      validateNetwork(webSocket.url(), permissions)
+        .then(() => webSocket.connectToServer())
+        .catch(() => webSocket.close({ code: 1008, reason: 'blocked by browser policy' }));
+    });
+    context.on('page', popup => { if (popup !== page) popup.close().catch(() => {}); });
+    page.on('download', download => download.cancel().catch(() => {}));
+    let declaredResponseBytes = 0;
+    let receivedResponseBytes = 0;
+    const receivedByRequest = new Map();
+    const cdp = await context.newCDPSession(page);
+    await cdp.send('Network.enable');
+    cdp.on('Network.dataReceived', event => {
+      const size = Number(event.dataLength || 0);
+      const requestBytes = (receivedByRequest.get(event.requestId) || 0) + size;
+      receivedByRequest.set(event.requestId, requestBytes);
+      receivedResponseBytes += size;
+      if (requestBytes > 16 * 1024 * 1024 || receivedResponseBytes > 64 * 1024 * 1024) {
+        resourceError = new Error('browser response byte limit exceeded');
+        page.close().catch(() => {});
+      }
+    });
+    cdp.on('Network.loadingFinished', event => { receivedByRequest.delete(event.requestId); });
+    cdp.on('Network.loadingFailed', event => { receivedByRequest.delete(event.requestId); });
+    page.on('response', response => {
+      const length = Number(response.headers()['content-length'] || 0);
+      declaredResponseBytes += Number.isFinite(length) ? length : 0;
+      if (length > 16 * 1024 * 1024 || declaredResponseBytes > 64 * 1024 * 1024) {
+        resourceError = new Error('browser response byte limit exceeded');
+        page.close().catch(() => {});
+      }
+    });
+    const extractedText = [];
+    let extractedTextBytes = 0;
+    const artifacts = [];
+    for (const step of request.steps) {
+      if (resourceError) throw resourceError;
+      const timeout = Math.min(step.timeout_ms || 10000, 15000);
+      switch (step.type) {
+        case 'navigate':
+          permissionFor(step.url, permissions, 'navigate');
+          await page.goto(step.url, {
+            waitUntil: ({ load: 'load', dom_content_loaded: 'domcontentloaded', network_idle: 'networkidle' })[step.wait_until] || 'domcontentloaded',
+            timeout,
+          });
+          break;
+        case 'click':
+          permissionFor(page.url(), permissions, 'interact');
+          await page.locator(step.selector).click({ timeout });
+          break;
+        case 'fill':
+          permissionFor(page.url(), permissions, 'interact');
+          await page.locator(step.selector).fill(step.value, { timeout });
+          break;
+        case 'wait_for':
+          permissionFor(page.url(), permissions, 'interact');
+          await page.locator(step.selector).waitFor({ state: 'visible', timeout });
+          break;
+        case 'wait_for_idle':
+          await page.waitForLoadState('networkidle', { timeout });
+          break;
+        case 'wait':
+          if (step.duration_ms < 1 || step.duration_ms > 10000) throw new Error('wait duration must be between 1 and 10000 ms');
+          await page.waitForTimeout(step.duration_ms);
+          break;
+        case 'extract_text':
+          permissionFor(page.url(), permissions, 'extract_text');
+          const text = await page.locator(step.selector).innerText({ timeout });
+          extractedTextBytes += Buffer.byteLength(text);
+          if (extractedTextBytes > 256 * 1024) throw new Error('browser extracted text exceeds 256 KiB');
+          extractedText.push(text);
+          break;
+        case 'screenshot': {
+          permissionFor(page.url(), permissions, 'screenshot');
+          const options = { type: step.format || 'png', fullPage: Boolean(step.full_page) };
+          if (options.type === 'jpeg' && step.quality != null) options.quality = step.quality;
+          const data = step.selector ? await page.locator(step.selector).screenshot(options) : await page.screenshot(options);
+          artifacts.push({ mime_type: options.type === 'jpeg' ? 'image/jpeg' : 'image/png', data_base64: data.toString('base64') });
+          break;
+        }
+        default: throw new Error(`unsupported browser step: ${step.type}`);
+      }
+    }
+    if (resourceError) throw resourceError;
+    const result = { final_url: page.url(), title: await page.title(), extracted_text: extractedText, artifacts };
+    await context.close();
+    process.stdout.write(JSON.stringify(result));
+  } finally { await browser.close(); }
+}
+
+let source = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { source += chunk; });
+process.stdin.on('end', () => (source.trim() ? execute(JSON.parse(source)) : selfCheck()).catch(error => {
   process.stderr.write(String(error && error.stack || error));
   process.exitCode = 1;
-});
+}));
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,7 +607,7 @@ The browser runtime is downloaded only after an explicit install command."
 }
 
 async fn status() -> Result<(), Box<dyn std::error::Error>> {
-    let home = browser_home()?;
+    let home = browser_home_for_cli()?;
     ensure_runtime_home(&home)?;
     let _lock = acquire_lock(&home)?;
     let Some(runtime) = active_runtime(&home)? else {
@@ -206,7 +632,7 @@ async fn status() -> Result<(), Box<dyn std::error::Error>> {
 async fn install() -> Result<(), Box<dyn std::error::Error>> {
     let node_asset = installer_result(node_asset())?;
     let browser_asset = installer_result(browser_asset())?;
-    let home = browser_home()?;
+    let home = browser_home_for_cli()?;
     ensure_runtime_home(&home)?;
     let _lock = acquire_lock(&home)?;
     let runtimes = home.join("runtimes");
@@ -215,7 +641,7 @@ async fn install() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(io::Error::other)??;
     let runtime_name = format!(
-        "pw-{PLAYWRIGHT_VERSION}-node-{NODE_VERSION}-{}",
+        "pw-{PLAYWRIGHT_VERSION}-node-{NODE_VERSION}-host2-{}",
         node_asset.platform
     );
     let final_runtime = runtimes.join(&runtime_name);
@@ -320,7 +746,7 @@ async fn install_into(
 }
 
 async fn check() -> Result<(), Box<dyn std::error::Error>> {
-    let home = browser_home()?;
+    let home = browser_home_for_cli()?;
     ensure_runtime_home(&home)?;
     let _lock = acquire_lock(&home)?;
     let runtime = active_runtime(&home)?
@@ -372,18 +798,18 @@ async fn remove_directory_blocking(path: PathBuf) -> io::Result<()> {
 }
 
 async fn remove() -> Result<(), Box<dyn std::error::Error>> {
-    tokio::task::spawn_blocking(|| {
-        remove_blocking().map_err(|error| io::Error::other(error.to_string()))
+    let home = browser_home_for_cli()?;
+    tokio::task::spawn_blocking(move || {
+        remove_blocking(&home).map_err(|error| io::Error::other(error.to_string()))
     })
     .await
     .map_err(io::Error::other)??;
     Ok(())
 }
 
-fn remove_blocking() -> Result<(), Box<dyn std::error::Error>> {
-    let home = browser_home()?;
-    ensure_runtime_home(&home)?;
-    let _lock = acquire_lock(&home)?;
+fn remove_blocking(home: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    ensure_runtime_home(home)?;
+    let _lock = acquire_lock(home)?;
     let runtimes = home.join("runtimes");
     let mut removed = Vec::new();
     if runtimes.is_dir() {
@@ -914,6 +1340,27 @@ fn strip_path(path: &Path, count: usize) -> InstallResult<PathBuf> {
 }
 
 fn browser_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let selection = browser_home_selection()?;
+    if let Some(reason) = &selection.fallback_reason {
+        warn!(
+            reason,
+            path = %selection.path.display(),
+            "using private Browser Runtime fallback directory"
+        );
+    }
+    Ok(selection.path)
+}
+
+fn browser_home_for_cli() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let selection = browser_home_selection()?;
+    if let Some(reason) = &selection.fallback_reason {
+        println!("Browser Runtime directory fallback: {reason}");
+        println!("Using: {}", selection.path.display());
+    }
+    Ok(selection.path)
+}
+
+fn browser_home_selection() -> Result<BrowserHomeSelection, Box<dyn std::error::Error>> {
     if let Some(path) = env::var_os("BKMQB_BROWSER_HOME") {
         if path.is_empty() {
             return Err("BKMQB_BROWSER_HOME must not be empty".into());
@@ -921,46 +1368,206 @@ fn browser_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let path = PathBuf::from(path);
         #[cfg(windows)]
         validate_windows_browser_home_override(&path)?;
-        return Ok(path);
+        inspect_directory_chain(&path, true)?;
+        return Ok(BrowserHomeSelection {
+            path,
+            fallback_reason: None,
+        });
     }
-    if cfg!(windows) {
-        let local_data = env::var_os("LOCALAPPDATA").or_else(|| env::var_os("APPDATA"));
-        let local_data = local_data
-            .ok_or("cannot determine Browser Runtime directory; set BKMQB_BROWSER_HOME")?;
-        return Ok(PathBuf::from(local_data).join("BroKnowMyQQBot/browser"));
+    let preferred = preferred_browser_home()?;
+    let fallback = fallback_browser_home()?;
+    Ok(choose_browser_home(preferred, fallback)?)
+}
+
+fn choose_browser_home(preferred: PathBuf, fallback: PathBuf) -> io::Result<BrowserHomeSelection> {
+    match inspect_directory_chain(&preferred, true) {
+        Ok(()) => Ok(BrowserHomeSelection {
+            path: preferred,
+            fallback_reason: None,
+        }),
+        Err(error) => {
+            inspect_directory_chain(&fallback, true).map_err(|fallback_error| {
+                io::Error::other(format!(
+                    "preferred Browser Runtime directory is unsafe ({error}); private fallback is also unsafe ({fallback_error})"
+                ))
+            })?;
+            Ok(BrowserHomeSelection {
+                path: fallback,
+                fallback_reason: Some(error.to_string()),
+            })
+        }
     }
-    if cfg!(target_os = "macos") {
-        let home = env::var_os("HOME")
-            .ok_or("cannot determine Browser Runtime directory; set BKMQB_BROWSER_HOME")?;
-        return Ok(PathBuf::from(home).join("Library/Application Support/BroKnowMyQQBot/browser"));
-    }
-    if let Some(path) = env::var_os("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(path).join("bkmqb/browser"));
-    }
-    let home = env::var_os("HOME")
-        .ok_or("cannot determine Browser Runtime directory; set BKMQB_BROWSER_HOME")?;
-    Ok(PathBuf::from(home).join(".local/share/bkmqb/browser"))
 }
 
 fn ensure_runtime_home(home: &Path) -> io::Result<()> {
     ensure_directory_no_symlinks(home, true)?;
     ensure_directory_no_symlinks(&home.join("runtimes"), true)?;
+    #[cfg(windows)]
+    {
+        protect_windows_directory(home)?;
+        protect_windows_directory(&home.join("runtimes"))?;
+    }
+    Ok(())
+}
+
+fn preferred_browser_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        let local_data = env::var_os("LOCALAPPDATA").or_else(|| env::var_os("APPDATA"));
+        let local_data = local_data
+            .ok_or("cannot determine Browser Runtime directory; set BKMQB_BROWSER_HOME")?;
+        return Ok(windows_preferred_browser_home(Path::new(&local_data)));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = env::var_os("HOME")
+            .ok_or("cannot determine Browser Runtime directory; set BKMQB_BROWSER_HOME")?;
+        return Ok(macos_preferred_browser_home(Path::new(&home)));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let home = env::var_os("HOME")
+            .ok_or("cannot determine Browser Runtime directory; set BKMQB_BROWSER_HOME")?;
+        if let Some(path) = env::var_os("XDG_DATA_HOME") {
+            return Ok(linux_preferred_browser_home(
+                Path::new(&home),
+                Some(Path::new(&path)),
+            ));
+        }
+        Ok(linux_preferred_browser_home(Path::new(&home), None))
+    }
+}
+
+fn fallback_browser_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    {
+        let profile = env::var_os("USERPROFILE")
+            .ok_or("cannot determine private Browser Runtime fallback; set BKMQB_BROWSER_HOME")?;
+        return Ok(private_fallback_browser_home(Path::new(&profile)));
+    }
+    #[cfg(unix)]
+    {
+        let home = env::var_os("HOME")
+            .ok_or("cannot determine private Browser Runtime fallback; set BKMQB_BROWSER_HOME")?;
+        Ok(private_fallback_browser_home(Path::new(&home)))
+    }
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn linux_preferred_browser_home(home: &Path, xdg_data_home: Option<&Path>) -> PathBuf {
+    xdg_data_home.map_or_else(
+        || home.join(".local/share/bkmqb/browser"),
+        |xdg| xdg.join("bkmqb/browser"),
+    )
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_preferred_browser_home(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/BroKnowMyQQBot/browser")
+}
+
+#[cfg(any(test, windows))]
+fn windows_preferred_browser_home(local_app_data: &Path) -> PathBuf {
+    local_app_data.join("BroKnowMyQQBot/browser")
+}
+
+fn private_fallback_browser_home(profile: &Path) -> PathBuf {
+    profile.join(".bkmqb/browser")
+}
+
+fn inspect_directory_chain(path: &Path, private_leaf: bool) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::other(
+            "Browser Runtime directory must be an absolute path",
+        ));
+    }
+    let mut current = PathBuf::new();
+    let mut missing = false;
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match component {
+            Component::Prefix(_) | Component::RootDir => continue,
+            Component::Normal(_) => {}
+            Component::CurDir | Component::ParentDir => {
+                return Err(io::Error::other(
+                    "Browser Runtime directory must not contain `.` or `..` components",
+                ));
+            }
+        }
+        if missing {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                validate_directory_component(&current, &metadata, private_leaf && current == path)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing = true,
+            Err(error) => return Err(error),
+        }
+    }
     Ok(())
 }
 
 #[cfg(windows)]
 fn validate_windows_browser_home_override(path: &Path) -> InstallResult<()> {
-    let trusted_root = env::var_os("LOCALAPPDATA")
-        .or_else(|| env::var_os("APPDATA"))
-        .ok_or("cannot determine trusted Windows application data directory")?;
-    let trusted_root = PathBuf::from(trusted_root);
-    if !path.is_absolute() || !trusted_root.is_absolute() || !path.starts_with(&trusted_root) {
+    let mut trusted_roots = Vec::new();
+    if let Some(root) = env::var_os("LOCALAPPDATA").or_else(|| env::var_os("APPDATA")) {
+        trusted_roots.push(PathBuf::from(root));
+    }
+    if let Some(root) = env::var_os("USERPROFILE") {
+        trusted_roots.push(PathBuf::from(root));
+    }
+    if !windows_override_is_trusted(path, &trusted_roots) {
         return Err(
-            "BKMQB_BROWSER_HOME on Windows must be inside the current user's application data directory"
+            "BKMQB_BROWSER_HOME on Windows must be inside LOCALAPPDATA, APPDATA, or USERPROFILE"
                 .into(),
         );
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn windows_override_is_trusted(path: &Path, trusted_roots: &[PathBuf]) -> bool {
+    path.is_absolute()
+        && !trusted_roots.is_empty()
+        && trusted_roots.iter().any(|root| {
+            root.is_absolute()
+                && path
+                    .strip_prefix(root)
+                    .is_ok_and(|relative| !relative.as_os_str().is_empty())
+        })
+}
+
+#[cfg(windows)]
+fn protect_windows_directory(path: &Path) -> io::Result<()> {
+    let username = env::var("USERNAME")
+        .map_err(|_| io::Error::other("USERNAME is unavailable for Browser Runtime ACL setup"))?;
+    let principal = env::var("USERDOMAIN")
+        .ok()
+        .filter(|domain| !domain.is_empty())
+        .map_or(username.clone(), |domain| format!("{domain}\\{username}"));
+    let status = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{principal}:(OI)(CI)F"))
+        .arg("*S-1-5-18:(OI)(CI)F")
+        .arg("*S-1-5-32-544:(OI)(CI)F")
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(
+            "failed to apply the private Browser Runtime Windows ACL",
+        ));
+    }
+    let verify = std::process::Command::new("icacls.exe")
+        .arg(path)
+        .arg("/verify")
+        .arg("/q")
+        .status()?;
+    verify
+        .success()
+        .then_some(())
+        .ok_or_else(|| io::Error::other("Browser Runtime Windows ACL verification failed"))
 }
 
 fn ensure_directory_no_symlinks(path: &Path, private_leaf: bool) -> io::Result<()> {
@@ -1170,6 +1777,11 @@ fn read_manifest(runtime: &Path) -> InstallResult<BrowserRuntimeManifest> {
 }
 
 fn validate_runtime(runtime: &Path) -> InstallResult<()> {
+    validate_runtime_with_cancel(runtime, None)
+}
+
+fn validate_runtime_with_cancel(runtime: &Path, cancel: Option<&AtomicBool>) -> InstallResult<()> {
+    check_validation_cancelled(cancel)?;
     let metadata = fs::symlink_metadata(runtime)?;
     if metadata_is_link_like(&metadata) || !metadata.is_dir() {
         return Err("Browser Runtime root must be a regular directory".into());
@@ -1191,22 +1803,25 @@ fn validate_runtime(runtime: &Path) -> InstallResult<()> {
     validate_runtime_file(runtime, Path::new("worker.js"))?;
     validate_runtime_file(runtime, Path::new("playwright/index.js"))?;
     validate_runtime_file(runtime, Path::new("playwright/browsers.json"))?;
-    validate_file_checksum(
+    validate_file_checksum_with_cancel(
         "Browser Runtime worker",
         &runtime.join("worker.js"),
         WORKER_SHA256,
+        cancel,
     )?;
-    validate_tree_checksum(
+    validate_tree_checksum_with_cancel(
         "Node Runtime",
         &runtime.join("node"),
         node_asset.tree_sha256,
         &[],
+        cancel,
     )?;
-    validate_tree_checksum(
+    validate_tree_checksum_with_cancel(
         "playwright-core",
         &runtime.join("playwright"),
         PLAYWRIGHT_TREE_SHA256,
         &[],
+        cancel,
     )?;
     validate_playwright_browser_metadata(runtime)?;
     validate_runtime_file(
@@ -1215,7 +1830,7 @@ fn validate_runtime(runtime: &Path) -> InstallResult<()> {
             .join(format!("chromium_headless_shell-{CHROMIUM_REVISION}"))
             .join(browser_asset.executable_path),
     )?;
-    validate_browser_tree(runtime, browser_asset)?;
+    validate_browser_tree_with_cancel(runtime, browser_asset, cancel)?;
     Ok(())
 }
 
@@ -1265,15 +1880,20 @@ fn validate_runtime_file(runtime: &Path, relative: &Path) -> InstallResult<()> {
     Ok(())
 }
 
-fn validate_browser_tree(runtime: &Path, asset: BrowserAsset) -> InstallResult<()> {
+fn validate_browser_tree_with_cancel(
+    runtime: &Path,
+    asset: BrowserAsset,
+    cancel: Option<&AtomicBool>,
+) -> InstallResult<()> {
     let root = runtime
         .join("browsers")
         .join(format!("chromium_headless_shell-{CHROMIUM_REVISION}"));
-    validate_tree_checksum(
+    validate_tree_checksum_with_cancel(
         "Chromium installation",
         &root,
         asset.tree_sha256,
         &["INSTALLATION_COMPLETE", "DEPENDENCIES_VALIDATED"],
+        cancel,
     )
 }
 
@@ -1282,24 +1902,31 @@ fn browser_tree_sha256(root: &Path) -> InstallResult<String> {
     directory_tree_sha256(root, &["INSTALLATION_COMPLETE", "DEPENDENCIES_VALIDATED"])
 }
 
-fn validate_tree_checksum(
+fn validate_tree_checksum_with_cancel(
     label: &str,
     root: &Path,
     expected: &str,
     ignored_file_names: &[&str],
+    cancel: Option<&AtomicBool>,
 ) -> InstallResult<()> {
-    let actual = directory_tree_sha256(root, ignored_file_names)?;
+    let actual = directory_tree_sha256_with_cancel(root, ignored_file_names, cancel)?;
     if actual != expected {
         return Err(format!("{label} checksum mismatch: expected {expected}, got {actual}").into());
     }
     Ok(())
 }
 
-fn validate_file_checksum(label: &str, path: &Path, expected: &str) -> InstallResult<()> {
+fn validate_file_checksum_with_cancel(
+    label: &str,
+    path: &Path,
+    expected: &str,
+    cancel: Option<&AtomicBool>,
+) -> InstallResult<()> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
+        check_validation_cancelled(cancel)?;
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -1313,21 +1940,33 @@ fn validate_file_checksum(label: &str, path: &Path, expected: &str) -> InstallRe
     Ok(())
 }
 
+#[cfg(test)]
 fn directory_tree_sha256(root: &Path, ignored_file_names: &[&str]) -> InstallResult<String> {
+    directory_tree_sha256_with_cancel(root, ignored_file_names, None)
+}
+
+fn directory_tree_sha256_with_cancel(
+    root: &Path,
+    ignored_file_names: &[&str],
+    cancel: Option<&AtomicBool>,
+) -> InstallResult<String> {
+    check_validation_cancelled(cancel)?;
     let metadata = fs::symlink_metadata(root)?;
     if metadata_is_link_like(&metadata) || !metadata.is_dir() {
         return Err("Chromium installation root must be a regular directory".into());
     }
     let mut files = Vec::new();
-    collect_tree_files(root, root, ignored_file_names, 0, &mut files)?;
+    collect_tree_files(root, root, ignored_file_names, 0, &mut files, cancel)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
     let mut tree_hasher = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     for (relative, path) in files {
+        check_validation_cancelled(cancel)?;
         let mut file = fs::File::open(path)?;
         let mut file_hasher = Sha256::new();
         loop {
+            check_validation_cancelled(cancel)?;
             let read = file.read(&mut buffer)?;
             if read == 0 {
                 break;
@@ -1346,7 +1985,9 @@ fn collect_tree_files(
     ignored_file_names: &[&str],
     depth: usize,
     files: &mut Vec<(String, PathBuf)>,
+    cancel: Option<&AtomicBool>,
 ) -> InstallResult<()> {
+    check_validation_cancelled(cancel)?;
     if depth > MAX_DIRECTORY_DEPTH {
         return Err("Browser Runtime directory nesting exceeds the depth limit".into());
     }
@@ -1358,7 +1999,7 @@ fn collect_tree_files(
         }
         let path = entry.path();
         if metadata.is_dir() {
-            collect_tree_files(root, &path, ignored_file_names, depth + 1, files)?;
+            collect_tree_files(root, &path, ignored_file_names, depth + 1, files, cancel)?;
             continue;
         }
         if !metadata.is_file() {
@@ -1389,6 +2030,17 @@ fn collect_tree_files(
             return Err("Chromium installation contains an unsafe path".into());
         }
         files.push((normalized, path));
+    }
+    Ok(())
+}
+
+fn check_validation_cancelled(cancel: Option<&AtomicBool>) -> InstallResult<()> {
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Browser Runtime validation was cancelled",
+        )
+        .into());
     }
     Ok(())
 }
@@ -1528,6 +2180,45 @@ mod tests {
             vec!["nested"; MAX_DIRECTORY_DEPTH + 1].join("/")
         );
         assert!(strip_path(Path::new(&deep), 1).is_err());
+    }
+
+    #[test]
+    fn public_ip_filter_rejects_embedded_private_ipv4_addresses() {
+        for address in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:c0a8:1",
+            "::127.0.0.1",
+        ] {
+            assert!(!is_public_ip(address.parse().unwrap()), "{address}");
+        }
+        assert!(is_public_ip("::ffff:8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn platform_browser_paths_are_stable() {
+        assert_eq!(
+            linux_preferred_browser_home(Path::new("/home/tester"), None),
+            PathBuf::from("/home/tester/.local/share/bkmqb/browser")
+        );
+        assert_eq!(
+            linux_preferred_browser_home(
+                Path::new("/home/tester"),
+                Some(Path::new("/data/tester"))
+            ),
+            PathBuf::from("/data/tester/bkmqb/browser")
+        );
+        assert_eq!(
+            macos_preferred_browser_home(Path::new("/Users/tester")),
+            PathBuf::from("/Users/tester/Library/Application Support/BroKnowMyQQBot/browser")
+        );
+        let windows = windows_preferred_browser_home(Path::new(r"C:\Users\tester\AppData\Local"));
+        assert!(windows.starts_with(Path::new(r"C:\Users\tester\AppData\Local")));
+        assert!(windows.ends_with(Path::new("BroKnowMyQQBot/browser")));
+        assert_eq!(
+            private_fallback_browser_home(Path::new("/home/tester")),
+            PathBuf::from("/home/tester/.bkmqb/browser")
+        );
     }
 
     #[test]
@@ -1708,6 +2399,97 @@ mod tests {
         assert_eq!(PLAYWRIGHT_TREE_SHA256.len(), 64);
     }
 
+    #[tokio::test]
+    async fn installed_runtime_can_launch_the_embedded_worker() {
+        let Ok(home) = browser_home() else {
+            return;
+        };
+        let Ok(Some(runtime)) = active_runtime(&home) else {
+            return;
+        };
+        let output = Command::new(node_executable(&runtime))
+            .arg("-e")
+            .arg(WORKER_SOURCE)
+            .env("PLAYWRIGHT_BROWSERS_PATH", runtime.join("browsers"))
+            .current_dir(runtime)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an installed Browser Runtime and public network"]
+    async fn installed_runtime_navigates_waits_and_captures_a_screenshot() {
+        let runtime = if let Some(path) = env::var_os("BKMQB_BROWSER_SMOKE_RUNTIME") {
+            PathBuf::from(path)
+        } else {
+            let home = browser_home().unwrap();
+            active_runtime(&home).unwrap().unwrap()
+        };
+        let executor = InstalledBrowserExecutor {
+            runtime,
+            inline_worker: Some(WORKER_SOURCE),
+        };
+        let permission = BrowserPermission {
+            scheme: "https".to_owned(),
+            host: "example.com".to_owned(),
+            port: 443,
+            path_prefixes: std::collections::BTreeSet::from(["/".to_owned()]),
+            capabilities: std::collections::BTreeSet::from([
+                "navigate".to_owned(),
+                "screenshot".to_owned(),
+            ]),
+        };
+        let grants = std::collections::BTreeSet::from([
+            "browser.run".to_owned(),
+            "browser.origin.https.example.com:443.navigate".to_owned(),
+            "browser.origin.https.example.com:443.screenshot".to_owned(),
+        ]);
+        let result = executor
+            .execute(
+                &[permission],
+                &grants,
+                &BrowserRun {
+                    steps: vec![
+                        plugin_api::BrowserStep::Navigate {
+                            url: "https://example.com/".to_owned(),
+                            wait_until: plugin_api::BrowserWaitUntil::DomContentLoaded,
+                            timeout_ms: 10_000,
+                        },
+                        plugin_api::BrowserStep::Wait { duration_ms: 3_000 },
+                        plugin_api::BrowserStep::Screenshot {
+                            selector: None,
+                            full_page: true,
+                            format: plugin_api::BrowserScreenshotFormat::Png,
+                            quality: None,
+                        },
+                    ],
+                    viewport: plugin_api::BrowserViewport::default(),
+                    user_agent: None,
+                    locale: None,
+                    timezone: None,
+                    color_scheme: None,
+                    extra_headers: std::collections::BTreeMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let (final_url, _, _, artifacts) = result.into_parts();
+        assert_eq!(final_url, "https://example.com/");
+        assert_eq!(artifacts.len(), 1);
+        assert!(artifacts[0].data().starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn runtime_home_rejects_a_symlinked_runtimes_directory() {
@@ -1747,6 +2529,77 @@ mod tests {
             .join("..")
             .join("browser");
         assert!(ensure_directory_no_symlinks(&with_parent, true).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_standard_directory_uses_private_fallback_without_chmod() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let preferred_parent = test_directory("preferred-browser-home");
+        let fallback_parent = test_directory("fallback-browser-home");
+        fs::create_dir_all(&preferred_parent).unwrap();
+        fs::create_dir_all(&fallback_parent).unwrap();
+        fs::set_permissions(&preferred_parent, fs::Permissions::from_mode(0o775)).unwrap();
+        fs::set_permissions(&fallback_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let preferred = preferred_parent.join("bkmqb/browser");
+        let fallback = fallback_parent.join(".bkmqb/browser");
+
+        let selection = choose_browser_home(preferred, fallback.clone()).unwrap();
+        assert_eq!(selection.path, fallback);
+        assert!(selection.fallback_reason.is_some());
+        assert_eq!(
+            fs::metadata(&preferred_parent)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775
+        );
+
+        fs::set_permissions(&preferred_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(preferred_parent).unwrap();
+        fs::remove_dir_all(fallback_parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_standard_directory_remains_preferred() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let preferred_parent = test_directory("secure-preferred-browser-home");
+        let fallback_parent = test_directory("unused-fallback-browser-home");
+        fs::create_dir_all(&preferred_parent).unwrap();
+        fs::create_dir_all(&fallback_parent).unwrap();
+        fs::set_permissions(&preferred_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&fallback_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let preferred = preferred_parent.join("bkmqb/browser");
+        let selection =
+            choose_browser_home(preferred.clone(), fallback_parent.join(".bkmqb/browser")).unwrap();
+        assert_eq!(selection.path, preferred);
+        assert!(selection.fallback_reason.is_none());
+
+        fs::remove_dir_all(preferred_parent).unwrap();
+        fs::remove_dir_all(fallback_parent).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_override_stays_inside_user_owned_roots() {
+        let roots = vec![
+            PathBuf::from(r"C:\Users\Tester\AppData\Local"),
+            PathBuf::from(r"C:\Users\Tester"),
+        ];
+        assert!(windows_override_is_trusted(
+            Path::new(r"C:\Users\Tester\.bkmqb\browser"),
+            &roots
+        ));
+        assert!(!windows_override_is_trusted(&roots[0], &roots));
+        assert!(!windows_override_is_trusted(&roots[1], &roots));
+        assert!(!windows_override_is_trusted(
+            Path::new(r"C:\ProgramData\BroKnowMyQQBot\browser"),
+            &roots
+        ));
     }
 
     #[cfg(unix)]

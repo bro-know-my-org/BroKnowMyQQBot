@@ -1,4 +1,4 @@
-package bkm:plugin@1.0.0;
+package bkm:plugin@1.1.0;
 
 interface types {
     enum host-error-code {
@@ -160,6 +160,19 @@ interface types {
         content: string,
     }
 
+    record media-reply-command {
+        asset-id: string,
+        caption: option<string>,
+        consume: bool,
+    }
+
+    record media-send-command {
+        target: message-target,
+        asset-id: string,
+        caption: option<string>,
+        consume: bool,
+    }
+
     record http-header {
         name: string,
         value: string,
@@ -172,6 +185,52 @@ interface types {
         body: option<list<u8>>,
         timeout-ms: u64,
         max-response-bytes: u64,
+    }
+
+    enum browser-wait-until { load, dom-content-loaded, network-idle }
+    enum browser-screenshot-format { png, jpeg }
+    enum browser-color-scheme { light, dark, no-preference }
+
+    record browser-viewport {
+        width: u32,
+        height: u32,
+        device-scale-factor: u8,
+    }
+
+    record browser-header { name: string, value: string }
+    record browser-navigate-step { url: string, wait-until: browser-wait-until, timeout-ms: u64 }
+    record browser-click-step { selector: string, timeout-ms: u64 }
+    record browser-fill-step { selector: string, value: string, timeout-ms: u64 }
+    record browser-wait-for-step { selector: string, timeout-ms: u64 }
+    record browser-wait-for-idle-step { timeout-ms: u64 }
+    record browser-wait-step { duration-ms: u64 }
+    record browser-extract-text-step { selector: string, timeout-ms: u64 }
+    record browser-screenshot-step {
+        selector: option<string>,
+        full-page: bool,
+        format: browser-screenshot-format,
+        quality: option<u8>,
+    }
+
+    variant browser-step {
+        navigate(browser-navigate-step),
+        click(browser-click-step),
+        fill(browser-fill-step),
+        wait-for(browser-wait-for-step),
+        wait-for-idle(browser-wait-for-idle-step),
+        wait(browser-wait-step),
+        extract-text(browser-extract-text-step),
+        screenshot(browser-screenshot-step),
+    }
+
+    record browser-run-command {
+        steps: list<browser-step>,
+        viewport: browser-viewport,
+        user-agent: option<string>,
+        locale: option<string>,
+        timezone: option<string>,
+        color-scheme: option<browser-color-scheme>,
+        extra-headers: list<browser-header>,
     }
 
     record schedule-create-command {
@@ -187,7 +246,10 @@ interface types {
     variant command-payload {
         message-reply(message-reply-command),
         message-send(message-send-command),
+        media-reply(media-reply-command),
+        media-send(media-send-command),
         http-request(http-request-command),
+        browser-run(browser-run-command),
         schedule-create(schedule-create-command),
         schedule-cancel(schedule-cancel-command),
     }

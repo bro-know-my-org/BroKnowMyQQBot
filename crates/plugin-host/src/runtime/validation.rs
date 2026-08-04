@@ -214,12 +214,15 @@ pub(super) fn validate_output(
             command.kind.as_str(),
             "message.reply"
                 | "message.send"
+                | "media.reply"
+                | "media.send"
                 | "http.request"
+                | "browser.run"
                 | "schedule.create"
                 | "schedule.cancel"
         ) {
             return Err(invalid(format!(
-                "command kind `{}` is not part of the BPP 1.0 baseline",
+                "command kind `{}` is not part of the supported BPP baseline",
                 command.kind
             )));
         }

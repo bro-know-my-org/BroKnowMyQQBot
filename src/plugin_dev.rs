@@ -717,7 +717,7 @@ fn manifest_template(
     command: &str,
 ) -> String {
     format!(
-        "manifest_version = 1\nid = {}\nversion = \"0.1.0\"\nprotocol = \">=1.0,<2.0\"\nentry = \"component.wasm\"\n\n[metadata]\ndefault_locale = {}\n\n[metadata.locales.{}]\nname = {}\ndescription = {}\n\n[[subscriptions]]\nid = \"message-handler\"\nevent = \"message.created\"\npriority = 0\nscopes = [\"group\", \"private\", \"channel\"]\n\n[[commands]]\nname = {}\naliases = []\ndescription = {}\n\n[permissions]\nactions = [\"message.reply\"]\n",
+        "manifest_version = 1\nid = {}\nversion = \"0.1.0\"\nprotocol = \">=1.1,<2.0\"\nentry = \"component.wasm\"\n\n[metadata]\ndefault_locale = {}\n\n[metadata.locales.{}]\nname = {}\ndescription = {}\n\n[[subscriptions]]\nid = \"message-handler\"\nevent = \"message.created\"\npriority = 0\nscopes = [\"group\", \"private\", \"channel\"]\n\n[[commands]]\nname = {}\naliases = []\ndescription = {}\n\n[permissions]\nactions = [\"message.reply\"]\n",
         toml_string(plugin_id),
         toml_string(locale),
         toml_string(locale),
