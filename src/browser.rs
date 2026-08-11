@@ -25,7 +25,7 @@ const PLAYWRIGHT_VERSION: &str = "1.62.1";
 const PLAYWRIGHT_SHA256: &str = "954be1e183d0ddb9748fe0d2d08b0b66a9210c74dd75c397aeb70303b9f08a00";
 const PLAYWRIGHT_TREE_SHA256: &str =
     "56d9c79a81caabc7754771f96672d649425f27690565c25e832d95a15a830948";
-const WORKER_SHA256: &str = "4b21217082446249702e1c17516e1dea83acab6909a87cee8bf6272b06e90480";
+const WORKER_SHA256: &str = "5f29590d33fee98f8610e6b3094bc06d639395e91ab1fe345cf1dfb714380d68";
 const CHROMIUM_VERSION: &str = "151.0.7922.34";
 const CHROMIUM_REVISION: &str = "1234";
 const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
@@ -145,25 +145,34 @@ impl BrowserExecutor for InstalledBrowserExecutor {
             ));
         }
         let mut resolved_permissions = Vec::with_capacity(permissions.len());
+        let mut resolved_hosts = std::collections::HashMap::new();
         for permission in &permissions {
-            let addresses = tokio::net::lookup_host((permission.host.as_str(), permission.port))
-                .await
-                .map_err(|error| BrowserExecutionError::Denied(error.to_string()))?;
-            let public_addresses = addresses
-                .map(|address| address.ip())
-                .filter(|address| is_public_ip(*address))
-                .collect::<Vec<_>>();
-            let address = public_addresses
-                .iter()
-                .copied()
-                .find(std::net::IpAddr::is_ipv4)
-                .or_else(|| public_addresses.first().copied())
-                .ok_or_else(|| {
-                    BrowserExecutionError::Denied(format!(
-                        "browser host `{}` did not resolve to a public address",
-                        permission.host
-                    ))
-                })?;
+            let host_key = permission.host.to_ascii_lowercase();
+            let address = if let Some(address) = resolved_hosts.get(&host_key) {
+                *address
+            } else {
+                let addresses =
+                    tokio::net::lookup_host((permission.host.as_str(), permission.port))
+                        .await
+                        .map_err(|error| BrowserExecutionError::Denied(error.to_string()))?;
+                let public_addresses = addresses
+                    .map(|address| address.ip())
+                    .filter(|address| is_public_ip(*address))
+                    .collect::<Vec<_>>();
+                let address = public_addresses
+                    .iter()
+                    .copied()
+                    .find(std::net::IpAddr::is_ipv4)
+                    .or_else(|| public_addresses.first().copied())
+                    .ok_or_else(|| {
+                        BrowserExecutionError::Denied(format!(
+                            "browser host `{}` did not resolve to a public address",
+                            permission.host
+                        ))
+                    })?;
+                resolved_hosts.insert(host_key, address);
+                address
+            };
             resolved_permissions.push(ResolvedBrowserPermission {
                 scheme: &permission.scheme,
                 host: &permission.host,
@@ -272,6 +281,8 @@ fn installer_result<T>(result: InstallResult<T>) -> Result<T, io::Error> {
 }
 
 const WORKER_SOURCE: &str = r"'use strict';
+const dns = require('node:dns').promises;
+const http = require('node:http');
 const net = require('node:net');
 const { chromium } = require('./playwright');
 
@@ -310,6 +321,266 @@ function embeddedIpv4(address) {
   return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
 }
 
+function publicHttpUrl(value) {
+  const parsed = new URL(value);
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error('unsupported URL scheme');
+  if (parsed.username || parsed.password) throw new Error('URL credentials are denied');
+  if (net.isIP(parsed.hostname)) throw new Error('IP literal URLs are denied');
+  return parsed;
+}
+
+async function resolvePublicAddress(hostname, pinnedAddresses, closingSignal) {
+  if (net.isIP(hostname)) throw new Error('IP literal hosts are denied');
+  const pinned = pinnedAddresses.get(hostname.toLowerCase());
+  if (pinned) {
+    const family = net.isIP(pinned);
+    if (!family || !publicAddress(pinned)) throw new Error(`host has an invalid pinned address: ${hostname}`);
+    return { address: pinned, family };
+  }
+  let timeoutId;
+  const outcome = await Promise.race([
+    dns.lookup(hostname, { all: true, verbatim: true }).then(
+      addresses => ({ addresses }),
+      error => ({ error }),
+    ),
+    closingSignal.then(() => ({ closing: true })),
+    new Promise(resolve => {
+      timeoutId = setTimeout(() => resolve({ timedOut: true }), 5_000);
+    }),
+  ]);
+  clearTimeout(timeoutId);
+  if (outcome.closing) throw new Error('browser proxy is closing');
+  if (outcome.timedOut) throw new Error(`DNS lookup timed out: ${hostname}`);
+  if (outcome.error) throw outcome.error;
+  const addresses = outcome.addresses;
+  if (addresses.length === 0 || addresses.some(item => !publicAddress(item.address))) {
+    throw new Error(`host has a non-public or missing address: ${hostname}`);
+  }
+  return addresses.find(item => item.family === 4) || addresses[0];
+}
+
+function connectAuthority(value) {
+  let hostname;
+  let portText;
+  if (value.startsWith('[')) {
+    const end = value.indexOf(']');
+    if (end < 0 || value[end + 1] !== ':') throw new Error('invalid proxy authority');
+    hostname = value.slice(1, end);
+    portText = value.slice(end + 2);
+  } else {
+    const separator = value.lastIndexOf(':');
+    if (separator <= 0) throw new Error('invalid proxy authority');
+    hostname = value.slice(0, separator);
+    portText = value.slice(separator + 1);
+  }
+  if (net.isIP(hostname)) throw new Error('IP literal hosts are denied');
+  const port = Number(portText);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('invalid proxy port');
+  return { hostname: hostname.toLowerCase(), port };
+}
+
+function sanitizedProxyHeaders(headers) {
+  const sanitized = { ...headers };
+  const connectionValues = Array.isArray(sanitized.connection)
+    ? sanitized.connection
+    : [sanitized.connection];
+  for (const value of connectionValues) {
+    if (typeof value !== 'string') continue;
+    for (const token of value.split(',')) {
+      const name = token.trim().toLowerCase();
+      if (name) delete sanitized[name];
+    }
+  }
+  for (const name of [
+    'connection',
+    'keep-alive',
+    'proxy-authenticate',
+    'proxy-authorization',
+    'proxy-connection',
+    'te',
+    'trailer',
+    'transfer-encoding',
+    'upgrade',
+  ]) delete sanitized[name];
+  return sanitized;
+}
+
+async function startPublicProxy(permissions) {
+  const pinnedAddresses = new Map();
+  for (const permission of permissions) {
+    const hostname = permission.host.toLowerCase();
+    const existing = pinnedAddresses.get(hostname);
+    if (existing && existing !== permission.resolved_ip) {
+      throw new Error(`browser permissions disagree on the pinned address for ${hostname}`);
+    }
+    pinnedAddresses.set(hostname, permission.resolved_ip);
+  }
+  const tunnelSockets = new Set();
+  const ordinaryUpstreams = new Set();
+  let closing = false;
+  let signalClosing;
+  const closingSignal = new Promise(resolve => { signalClosing = resolve; });
+  const trackTunnelSocket = socket => {
+    tunnelSockets.add(socket);
+    socket.once('close', () => tunnelSockets.delete(socket));
+    return socket;
+  };
+  const server = http.createServer(async (request, response) => {
+    let upstream = null;
+    let clientClosed = false;
+    const closeUpstream = () => {
+      clientClosed = true;
+      if (upstream) upstream.destroy();
+    };
+    request.once('aborted', closeUpstream);
+    response.once('close', closeUpstream);
+    try {
+      const target = publicHttpUrl(request.url);
+      if (target.protocol !== 'http:') throw new Error('HTTPS proxy requests must use CONNECT');
+      const resolved = await resolvePublicAddress(target.hostname, pinnedAddresses, closingSignal);
+      if (closing || clientClosed) return;
+      const headers = sanitizedProxyHeaders(request.headers);
+      headers.host = target.host;
+      upstream = http.request({
+        hostname: resolved.address,
+        family: resolved.family,
+        port: Number(target.port || 80),
+        method: request.method,
+        path: `${target.pathname}${target.search}`,
+        headers,
+      }, upstreamResponse => {
+        response.writeHead(
+          upstreamResponse.statusCode || 502,
+          sanitizedProxyHeaders(upstreamResponse.headers),
+        );
+        upstreamResponse.on('aborted', () => response.destroy());
+        upstreamResponse.on('error', error => response.destroy(error));
+        upstreamResponse.pipe(response);
+      });
+      ordinaryUpstreams.add(upstream);
+      upstream.once('close', () => ordinaryUpstreams.delete(upstream));
+      upstream.setTimeout(30_000, () => upstream.destroy(new Error('proxy request timed out')));
+      upstream.on('error', error => response.destroy(error));
+      request.pipe(upstream);
+    } catch (error) {
+      if (!response.destroyed) {
+        response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+        response.end(String(error && error.message || error));
+      }
+    }
+  });
+  server.on('connect', async (request, client, head) => {
+    let upstream = null;
+    trackTunnelSocket(client);
+    client.setTimeout(30_000, () => client.destroy());
+    client.on('error', () => {
+      if (upstream) upstream.destroy();
+    });
+    client.once('close', () => {
+      if (upstream) upstream.destroy();
+    });
+    try {
+      const target = connectAuthority(request.url);
+      const resolved = await resolvePublicAddress(target.hostname, pinnedAddresses, closingSignal);
+      if (closing || client.destroyed) return;
+      upstream = trackTunnelSocket(net.connect({
+        host: resolved.address,
+        family: resolved.family,
+        port: target.port,
+      }));
+      upstream.setTimeout(30_000, () => upstream.destroy(new Error('proxy tunnel timed out')));
+      upstream.once('connect', () => {
+        if (client.destroyed) {
+          upstream.destroy();
+          return;
+        }
+        client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if (head.length > 0) upstream.write(head);
+        upstream.pipe(client);
+        client.pipe(upstream);
+      });
+      upstream.on('error', () => client.destroy());
+      upstream.once('close', () => client.destroy());
+    } catch (error) {
+      if (!client.destroyed) {
+        client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      }
+    }
+  });
+  server.on('upgrade', async (request, client, head) => {
+    let upstream = null;
+    trackTunnelSocket(client);
+    client.setTimeout(30_000, () => client.destroy());
+    client.on('error', () => {
+      if (upstream) upstream.destroy();
+    });
+    client.once('close', () => {
+      if (upstream) upstream.destroy();
+    });
+    try {
+      const target = publicHttpUrl(request.url);
+      if (target.protocol !== 'http:' || request.method !== 'GET') {
+        throw new Error('invalid WebSocket proxy request');
+      }
+      const upgrade = request.headers.upgrade;
+      if (typeof upgrade !== 'string' || upgrade.toLowerCase() !== 'websocket') {
+        throw new Error('unsupported proxy upgrade');
+      }
+      const resolved = await resolvePublicAddress(target.hostname, pinnedAddresses, closingSignal);
+      if (closing || client.destroyed) return;
+      upstream = trackTunnelSocket(net.connect({
+        host: resolved.address,
+        family: resolved.family,
+        port: Number(target.port || 80),
+      }));
+      upstream.setTimeout(30_000, () => upstream.destroy(new Error('proxy WebSocket timed out')));
+      upstream.once('connect', () => {
+        if (client.destroyed) {
+          upstream.destroy();
+          return;
+        }
+        const headers = sanitizedProxyHeaders(request.headers);
+        headers.host = target.host;
+        headers.connection = 'Upgrade';
+        headers.upgrade = upgrade;
+        upstream.write(`${request.method} ${target.pathname}${target.search} HTTP/${request.httpVersion}\r\n`);
+        for (const [name, value] of Object.entries(headers)) {
+          for (const item of Array.isArray(value) ? value : [value]) {
+            if (item != null) upstream.write(`${name}: ${item}\r\n`);
+          }
+        }
+        upstream.write('\r\n');
+        if (head.length > 0) upstream.write(head);
+        upstream.pipe(client);
+        client.pipe(upstream);
+      });
+      upstream.on('error', () => client.destroy());
+      upstream.once('close', () => client.destroy());
+    } catch (error) {
+      if (!client.destroyed) {
+        client.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+      }
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('browser proxy did not bind an IP socket');
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise((resolve, reject) => {
+      closing = true;
+      signalClosing();
+      for (const upstream of ordinaryUpstreams) upstream.destroy();
+      for (const socket of tunnelSockets) socket.destroy();
+      server.close(error => error ? reject(error) : resolve());
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    }),
+  };
+}
+
 function pathMatches(path, prefix) {
   if (path.includes('%') || path.includes('\\') || path.split('/').some(segment => segment === '.' || segment === '..')) return false;
   return prefix === '/' || path === prefix || (path.startsWith(prefix) && (prefix.endsWith('/') || path[prefix.length] === '/'));
@@ -335,15 +606,53 @@ async function validateNetwork(url, permissions) {
   }
 }
 
+function validateSubresource(url) {
+  if (url.startsWith('data:') || url.startsWith('blob:')) return;
+  publicHttpUrl(url);
+}
+
+function webSocketPermissionUrl(value) {
+  const parsed = new URL(value);
+  if (parsed.protocol === 'ws:') parsed.protocol = 'http:';
+  else if (parsed.protocol === 'wss:') parsed.protocol = 'https:';
+  else throw new Error('unsupported WebSocket URL scheme');
+  return parsed.href;
+}
+
 async function selfCheck() {
-  const browser = await chromium.launch({ headless: true });
+  let loopbackHits = 0;
+  const loopbackServer = http.createServer((request, response) => {
+    loopbackHits += 1;
+    response.end('loopback access must be blocked');
+  });
+  await new Promise((resolve, reject) => {
+    loopbackServer.once('error', reject);
+    loopbackServer.listen(0, '127.0.0.1', resolve);
+  });
+  let proxy = null;
+  let browser = null;
   try {
+    const loopbackAddress = loopbackServer.address();
+    if (!loopbackAddress || typeof loopbackAddress === 'string') throw new Error('loopback self-check did not bind an IP socket');
+    proxy = await startPublicProxy([]);
+    browser = await chromium.launch({
+      headless: true,
+      proxy: { server: proxy.url, bypass: '<-loopback>' },
+    });
     const context = await browser.newContext();
     const page = await context.newPage();
     await page.setContent('<!doctype html><title>bkmqb browser check</title><p>ok</p>');
     const title = await page.title();
-    process.stdout.write(JSON.stringify({ ok: title === 'bkmqb browser check', browser: browser.version() }));
-  } finally { await browser.close(); }
+    await page.goto(`http://127.0.0.1:${loopbackAddress.port}/`).catch(() => {});
+    process.stdout.write(JSON.stringify({
+      ok: title === 'bkmqb browser check' && loopbackHits === 0,
+      browser: browser.version(),
+    }));
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    if (proxy) await proxy.close().catch(() => {});
+    await new Promise(resolve => loopbackServer.close(resolve));
+  }
 }
 
 async function execute(input) {
@@ -351,15 +660,17 @@ async function execute(input) {
   const permissions = input.permissions;
   if (!Array.isArray(request.steps) || request.steps.length < 1 || request.steps.length > 32) throw new Error('browser task must contain 1 to 32 steps');
   const headers = request.extra_headers || {};
+  const extraHeaderNames = new Set(Object.keys(headers).map(name => name.toLowerCase()));
   for (const name of Object.keys(headers)) {
     if (['authorization', 'cookie', 'host', 'proxy-authorization'].includes(name.toLowerCase())) throw new Error(`forbidden browser header: ${name}`);
   }
-  const resolverRules = permissions.map(item => `MAP ${item.host} ${item.resolved_ip}`).join(',');
-  const browser = await chromium.launch({
-    headless: true,
-    args: [`--host-resolver-rules=${resolverRules},EXCLUDE localhost`],
-  });
+  const proxy = await startPublicProxy(permissions);
+  let browser = null;
   try {
+    browser = await chromium.launch({
+      headless: true,
+      proxy: { server: proxy.url, bypass: '<-loopback>' },
+    });
     const viewport = request.viewport || { width: 1280, height: 720, device_scale_factor: 1 };
     const context = await browser.newContext({
       viewport: { width: viewport.width, height: viewport.height },
@@ -368,12 +679,15 @@ async function execute(input) {
       locale: request.locale || undefined,
       timezoneId: request.timezone || undefined,
       colorScheme: request.color_scheme === 'no_preference' ? 'no-preference' : (request.color_scheme || undefined),
-      extraHTTPHeaders: headers,
       acceptDownloads: false,
       serviceWorkers: 'block',
     });
     let requestCount = 0;
     let resourceError = null;
+    let headerOrigin = null;
+    let pendingHeaderOrigin = null;
+    let explicitNavigationRequest = null;
+    let navigationCrossedOrigin = false;
     await context.route('**/*', async route => {
       requestCount += 1;
       if (requestCount > 256) {
@@ -381,12 +695,65 @@ async function execute(input) {
         await route.abort('blockedbyclient');
         return;
       }
-      try { await validateNetwork(route.request().url(), permissions); await route.continue(); }
+      try {
+        const browserRequest = route.request();
+        let requestOrigin = null;
+        if (browserRequest.isNavigationRequest()) {
+          await validateNetwork(browserRequest.url(), permissions);
+          requestOrigin = publicHttpUrl(browserRequest.url()).origin;
+          if (browserRequest.frame().parentFrame() === null) {
+            if (pendingHeaderOrigin !== null) {
+              if (requestOrigin === pendingHeaderOrigin) {
+                headerOrigin = pendingHeaderOrigin;
+                explicitNavigationRequest = browserRequest;
+                navigationCrossedOrigin = false;
+              } else {
+                headerOrigin = null;
+                explicitNavigationRequest = null;
+                navigationCrossedOrigin = true;
+              }
+              pendingHeaderOrigin = null;
+            } else if (
+              explicitNavigationRequest !== null &&
+              browserRequest.redirectedFrom() === explicitNavigationRequest
+            ) {
+              explicitNavigationRequest = browserRequest;
+              if (headerOrigin !== null && requestOrigin !== headerOrigin) {
+                navigationCrossedOrigin = true;
+              }
+            } else {
+              headerOrigin = null;
+              explicitNavigationRequest = null;
+              navigationCrossedOrigin = true;
+            }
+          }
+        } else {
+          validateSubresource(browserRequest.url());
+          if (!browserRequest.url().startsWith('data:') && !browserRequest.url().startsWith('blob:')) {
+            requestOrigin = publicHttpUrl(browserRequest.url()).origin;
+          }
+        }
+        const continuedHeaders = { ...await browserRequest.allHeaders() };
+        for (const name of Object.keys(continuedHeaders)) {
+          if (extraHeaderNames.has(name.toLowerCase())) delete continuedHeaders[name];
+        }
+        if (headerOrigin === requestOrigin && !navigationCrossedOrigin) {
+          Object.assign(continuedHeaders, headers);
+        }
+        await route.continue({ headers: continuedHeaders });
+      }
       catch (error) { await route.abort('blockedbyclient'); }
     });
     const page = await context.newPage();
     await page.routeWebSocket('**/*', webSocket => {
-      validateNetwork(webSocket.url(), permissions)
+      let permissionUrl;
+      try {
+        permissionUrl = webSocketPermissionUrl(webSocket.url());
+      } catch (_) {
+        webSocket.close({ code: 1008, reason: 'blocked by browser policy' });
+        return;
+      }
+      validateNetwork(permissionUrl, permissions)
         .then(() => webSocket.connectToServer())
         .catch(() => webSocket.close({ code: 1008, reason: 'blocked by browser policy' }));
     });
@@ -426,10 +793,17 @@ async function execute(input) {
       switch (step.type) {
         case 'navigate':
           permissionFor(step.url, permissions, 'navigate');
+          headerOrigin = null;
+          pendingHeaderOrigin = null;
+          explicitNavigationRequest = null;
+          navigationCrossedOrigin = true;
+          await page.goto('about:blank');
+          pendingHeaderOrigin = publicHttpUrl(step.url).origin;
           await page.goto(step.url, {
             waitUntil: ({ load: 'load', dom_content_loaded: 'domcontentloaded', network_idle: 'networkidle' })[step.wait_until] || 'domcontentloaded',
             timeout,
           });
+          explicitNavigationRequest = null;
           break;
         case 'click':
           permissionFor(page.url(), permissions, 'interact');
@@ -472,7 +846,10 @@ async function execute(input) {
     const result = { final_url: page.url(), title: await page.title(), extracted_text: extractedText, artifacts };
     await context.close();
     process.stdout.write(JSON.stringify(result));
-  } finally { await browser.close(); }
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    await proxy.close();
+  }
 }
 
 let source = '';
@@ -2399,6 +2776,21 @@ mod tests {
         assert_eq!(PLAYWRIGHT_TREE_SHA256.len(), 64);
     }
 
+    #[test]
+    fn worker_forces_loopback_requests_through_the_public_proxy() {
+        assert!(WORKER_SOURCE.contains("proxy: { server: proxy.url, bypass: '<-loopback>' }"));
+        assert!(
+            WORKER_SOURCE
+                .contains("resolvePublicAddress(target.hostname, pinnedAddresses, closingSignal)")
+        );
+        assert!(WORKER_SOURCE.contains("if (parsed.protocol === 'ws:') parsed.protocol = 'http:'"));
+        assert!(
+            WORKER_SOURCE
+                .contains("else if (parsed.protocol === 'wss:') parsed.protocol = 'https:'")
+        );
+        assert!(WORKER_SOURCE.contains("server.on('upgrade', async (request, client, head) =>"));
+    }
+
     #[tokio::test]
     async fn installed_runtime_can_launch_the_embedded_worker() {
         let Ok(home) = browser_home() else {
@@ -2440,10 +2832,16 @@ mod tests {
             runtime,
             inline_worker: Some(WORKER_SOURCE),
         };
+        let smoke_url = env::var("BKMQB_BROWSER_SMOKE_URL")
+            .unwrap_or_else(|_| "https://example.com/".to_owned());
+        let parsed_url = reqwest::Url::parse(&smoke_url).unwrap();
+        let scheme = parsed_url.scheme().to_owned();
+        let host = parsed_url.host_str().unwrap().to_owned();
+        let port = parsed_url.port_or_known_default().unwrap();
         let permission = BrowserPermission {
-            scheme: "https".to_owned(),
-            host: "example.com".to_owned(),
-            port: 443,
+            scheme: scheme.clone(),
+            host: host.clone(),
+            port,
             path_prefixes: std::collections::BTreeSet::from(["/".to_owned()]),
             capabilities: std::collections::BTreeSet::from([
                 "navigate".to_owned(),
@@ -2452,8 +2850,8 @@ mod tests {
         };
         let grants = std::collections::BTreeSet::from([
             "browser.run".to_owned(),
-            "browser.origin.https.example.com:443.navigate".to_owned(),
-            "browser.origin.https.example.com:443.screenshot".to_owned(),
+            format!("browser.origin.{scheme}.{host}:{port}.navigate"),
+            format!("browser.origin.{scheme}.{host}:{port}.screenshot"),
         ]);
         let result = executor
             .execute(
@@ -2462,14 +2860,14 @@ mod tests {
                 &BrowserRun {
                     steps: vec![
                         plugin_api::BrowserStep::Navigate {
-                            url: "https://example.com/".to_owned(),
+                            url: smoke_url,
                             wait_until: plugin_api::BrowserWaitUntil::DomContentLoaded,
                             timeout_ms: 10_000,
                         },
-                        plugin_api::BrowserStep::Wait { duration_ms: 3_000 },
+                        plugin_api::BrowserStep::Wait { duration_ms: 5_000 },
                         plugin_api::BrowserStep::Screenshot {
                             selector: None,
-                            full_page: true,
+                            full_page: false,
                             format: plugin_api::BrowserScreenshotFormat::Png,
                             quality: None,
                         },
@@ -2484,10 +2882,18 @@ mod tests {
             )
             .await
             .unwrap();
-        let (final_url, _, _, artifacts) = result.into_parts();
-        assert_eq!(final_url, "https://example.com/");
+        let (final_url, title, _, artifacts) = result.into_parts();
+        assert_eq!(
+            reqwest::Url::parse(&final_url).unwrap().host_str(),
+            Some(host.as_str())
+        );
         assert_eq!(artifacts.len(), 1);
         assert!(artifacts[0].data().starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(artifacts[0].data().len() > 1_024);
+        eprintln!(
+            "browser smoke captured `{title}` from {final_url} ({} bytes)",
+            artifacts[0].data().len()
+        );
     }
 
     #[cfg(unix)]

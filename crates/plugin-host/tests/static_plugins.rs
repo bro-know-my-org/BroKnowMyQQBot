@@ -68,8 +68,11 @@ impl BrowserExecutor for MockBrowserExecutor {
             request.steps.as_slice(),
             [
                 BrowserStep::Navigate { url, .. },
-                BrowserStep::Wait { duration_ms: 3_000 },
-                BrowserStep::Screenshot { .. },
+                BrowserStep::Wait { duration_ms: 5_000 },
+                BrowserStep::Screenshot {
+                    full_page: false,
+                    ..
+                },
             ] if url == "https://example.com/"
         ));
         BrowserExecution::new(
@@ -421,7 +424,7 @@ async fn browser_screenshot_is_stored_and_replied_as_media() {
     let (action_sender, mut actions) = mpsc::channel(1);
     let adapter = Arc::new(MockAdapter {
         id: AdapterId::new("mock"),
-        event: Mutex::new(Some(message_event("/screenshot https://example.com/"))),
+        event: Mutex::new(Some(message_event("/screenshot example.com/"))),
         actions: action_sender,
         shutdown: shutdown_handle,
         outcome: ActionOutcome::Succeeded,

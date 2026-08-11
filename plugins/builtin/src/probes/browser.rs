@@ -11,6 +11,21 @@ pub struct BrowserProbePlugin {
     manifest: PluginManifest,
 }
 
+fn normalize_screenshot_url(url: &str) -> String {
+    let has_scheme = url.split_once("://").is_some_and(|(scheme, _)| {
+        let mut characters = scheme.chars();
+        matches!(characters.next(), Some(first) if first.is_ascii_alphabetic())
+            && characters.all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            })
+    });
+    if has_scheme {
+        url.to_owned()
+    } else {
+        format!("https://{url}")
+    }
+}
+
 impl Default for BrowserProbePlugin {
     fn default() -> Self {
         let mut manifest = message_plugin_manifest(
@@ -34,6 +49,15 @@ impl Default for BrowserProbePlugin {
             path_prefixes: BTreeSet::from(["/".to_owned()]),
             capabilities: BTreeSet::from(["navigate".to_owned(), "screenshot".to_owned()]),
         });
+        for host in ["bilibili.com", "www.bilibili.com"] {
+            manifest.permissions.browser.push(BrowserPermission {
+                scheme: "https".to_owned(),
+                host: host.to_owned(),
+                port: 443,
+                path_prefixes: BTreeSet::from(["/".to_owned()]),
+                capabilities: BTreeSet::from(["navigate".to_owned(), "screenshot".to_owned()]),
+            });
+        }
         Self { manifest }
     }
 }
@@ -55,17 +79,18 @@ impl StaticPlugin for BrowserProbePlugin {
             else {
                 return Ok(ignored());
             };
+            let url = normalize_screenshot_url(url);
             let request = BrowserRun {
                 steps: vec![
                     BrowserStep::Navigate {
-                        url: url.to_owned(),
+                        url,
                         wait_until: BrowserWaitUntil::DomContentLoaded,
                         timeout_ms: 10_000,
                     },
-                    BrowserStep::Wait { duration_ms: 3_000 },
+                    BrowserStep::Wait { duration_ms: 5_000 },
                     BrowserStep::Screenshot {
                         selector: None,
-                        full_page: true,
+                        full_page: false,
                         format: BrowserScreenshotFormat::Png,
                         quality: None,
                     },
@@ -126,5 +151,22 @@ impl StaticPlugin for BrowserProbePlugin {
             }],
             diagnostics: Vec::new(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_screenshot_url;
+
+    #[test]
+    fn screenshot_url_only_recognizes_a_leading_scheme() {
+        assert_eq!(
+            normalize_screenshot_url("example.com/?next=https://other.example"),
+            "https://example.com/?next=https://other.example"
+        );
+        assert_eq!(
+            normalize_screenshot_url("https://example.com/"),
+            "https://example.com/"
+        );
     }
 }
