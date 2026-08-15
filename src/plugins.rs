@@ -248,11 +248,8 @@ pub(crate) async fn load_plugins(
     }
     let installation_store = store.clone();
     let managed_installations =
-        tokio::task::spawn_blocking(move || installation_store.installations()).await??;
+        tokio::task::spawn_blocking(move || installation_store.enabled_installations()).await??;
     for installation in managed_installations {
-        if !installation.enabled {
-            continue;
-        }
         if is_reserved_bundled_instance_id(&installation.instance_id) {
             return Err(Box::new(PluginConfigError::ReservedInstance(
                 installation.instance_id,
@@ -667,6 +664,7 @@ mod tests {
                 requested_permissions: vec!["message.reply".to_owned()],
                 granted_permissions: vec!["message.reply".to_owned()],
                 config: BTreeMap::new(),
+                admins_explicit: false,
                 enabled: true,
                 installed_at_ms: 1,
                 updated_at_ms: 1,
@@ -698,6 +696,7 @@ mod tests {
                 requested_permissions: vec!["message.reply".to_owned()],
                 granted_permissions: Vec::new(),
                 config: BTreeMap::new(),
+                admins_explicit: false,
                 enabled: false,
                 installed_at_ms: 1,
                 updated_at_ms: 1,
@@ -733,6 +732,7 @@ mod tests {
                 requested_permissions: Vec::new(),
                 granted_permissions: Vec::new(),
                 config: BTreeMap::new(),
+                admins_explicit: false,
                 enabled: true,
                 installed_at_ms: 1,
                 updated_at_ms: 1,
@@ -775,6 +775,7 @@ mod tests {
                 requested_permissions: vec!["message.reply".to_owned()],
                 granted_permissions: vec!["message.reply".to_owned()],
                 config: BTreeMap::new(),
+                admins_explicit: false,
                 enabled: true,
                 installed_at_ms: 1,
                 updated_at_ms: 1,

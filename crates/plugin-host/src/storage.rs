@@ -139,9 +139,15 @@ pub struct PluginInstallation {
     pub requested_permissions: Vec<String>,
     pub granted_permissions: Vec<String>,
     pub config: BTreeMap<String, serde_json::Value>,
+    #[serde(default = "legacy_admins_explicit")]
+    pub admins_explicit: bool,
     pub enabled: bool,
     pub installed_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+const fn legacy_admins_explicit() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +267,7 @@ impl PluginStore {
                 requested_permissions BLOB NOT NULL,
                 granted_permissions BLOB NOT NULL,
                 config BLOB NOT NULL,
+                admins_explicit INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL,
                 installed_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL
@@ -281,6 +288,7 @@ impl PluginStore {
         )?;
         ensure_column(&connection, "plugin_installations", "metadata", "BLOB")?;
         migrate_installation_metadata(&connection)?;
+        migrate_installation_admins_explicit(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -947,8 +955,8 @@ impl PluginStore {
             "INSERT INTO plugin_installations
                 (instance_id, plugin_id, metadata, version, package_path, package_sha256, source,
                  trust_level, signature_status, requested_permissions, granted_permissions,
-                 config, enabled, installed_at_ms, updated_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 config, admins_explicit, enabled, installed_at_ms, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(instance_id) DO UPDATE SET
                 plugin_id = excluded.plugin_id,
                 metadata = excluded.metadata,
@@ -961,6 +969,7 @@ impl PluginStore {
                 requested_permissions = excluded.requested_permissions,
                 granted_permissions = excluded.granted_permissions,
                 config = excluded.config,
+                admins_explicit = excluded.admins_explicit,
                 enabled = excluded.enabled,
                 updated_at_ms = excluded.updated_at_ms",
             params![
@@ -976,6 +985,7 @@ impl PluginStore {
                 serde_json::to_vec(&installation.requested_permissions)?,
                 serde_json::to_vec(&installation.granted_permissions)?,
                 serde_json::to_vec(&installation.config)?,
+                installation.admins_explicit,
                 installation.enabled,
                 installation.installed_at_ms,
                 installation.updated_at_ms,
@@ -999,7 +1009,7 @@ impl PluginStore {
                 "UPDATE plugin_installations SET
                     plugin_id = ?, metadata = ?, version = ?, package_path = ?,
                     package_sha256 = ?, source = ?, trust_level = ?, signature_status = ?,
-                    requested_permissions = ?, granted_permissions = ?, config = ?, enabled = ?,
+                    requested_permissions = ?, granted_permissions = ?, config = ?, admins_explicit = ?, enabled = ?,
                     installed_at_ms = ?, updated_at_ms = ?
                  WHERE instance_id = ? AND updated_at_ms = ? AND ? > updated_at_ms",
                 params![
@@ -1014,6 +1024,7 @@ impl PluginStore {
                     requested,
                     granted,
                     config,
+                    installation.admins_explicit,
                     installation.enabled,
                     installation.installed_at_ms,
                     installation.updated_at_ms,
@@ -1027,8 +1038,8 @@ impl PluginStore {
                 "INSERT OR IGNORE INTO plugin_installations
                     (instance_id, plugin_id, metadata, version, package_path, package_sha256,
                      source, trust_level, signature_status, requested_permissions,
-                     granted_permissions, config, enabled, installed_at_ms, updated_at_ms)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     granted_permissions, config, admins_explicit, enabled, installed_at_ms, updated_at_ms)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     installation.instance_id,
                     installation.plugin_id,
@@ -1042,6 +1053,7 @@ impl PluginStore {
                     requested,
                     granted,
                     config,
+                    installation.admins_explicit,
                     installation.enabled,
                     installation.installed_at_ms,
                     installation.updated_at_ms,
@@ -1059,7 +1071,21 @@ impl PluginStore {
         let mut statement = connection.prepare(
             "SELECT plugin_id, metadata, instance_id, version, package_path, package_sha256, source,
              trust_level, signature_status, requested_permissions, granted_permissions, config,
-             enabled, installed_at_ms, updated_at_ms FROM plugin_installations
+             admins_explicit, enabled, installed_at_ms, updated_at_ms FROM plugin_installations
+             ORDER BY plugin_id, instance_id",
+        )?;
+        let rows = statement.query_map([], installation_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn enabled_installations(&self) -> Result<Vec<PluginInstallation>, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT plugin_id, metadata, instance_id, version, package_path, package_sha256, source,
+             trust_level, signature_status, requested_permissions, granted_permissions, config,
+             admins_explicit, enabled, installed_at_ms, updated_at_ms FROM plugin_installations
+             WHERE enabled = 1
              ORDER BY plugin_id, instance_id",
         )?;
         let rows = statement.query_map([], installation_row)?;
@@ -1076,7 +1102,7 @@ impl PluginStore {
             .query_row(
                 "SELECT plugin_id, metadata, instance_id, version, package_path, package_sha256, source,
                  trust_level, signature_status, requested_permissions, granted_permissions, config,
-                 enabled, installed_at_ms, updated_at_ms FROM plugin_installations
+                 admins_explicit, enabled, installed_at_ms, updated_at_ms FROM plugin_installations
                  WHERE instance_id = ?",
                 [instance_id],
                 installation_row,
@@ -1387,6 +1413,43 @@ fn migrate_installation_metadata(connection: &Connection) -> Result<(), StoreErr
     Ok(())
 }
 
+fn migrate_installation_admins_explicit(connection: &Connection) -> Result<(), StoreError> {
+    let columns = table_columns(connection, "plugin_installations")?;
+    if columns.iter().any(|column| column == "admins_explicit") {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE plugin_installations
+         ADD COLUMN admins_explicit INTEGER NOT NULL DEFAULT 0;",
+    )?;
+    let records = {
+        let mut statement =
+            transaction.prepare("SELECT instance_id, config FROM plugin_installations")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (instance_id, config) in records {
+        // Legacy rows do not record whether `admins` came from global owners or an explicit
+        // plugin override. Preserve every stored value as explicit rather than risk silently
+        // replacing an intentional authorization list; rows without `admins` remain inherited.
+        let explicit = serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(&config)
+            .map_or(true, |config| config.contains_key("admins"));
+        if explicit {
+            transaction.execute(
+                "UPDATE plugin_installations SET admins_explicit = 1 WHERE instance_id = ?",
+                [instance_id],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn table_columns(connection: &Connection, table: &str) -> Result<Vec<String>, StoreError> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     statement
@@ -1433,9 +1496,10 @@ fn installation_row(row: &rusqlite::Row<'_>) -> Result<PluginInstallation, rusql
         requested_permissions: decode_json_column(row, 9)?,
         granted_permissions: decode_json_column(row, 10)?,
         config: decode_json_column(row, 11)?,
-        enabled: row.get(12)?,
-        installed_at_ms: row.get(13)?,
-        updated_at_ms: row.get(14)?,
+        admins_explicit: row.get(12)?,
+        enabled: row.get(13)?,
+        installed_at_ms: row.get(14)?,
+        updated_at_ms: row.get(15)?,
     })
 }
 
@@ -1912,10 +1976,18 @@ mod tests {
             requested_permissions: vec!["message.reply".to_owned()],
             granted_permissions: vec!["message.reply".to_owned()],
             config: BTreeMap::from([("greeting".to_owned(), json!("hello"))]),
+            admins_explicit: false,
             enabled: true,
             installed_at_ms: 1,
             updated_at_ms: 1,
         };
+        let mut legacy_json = serde_json::to_value(&installation).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("admins_explicit");
+        let legacy_installation: PluginInstallation = serde_json::from_value(legacy_json).unwrap();
+        assert!(legacy_installation.admins_explicit);
         store.upsert_installation(&installation).unwrap();
         assert_eq!(
             store.installation(&installation.instance_id).unwrap(),
@@ -1942,6 +2014,42 @@ mod tests {
     }
 
     #[test]
+    fn enabled_installations_skip_malformed_disabled_rows() {
+        let store = PluginStore::in_memory().unwrap();
+        let installation = PluginInstallation {
+            plugin_id: "dev.bkm.disabled".to_owned(),
+            metadata: PluginMetadata::single_locale("en", "Disabled", ""),
+            instance_id: "dev.bkm.disabled/default".to_owned(),
+            version: "0.1.0".to_owned(),
+            package_path: "/tmp/disabled.bkm-plugin".to_owned(),
+            package_sha256: "abc".to_owned(),
+            source: "local".to_owned(),
+            trust_level: "local-wasm".to_owned(),
+            signature_status: "unsigned".to_owned(),
+            requested_permissions: Vec::new(),
+            granted_permissions: Vec::new(),
+            config: BTreeMap::new(),
+            admins_explicit: false,
+            enabled: false,
+            installed_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        store.upsert_installation(&installation).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE plugin_installations SET config = x'ff' WHERE instance_id = ?",
+                [&installation.instance_id],
+            )
+            .unwrap();
+
+        assert!(store.enabled_installations().unwrap().is_empty());
+        assert!(store.installations().is_err());
+    }
+
+    #[test]
     fn conditional_installation_write_rejects_stale_updates() {
         let store = PluginStore::in_memory().unwrap();
         let mut installation = PluginInstallation {
@@ -1957,6 +2065,7 @@ mod tests {
             requested_permissions: Vec::new(),
             granted_permissions: Vec::new(),
             config: BTreeMap::new(),
+            admins_explicit: false,
             enabled: true,
             installed_at_ms: 1,
             updated_at_ms: 1,
@@ -2006,17 +2115,18 @@ mod tests {
                 );",
             )
             .unwrap();
-        connection
-            .execute(
-                "INSERT INTO plugin_installations
+        let insert = "INSERT INTO plugin_installations
                  (instance_id, plugin_id, name, description, version, package_path,
                   package_sha256, source, trust_level, signature_status,
                   requested_permissions, granted_permissions, config, enabled,
                   installed_at_ms, updated_at_ms)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        let insert_legacy = |instance_id: &str, plugin_id: &str, config: &[u8]| {
+            connection.execute(
+                insert,
                 params![
-                    "dev.bkm.migrated/default",
-                    "dev.bkm.migrated",
+                    instance_id,
+                    plugin_id,
                     "Migrated Plugin",
                     "display metadata migration",
                     "1.0.0",
@@ -2027,13 +2137,26 @@ mod tests {
                     "unsigned",
                     b"[]",
                     b"[]",
-                    b"{}",
+                    config,
                     true,
                     1,
                     1,
                 ],
             )
-            .unwrap();
+        };
+        insert_legacy(
+            "dev.bkm.migrated/default",
+            "dev.bkm.migrated",
+            br#"{"admins":["legacy-admin"]}"#,
+        )
+        .unwrap();
+        insert_legacy("dev.bkm.inherited/default", "dev.bkm.inherited", b"{}").unwrap();
+        insert_legacy(
+            "dev.bkm.malformed/default",
+            "dev.bkm.malformed",
+            b"not-json",
+        )
+        .unwrap();
         let store = PluginStore::from_connection(connection).unwrap();
         let installation = store
             .installation("dev.bkm.migrated/default")
@@ -2042,6 +2165,25 @@ mod tests {
         let metadata = installation.metadata.resolve("en").unwrap();
         assert_eq!(metadata.name, "Migrated Plugin");
         assert_eq!(metadata.description, "display metadata migration");
+        assert!(installation.admins_explicit);
+        assert!(
+            !store
+                .installation("dev.bkm.inherited/default")
+                .unwrap()
+                .unwrap()
+                .admins_explicit
+        );
+        let malformed_explicit = store
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT admins_explicit FROM plugin_installations WHERE instance_id = ?",
+                ["dev.bkm.malformed/default"],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(malformed_explicit);
     }
 
     #[test]

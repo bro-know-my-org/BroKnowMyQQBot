@@ -179,11 +179,10 @@ impl MarketplaceIndex {
         selector: &str,
     ) -> Result<&MarketplacePlugin, Box<dyn std::error::Error>> {
         validate_selector(selector)?;
+        let normalized = selector.to_ascii_lowercase();
         self.plugins
             .iter()
-            .find(|plugin| {
-                plugin.slug.eq_ignore_ascii_case(selector) || plugin.plugin_id.as_str() == selector
-            })
+            .find(|plugin| plugin.slug == normalized || plugin.plugin_id.as_str() == selector)
             .ok_or_else(|| format!("plugin `{selector}` was not found in the marketplace").into())
     }
 
@@ -205,7 +204,7 @@ impl MarketplaceIndex {
 }
 
 pub(crate) fn validate_selector(selector: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if valid_slug(selector) || PluginId::new(selector.to_owned()).is_ok() {
+    if valid_slug(&selector.to_ascii_lowercase()) || PluginId::new(selector.to_owned()).is_ok() {
         Ok(())
     } else {
         Err(format!("invalid marketplace plugin selector `{selector}`").into())
@@ -264,7 +263,7 @@ impl MarketplacePlugin {
             )
             .into());
         }
-        if release.2 != self.latest.version && release.2 != format!("v{}", self.latest.version) {
+        if !release_tag_matches_version(&release.2, &self.latest.version) {
             return Err(format!(
                 "marketplace plugin `{}` download tag does not match version `{}`",
                 self.slug, self.latest.version
@@ -471,20 +470,20 @@ fn parse_github_release_url(
         || segments[3] != "download"
         || !valid_github_owner(segments[0])
         || !valid_github_repository(segments[1])
-        || !valid_release_segment(segments[4])
-        || !valid_release_segment(segments[5])
-        || segments[4].eq_ignore_ascii_case("latest")
     {
         return Err(
             "plugin download must be an exact fixed-version github.com Release asset URL".into(),
         );
     }
-    Ok((
-        segments[0].to_owned(),
-        segments[1].to_owned(),
-        segments[4].to_owned(),
-        segments[5].to_owned(),
-    ))
+    let tag = decode_url_segment(segments[4], "plugin release tag")?;
+    let asset = decode_url_segment(segments[5], "plugin release asset")?;
+    if tag.eq_ignore_ascii_case("latest")
+        || !valid_release_tag(&tag)
+        || !valid_release_asset(&asset)
+    {
+        return Err("plugin download must contain a valid fixed release tag and asset name".into());
+    }
+    Ok((segments[0].to_owned(), segments[1].to_owned(), tag, asset))
 }
 
 fn valid_github_owner(value: &str) -> bool {
@@ -503,11 +502,72 @@ fn valid_github_repository(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn valid_release_segment(value: &str) -> bool {
+fn decode_url_segment(value: &str, label: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let Some(encoded) = bytes.get(index + 1..index + 3) else {
+                return Err(format!("{label} contains incomplete percent encoding").into());
+            };
+            let high = hex_digit(encoded[0])
+                .ok_or_else(|| format!("{label} contains invalid percent encoding"))?;
+            let low = hex_digit(encoded[1])
+                .ok_or_else(|| format!("{label} contains invalid percent encoding"))?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| format!("{label} is not UTF-8").into())
+}
+
+const fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn valid_release_tag(value: &str) -> bool {
     (1..=255).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
+        && value != "@"
+        && !value.starts_with('/')
+        && !value.ends_with(['/', '.'])
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains("//")
+        && !value.split('/').any(|component| {
+            component.is_empty()
+                || component.starts_with('.')
+                || component
+                    .rsplit_once('.')
+                    .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("lock"))
+        })
+        && !value.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(character, '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+}
+
+fn valid_release_asset(value: &str) -> bool {
+    (1..=255).contains(&value.len())
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | '?' | '#'))
+}
+
+fn release_tag_matches_version(tag: &str, version: &str) -> bool {
+    tag == version
+        || tag == format!("v{version}")
+        || tag.ends_with(&format!("/{version}"))
+        || tag.ends_with(&format!("/v{version}"))
 }
 
 fn is_github_download_host(host: &str) -> bool {
@@ -572,6 +632,12 @@ mod tests {
         let index: MarketplaceIndex = serde_json::from_str(VALID_INDEX).unwrap();
         index.validate().unwrap();
         assert_eq!(index.find("github-issue").unwrap().latest.version, "0.2.3");
+        assert_eq!(index.find("GitHub-Issue").unwrap().latest.version, "0.2.3");
+        assert!(
+            index
+                .find("IO.GITHUB.BKMQB-COMMUNITY.GITHUB-ISSUE")
+                .is_err()
+        );
         assert_eq!(
             index
                 .find("io.github.bkmqb-community.github-issue")
@@ -581,6 +647,7 @@ mod tests {
         );
         assert_eq!(index.search("message.reply").len(), 1);
         validate_selector("github-issue").unwrap();
+        validate_selector("GitHub-Issue").unwrap();
         validate_selector("io.github.bkmqb-community.github-issue").unwrap();
         assert!(validate_selector("not a selector").is_err());
     }
@@ -591,6 +658,12 @@ mod tests {
         assert!(
             validate_release_url("https://github.com/o/r/releases/latest/download/p.bkm-plugin")
                 .is_err()
+        );
+        assert!(
+            validate_release_url(
+                "https://github.com/o/r/releases/download/%6c%61%74%65%73%74/p.bkm-plugin"
+            )
+            .is_err()
         );
         assert!(
             validate_release_url("http://github.com/o/r/releases/download/v1/p.bkm-plugin")
@@ -634,6 +707,28 @@ mod tests {
             )
             .is_err()
         );
+        let release = parse_github_release_url(
+            "https://github.com/owner/repo/releases/download/release%2Fv1.0.0/plugin%20name.bkm-plugin",
+        )
+        .unwrap();
+        assert_eq!(release.2, "release/v1.0.0");
+        assert_eq!(release.3, "plugin name.bkm-plugin");
+        assert!(release_tag_matches_version(&release.2, "1.0.0"));
+        for invalid in [
+            "release v1.0.0",
+            "release..v1.0.0",
+            "foo~1/v1.0.0",
+            "release:/v1.0.0",
+            ".hidden/v1.0.0",
+            "release.lock/v1.0.0",
+            "release//v1.0.0",
+            "release/v1.0.0.",
+        ] {
+            assert!(
+                !valid_release_tag(invalid),
+                "accepted invalid tag {invalid}"
+            );
+        }
     }
 
     #[test]
