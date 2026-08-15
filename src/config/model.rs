@@ -142,6 +142,7 @@ impl Default for ManagementConfig {
 pub(crate) struct PluginsConfig {
     pub(crate) database: PathBuf,
     pub(crate) installations: Option<PathBuf>,
+    pub(crate) marketplace_url: String,
 }
 
 impl Default for PluginsConfig {
@@ -149,6 +150,7 @@ impl Default for PluginsConfig {
         Self {
             database: PathBuf::from("data/plugins.db"),
             installations: None,
+            marketplace_url: crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
         }
     }
 }

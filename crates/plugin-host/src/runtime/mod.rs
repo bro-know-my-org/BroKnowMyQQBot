@@ -96,6 +96,19 @@ pub enum PluginHostError {
     Store(#[from] StoreError),
 }
 
+/// Validates a plugin configuration without registering or initializing the plugin.
+pub async fn validate_plugin_config(
+    plugin: &dyn StaticPlugin,
+    config: &BTreeMap<String, Value>,
+) -> Result<(), PluginHostError> {
+    let manifest = plugin.manifest();
+    manifest
+        .validate()
+        .map_err(|error| PluginHostError::Manifest(error.to_string()))?;
+    validate_config_schema(plugin, manifest.id.as_str(), config)?;
+    supervised_validate_config(plugin, manifest, config).await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginInstanceState {
     Ready,
@@ -1872,14 +1885,17 @@ fn now_ms() -> i64 {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        sync::{Arc, Mutex as StdMutex},
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use bot_core::MessageTarget;
     use builtin_plugins::PingPlugin;
     use plugin_api::{
-        Disposition, ExtensionPayload, HandlerOutput, HostQueries, PluginCommand, PluginError,
-        PluginEventEnvelope, PluginManifest, StaticPlugin,
+        Disposition, ExtensionPayload, HandlerOutput, HostQueries, InitContext, PluginCommand,
+        PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin,
     };
     use serde_json::{Value, json};
 
@@ -1888,7 +1904,7 @@ mod tests {
     use super::{
         ACTION_COMPLETION_DEPTH_NAMESPACE, InvocationGate, LifecycleState, PluginHostError,
         RegisteredPlugin, StaticPluginHost, validate_config_schema, validate_output,
-        validation::redact_sensitive_fields,
+        validate_plugin_config, validation::redact_sensitive_fields,
     };
 
     #[derive(Debug)]
@@ -1901,6 +1917,41 @@ mod tests {
     struct CompletionRecoveryPlugin {
         manifest: PluginManifest,
         events: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[derive(Debug)]
+    struct InitializationTrackingPlugin {
+        manifest: PluginManifest,
+        init_calls: Arc<AtomicUsize>,
+        validation_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl StaticPlugin for InitializationTrackingPlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        async fn validate_config(
+            &self,
+            _config: &BTreeMap<String, Value>,
+        ) -> Result<(), PluginError> {
+            self.validation_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn init(&self, _context: InitContext) -> Result<(), PluginError> {
+            self.init_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn on_event(
+            &self,
+            _event: &PluginEventEnvelope,
+            _queries: &dyn HostQueries,
+        ) -> Result<HandlerOutput, PluginError> {
+            Ok(HandlerOutput::default())
+        }
     }
 
     #[async_trait::async_trait]
@@ -2003,6 +2054,24 @@ mod tests {
         let error =
             validate_config_schema(&invalid, "dev.bkm.schema/test", &BTreeMap::new()).unwrap_err();
         assert!(matches!(error, PluginHostError::InvalidConfigSchema { .. }));
+    }
+
+    #[tokio::test]
+    async fn standalone_config_validation_calls_validation_without_initializing_the_plugin() {
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let validation_calls = Arc::new(AtomicUsize::new(0));
+        let plugin = InitializationTrackingPlugin {
+            manifest: PingPlugin::default().manifest().clone(),
+            init_calls: init_calls.clone(),
+            validation_calls: validation_calls.clone(),
+        };
+
+        validate_plugin_config(&plugin, &BTreeMap::new())
+            .await
+            .unwrap();
+
+        assert_eq!(validation_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(init_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

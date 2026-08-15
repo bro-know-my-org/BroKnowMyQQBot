@@ -248,6 +248,8 @@ impl BotConfig {
             validate_management_config(&self.management)?;
         }
         validate_listener_conflicts(self)?;
+        crate::plugin_marketplace::validate_index_url(&self.plugins.marketplace_url)
+            .map_err(ConfigError::InvalidValue)?;
         if self.logging.console.filter.trim().is_empty() {
             return Err(ConfigError::InvalidValue(
                 "logging.console.filter must not be empty".to_owned(),
@@ -920,6 +922,7 @@ mod tests {
                 [plugins]
                 database = "state/plugins.db"
                 installations = "plugins.toml"
+                marketplace_url = "https://example.github.io/marketplace/index.json"
 
                 [logging.console]
                 enabled = true
@@ -945,6 +948,10 @@ mod tests {
         assert_eq!(config.runtime.dedup_capacity, 2048);
         assert!(config.management.enabled);
         assert_eq!(config.plugins.database, PathBuf::from("state/plugins.db"));
+        assert_eq!(
+            config.plugins.marketplace_url,
+            "https://example.github.io/marketplace/index.json"
+        );
         assert!(config.logging.console.message_content);
         assert!(config.logging.files.message_content);
         assert_eq!(BotConfig::default().logging.console.language, "en");
@@ -958,6 +965,9 @@ mod tests {
         assert!(config.validate().is_err());
         let mut config = BotConfig::default();
         config.logging.console.language = "fr".to_owned();
+        assert!(config.validate().is_err());
+        let mut config = BotConfig::default();
+        config.plugins.marketplace_url = "http://example.com/index.json".to_owned();
         assert!(config.validate().is_err());
     }
 

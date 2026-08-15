@@ -9,6 +9,7 @@ mod config;
 mod logging;
 mod management;
 mod plugin_dev;
+mod plugin_marketplace;
 mod plugins;
 
 use std::process::ExitCode;
@@ -36,7 +37,7 @@ async fn main() -> ExitCode {
     match cli::run(arguments).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("bkmqb failed: {error}");
+            eprintln!("bkmqb failed: {}", cli::terminal_safe(&error.to_string()));
             ExitCode::FAILURE
         }
     }

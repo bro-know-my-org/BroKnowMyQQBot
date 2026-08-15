@@ -39,6 +39,7 @@ listen = "127.0.0.1:9090"
 [plugins]
 database = "data/plugins.db"
 # installations = "config/plugins.toml"
+marketplace_url = "https://bkmqb-plugins.github.io/marketplace/index.json"
 
 [logging.console]
 enabled = true

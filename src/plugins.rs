@@ -19,6 +19,20 @@ use builtin_plugins::{
 use plugin_host::{PluginStore, StaticPluginHost, ValidatedPluginPackage, WasmPlugin};
 
 const MAX_INSTALLATION_FILE_BYTES: usize = 1024 * 1024;
+const MAX_CONFIGURED_OWNERS: usize = 32;
+const BUNDLED_PLUGIN_INSTANCES: &[(&str, &str)] = &[
+    ("ping", "dev.bkm.ping/default"),
+    ("help", "dev.bkm.help/default"),
+    ("echo", "dev.bkm.echo/default"),
+    ("counter", "dev.bkm.counter/default"),
+    ("admin", "dev.bkm.admin/default"),
+    ("reminder", "dev.bkm.reminder/default"),
+    ("http-probe", "dev.bkm.http-probe/default"),
+    ("browser-probe", "dev.bkm.browser-probe/default"),
+    ("scheduler-probe", "dev.bkm.scheduler-probe/default"),
+    ("qq-extension-probe", "dev.bkm.qq-extension-probe/default"),
+    ("active-send-probe", "dev.bkm.active-send-probe/default"),
+];
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +93,74 @@ impl PluginInstallations {
     }
 }
 
+pub(crate) fn global_administrator_ids(
+    installation_file: Option<&Path>,
+) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
+    let installations = installation_file.map_or_else(
+        || Ok(PluginInstallations::default()),
+        PluginInstallations::from_path,
+    )?;
+    let mut administrators = BTreeSet::new();
+    if let Some(owners) = installations
+        .bundled_config
+        .get("admin")
+        .and_then(|config| config.get("owners"))
+    {
+        let owners = owners
+            .as_array()
+            .ok_or("bundled admin `owners` must be an array")?;
+        if owners.is_empty() || owners.len() > MAX_CONFIGURED_OWNERS {
+            return Err(format!(
+                "bundled admin `owners` must contain 1..={MAX_CONFIGURED_OWNERS} identities"
+            )
+            .into());
+        }
+        for owner in owners {
+            let owner = owner
+                .as_str()
+                .ok_or("bundled admin `owners` entries must be strings")?;
+            if !valid_administrator_identity(owner) {
+                return Err("bundled admin `owners` contains an invalid identity".into());
+            }
+            if !administrators.insert(owner.to_owned()) {
+                return Err("bundled admin `owners` contains duplicate identities".into());
+            }
+        }
+    }
+    Ok(administrators)
+}
+
+fn valid_administrator_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 124
+        && !value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{00ad}'
+                        | '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{2028}'
+                        | '\u{2029}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+        })
+}
+
+pub(crate) fn is_reserved_bundled_instance_id(instance_id: &str) -> bool {
+    BUNDLED_PLUGIN_INSTANCES
+        .iter()
+        .any(|(_, bundled_instance_id)| *bundled_instance_id == instance_id)
+}
+
+fn bundled_plugin_instance_id(name: &str) -> Option<&'static str> {
+    BUNDLED_PLUGIN_INSTANCES
+        .iter()
+        .find_map(|(bundled_name, instance_id)| (*bundled_name == name).then_some(*instance_id))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WasmPluginInstallation {
@@ -131,6 +213,11 @@ pub(crate) async fn load_plugins(
             );
             continue;
         }
+        if is_reserved_bundled_instance_id(&installation.instance_id) {
+            return Err(Box::new(PluginConfigError::ReservedInstance(
+                installation.instance_id,
+            )));
+        }
         if !declared_instances.insert(installation.instance_id.clone()) {
             return Err(Box::new(PluginConfigError::DuplicateInstance(
                 installation.instance_id,
@@ -165,6 +252,11 @@ pub(crate) async fn load_plugins(
     for installation in managed_installations {
         if !installation.enabled {
             continue;
+        }
+        if is_reserved_bundled_instance_id(&installation.instance_id) {
+            return Err(Box::new(PluginConfigError::ReservedInstance(
+                installation.instance_id,
+            )));
         }
         if !declared_instances.insert(installation.instance_id.clone()) {
             return Err(Box::new(PluginConfigError::DuplicateInstance(
@@ -240,55 +332,27 @@ async fn register_bundled_plugins(
         if !seen.insert(name.clone()) {
             return Err(Box::new(PluginConfigError::DuplicateBundled(name)));
         }
+        let Some(instance_id) = bundled_plugin_instance_id(&name) else {
+            return Err(Box::new(PluginConfigError::UnknownBundled(name)));
+        };
         if name == "help" {
             include_help = true;
-            instance_ids.insert("dev.bkm.help/default".to_owned());
+            instance_ids.insert(instance_id.to_owned());
             continue;
         }
-        let (plugin, instance_id): (std::sync::Arc<dyn plugin_api::StaticPlugin>, &str) =
-            match name.as_str() {
-                "ping" => (
-                    std::sync::Arc::new(PingPlugin::default()),
-                    "dev.bkm.ping/default",
-                ),
-                "echo" => (
-                    std::sync::Arc::new(EchoPlugin::default()),
-                    "dev.bkm.echo/default",
-                ),
-                "counter" => (
-                    std::sync::Arc::new(CounterPlugin::default()),
-                    "dev.bkm.counter/default",
-                ),
-                "admin" => (
-                    std::sync::Arc::new(AdminPlugin::default()),
-                    "dev.bkm.admin/default",
-                ),
-                "reminder" => (
-                    std::sync::Arc::new(ReminderPlugin::default()),
-                    "dev.bkm.reminder/default",
-                ),
-                "http-probe" => (
-                    std::sync::Arc::new(HttpProbePlugin::default()),
-                    "dev.bkm.http-probe/default",
-                ),
-                "browser-probe" => (
-                    std::sync::Arc::new(BrowserProbePlugin::default()),
-                    "dev.bkm.browser-probe/default",
-                ),
-                "scheduler-probe" => (
-                    std::sync::Arc::new(SchedulerProbePlugin::default()),
-                    "dev.bkm.scheduler-probe/default",
-                ),
-                "qq-extension-probe" => (
-                    std::sync::Arc::new(QqExtensionProbePlugin::default()),
-                    "dev.bkm.qq-extension-probe/default",
-                ),
-                "active-send-probe" => (
-                    std::sync::Arc::new(ActiveSendProbePlugin::default()),
-                    "dev.bkm.active-send-probe/default",
-                ),
-                _ => return Err(Box::new(PluginConfigError::UnknownBundled(name))),
-            };
+        let plugin: std::sync::Arc<dyn plugin_api::StaticPlugin> = match name.as_str() {
+            "ping" => std::sync::Arc::new(PingPlugin::default()),
+            "echo" => std::sync::Arc::new(EchoPlugin::default()),
+            "counter" => std::sync::Arc::new(CounterPlugin::default()),
+            "admin" => std::sync::Arc::new(AdminPlugin::default()),
+            "reminder" => std::sync::Arc::new(ReminderPlugin::default()),
+            "http-probe" => std::sync::Arc::new(HttpProbePlugin::default()),
+            "browser-probe" => std::sync::Arc::new(BrowserProbePlugin::default()),
+            "scheduler-probe" => std::sync::Arc::new(SchedulerProbePlugin::default()),
+            "qq-extension-probe" => std::sync::Arc::new(QqExtensionProbePlugin::default()),
+            "active-send-probe" => std::sync::Arc::new(ActiveSendProbePlugin::default()),
+            _ => return Err(Box::new(PluginConfigError::UnknownBundled(name))),
+        };
         plugins
             .register_trusted(
                 plugin,
@@ -309,6 +373,8 @@ enum PluginConfigError {
     DuplicateBundled(String),
     #[error("plugin instance `{0}` is declared by more than one installation source")]
     DuplicateInstance(String),
+    #[error("plugin instance `{0}` is reserved for a bundled plugin")]
+    ReservedInstance(String),
     #[error("installed plugin package `{path}` changed: expected SHA-256 {expected}, got {actual}")]
     PackageHashChanged {
         path: PathBuf,
@@ -392,6 +458,58 @@ mod tests {
             installation.resolved_package(Path::new("/srv/bkm/plugins.toml")),
             Path::new("/srv/bkm/plugins/example.bkm-plugin")
         );
+    }
+
+    #[test]
+    fn global_administrators_include_configured_owners() {
+        let directory = TestDirectory::new();
+        let installation_file = directory.0.join("plugins.toml");
+        fs::write(
+            &installation_file,
+            r#"
+                bundled = ["ping"]
+
+                [bundled_config.admin]
+                owners = ["owner-1", "owner-2"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            global_administrator_ids(Some(&installation_file)).unwrap(),
+            BTreeSet::from(["owner-1".to_owned(), "owner-2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn global_administrators_reject_malformed_configured_owners() {
+        let directory = TestDirectory::new();
+        let installation_file = directory.0.join("plugins.toml");
+        fs::write(
+            &installation_file,
+            r#"
+                [bundled_config.admin]
+                owners = "owner-1"
+            "#,
+        )
+        .unwrap();
+        assert!(global_administrator_ids(Some(&installation_file)).is_err());
+
+        fs::write(
+            &installation_file,
+            r#"
+                [bundled_config.admin]
+                owners = ["owner-1", "owner-1"]
+            "#,
+        )
+        .unwrap();
+        assert!(global_administrator_ids(Some(&installation_file)).is_err());
+
+        fs::write(
+            &installation_file,
+            "[bundled_config.admin]\nowners = [\"owner\\u{202e}spoof\"]\n",
+        )
+        .unwrap();
+        assert!(global_administrator_ids(Some(&installation_file)).is_err());
     }
 
     #[tokio::test]
@@ -498,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_instance_id_conflict_is_rejected_before_package_loading() {
+    async fn reserved_bundled_instance_id_is_rejected_before_package_loading() {
         let directory = TestDirectory::new();
         let installation_file = directory.0.join("plugins.toml");
         fs::write(
@@ -517,11 +635,7 @@ mod tests {
         let error = load_plugins(&mut plugins, &store, Some(&installation_file))
             .await
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("more than one installation source")
-        );
+        assert!(error.to_string().contains("reserved for a bundled plugin"));
     }
 
     #[tokio::test]
@@ -561,6 +675,74 @@ mod tests {
         let mut plugins = StaticPluginHost::new(store.clone());
         let error = load_plugins(&mut plugins, &store, None).await.unwrap_err();
         assert!(error.to_string().contains("changed"));
+    }
+
+    #[tokio::test]
+    async fn disabled_managed_installation_does_not_block_startup() {
+        let store = plugin_host::PluginStore::in_memory().unwrap();
+        store
+            .upsert_installation(&plugin_host::PluginInstallation {
+                plugin_id: "dev.bkm.incomplete".to_owned(),
+                metadata: plugin_api::PluginMetadata::single_locale(
+                    "en",
+                    "Incomplete",
+                    "Incomplete plugin",
+                ),
+                instance_id: "dev.bkm.incomplete/default".to_owned(),
+                version: "0.1.0".to_owned(),
+                package_path: "/missing/incomplete.bkm-plugin".to_owned(),
+                package_sha256: "missing".to_owned(),
+                source: "marketplace".to_owned(),
+                trust_level: "local-wasm".to_owned(),
+                signature_status: "unsigned".to_owned(),
+                requested_permissions: vec!["message.reply".to_owned()],
+                granted_permissions: Vec::new(),
+                config: BTreeMap::new(),
+                enabled: false,
+                installed_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        let mut plugins = StaticPluginHost::new(store.clone());
+        load_plugins(&mut plugins, &store, None).await.unwrap();
+        assert!(
+            plugins
+                .instance_manifest("dev.bkm.incomplete/default")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_installation_cannot_claim_a_bundled_instance_id() {
+        let store = plugin_host::PluginStore::in_memory().unwrap();
+        store
+            .upsert_installation(&plugin_host::PluginInstallation {
+                plugin_id: "dev.example.impostor".to_owned(),
+                metadata: plugin_api::PluginMetadata::single_locale(
+                    "en",
+                    "Impostor",
+                    "Impostor plugin",
+                ),
+                instance_id: "dev.bkm.admin/default".to_owned(),
+                version: "0.1.0".to_owned(),
+                package_path: "/missing/impostor.bkm-plugin".to_owned(),
+                package_sha256: "missing".to_owned(),
+                source: "marketplace".to_owned(),
+                trust_level: "local-wasm".to_owned(),
+                signature_status: "unsigned".to_owned(),
+                requested_permissions: Vec::new(),
+                granted_permissions: Vec::new(),
+                config: BTreeMap::new(),
+                enabled: true,
+                installed_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        let mut plugins = StaticPluginHost::new(store.clone());
+
+        let error = load_plugins(&mut plugins, &store, None).await.unwrap_err();
+
+        assert!(error.to_string().contains("reserved for a bundled plugin"));
     }
 
     #[tokio::test]
