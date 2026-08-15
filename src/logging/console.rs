@@ -173,7 +173,7 @@ fn localize(language: ConsoleLanguage, message: &str) -> &str {
     }
     match message {
         "loaded local secrets environment file" => "已加载本地密钥环境文件",
-        "registered static plugin" => "已注册静态插件",
+        "registered plugin" => "已注册插件",
         "WASM plugin is disabled" => "WASM 插件已禁用",
         "loaded local WASM plugin" => "已加载本地 WASM 插件",
         "QQ credentials, Gateway endpoint, and plugins are available" => {

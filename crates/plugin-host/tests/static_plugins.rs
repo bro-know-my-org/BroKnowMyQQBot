@@ -608,7 +608,7 @@ async fn http_probe_uses_host_executor_and_receives_success() {
 #[tokio::test]
 async fn http_probe_rejects_ip_literal_before_network_access() {
     let (action, state) = run_http_probe(
-        Arc::new(SecureHttpExecutor),
+        Arc::new(SecureHttpExecutor::default()),
         BTreeMap::from([(
             "url".to_owned(),
             Value::String("https://169.254.169.254/latest/meta-data/".to_owned()),

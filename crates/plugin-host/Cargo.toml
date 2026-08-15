@@ -20,6 +20,8 @@ jsonschema.workspace = true
 plugin-api = { path = "../plugin-api" }
 reqwest.workspace = true
 rusqlite.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

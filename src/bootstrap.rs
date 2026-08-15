@@ -23,7 +23,7 @@ use adapter_qqbot::{QqWebSocketAdapter, QqWebSocketConfig, QqWebhookAdapter, QqW
 use bot_core::{
     Adapter, MemoryDedupStore, Runtime, RuntimeBuilder, RuntimeObserver, shutdown_channel,
 };
-use plugin_host::{PluginStore, StaticPluginHost};
+use plugin_host::{PluginStore, SecureHttpExecutor, StaticPluginHost};
 use qqbot_protocol::{Intents, OpenApiClient, OpenApiEnvironment, TokenManager};
 use secrecy::SecretString;
 use thiserror::Error;
@@ -82,7 +82,8 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(parent)?;
     }
     let plugin_store = PluginStore::open(plugin_db)?;
-    let mut plugins = StaticPluginHost::new(plugin_store.clone());
+    let mut plugins = StaticPluginHost::new(plugin_store.clone())
+        .with_http_executor(Arc::new(SecureHttpExecutor::from_environment()?));
     if let Some(executor) = discover_browser_executor().await {
         plugins = plugins.with_browser_executor(Arc::new(executor));
     }

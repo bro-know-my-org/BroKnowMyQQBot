@@ -30,6 +30,7 @@ impl Default for HttpProbePlugin {
             port: 443,
             methods: BTreeSet::from(["GET".to_owned()]),
             path_prefixes: BTreeSet::from(["/".to_owned()]),
+            credential: None,
         });
         Self { manifest }
     }

@@ -16,6 +16,8 @@ const MAX_PLUGIN_TIMEOUT_MS: u64 = 30_000;
 const MAX_PLUGIN_MEMORY_MB: u32 = 256;
 const MAX_PLUGIN_FUEL: u64 = 1_000_000_000_000;
 const MAX_STORAGE_QUOTA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_HTTP_PERMISSIONS: usize = 32;
+const MAX_HTTP_PATH_PREFIXES: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -77,13 +79,15 @@ impl PluginManifest {
         let uses_bpp_1_1 = !self.permissions.browser.is_empty()
             || self
                 .permissions
+                .http
+                .iter()
+                .any(|permission| permission.credential.is_some())
+            || self
+                .permissions
                 .actions
                 .iter()
                 .any(|action| matches!(action.as_str(), "media.reply" | "media.send"));
-        if uses_bpp_1_1
-            && (requirement.matches(&Version::new(1, 0, 0))
-                || requirement.matches(&Version::new(1, 0, u64::MAX)))
-        {
+        if uses_bpp_1_1 && requirement_matches_bpp_1_0(&requirement) {
             return Err(ManifestError::FeatureRequiresProtocol11);
         }
         if self.runtime.max_concurrency == 0 {
@@ -135,9 +139,7 @@ impl PluginManifest {
                 }
             }
         }
-        for permission in &self.permissions.http {
-            permission.validate()?;
-        }
+        validate_http_permissions(&self.permissions.http)?;
         for permission in &self.permissions.browser {
             permission.validate()?;
         }
@@ -153,6 +155,12 @@ impl PluginManifest {
         if !self.permissions.http.is_empty() {
             capabilities.insert("http.request".to_owned());
             capabilities.extend(self.permissions.http.iter().map(HttpPermission::capability));
+            capabilities.extend(
+                self.permissions
+                    .http
+                    .iter()
+                    .filter_map(HttpPermission::credential_capability),
+            );
         }
         if !self.permissions.browser.is_empty() {
             capabilities.insert("browser.run".to_owned());
@@ -181,6 +189,44 @@ impl PluginManifest {
         );
         capabilities
     }
+}
+
+fn requirement_matches_bpp_1_0(requirement: &VersionReq) -> bool {
+    let mut candidate_patches = BTreeSet::from([0, u64::MAX]);
+    for comparator in &requirement.comparators {
+        if comparator.major == 1
+            && comparator.minor.is_none_or(|minor| minor == 0)
+            && let Some(patch) = comparator.patch
+        {
+            candidate_patches.insert(patch);
+            candidate_patches.insert(patch.saturating_sub(1));
+            candidate_patches.insert(patch.saturating_add(1));
+        }
+    }
+    candidate_patches
+        .into_iter()
+        .any(|patch| requirement.matches(&Version::new(1, 0, patch)))
+}
+
+fn validate_http_permissions(permissions: &[HttpPermission]) -> Result<(), ManifestError> {
+    if permissions.len() > MAX_HTTP_PERMISSIONS {
+        return Err(ManifestError::InvalidHttpPermission(format!(
+            "a manifest may declare at most {MAX_HTTP_PERMISSIONS} HTTP permissions"
+        )));
+    }
+    for permission in permissions {
+        permission.validate()?;
+    }
+    for (index, permission) in permissions.iter().enumerate() {
+        for other in &permissions[index + 1..] {
+            if http_permissions_have_credential_conflict(permission, other) {
+                return Err(ManifestError::InvalidHttpPermission(
+                    "overlapping HTTP permissions must use the same named credential".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -520,6 +566,8 @@ pub struct HttpPermission {
     pub methods: BTreeSet<String>,
     #[serde(default = "default_http_path_prefixes")]
     pub path_prefixes: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 impl HttpPermission {
@@ -527,7 +575,18 @@ impl HttpPermission {
         format!("http.host.{}:{}", self.host, self.port)
     }
 
+    pub fn credential_capability(&self) -> Option<String> {
+        self.credential
+            .as_ref()
+            .map(|name| format!("http.credential.{name}"))
+    }
+
     fn validate(&self) -> Result<(), ManifestError> {
+        if self.path_prefixes.len() > MAX_HTTP_PATH_PREFIXES {
+            return Err(ManifestError::InvalidHttpPermission(format!(
+                "an HTTP permission may declare at most {MAX_HTTP_PATH_PREFIXES} path prefixes"
+            )));
+        }
         validate_public_host_and_paths(&self.host, self.port, &self.path_prefixes)
             .map_err(ManifestError::InvalidHttpPermission)?;
         if self.methods.is_empty()
@@ -542,8 +601,48 @@ impl HttpPermission {
                 "methods must use supported uppercase HTTP methods".to_owned(),
             ));
         }
+        if self
+            .credential
+            .as_ref()
+            .is_some_and(|name| !is_valid_http_credential_name(name))
+        {
+            return Err(ManifestError::InvalidHttpPermission(
+                "credential must match [a-z0-9][a-z0-9_]{0,63} and must not end with `_`"
+                    .to_owned(),
+            ));
+        }
         Ok(())
     }
+}
+
+#[must_use]
+pub fn is_valid_http_credential_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('_')
+        && !name.ends_with('_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn http_permissions_have_credential_conflict(
+    permission: &HttpPermission,
+    other: &HttpPermission,
+) -> bool {
+    permission.host == other.host
+        && permission.port == other.port
+        && permission.credential != other.credential
+        && permission
+            .methods
+            .iter()
+            .any(|method| other.methods.contains(method))
+        && permission.path_prefixes.iter().any(|prefix| {
+            other.path_prefixes.iter().any(|other_prefix| {
+                url_path_matches_prefix(prefix, other_prefix)
+                    || url_path_matches_prefix(other_prefix, prefix)
+            })
+        })
 }
 
 fn validate_public_host_and_paths(
@@ -635,7 +734,9 @@ pub enum ManifestError {
     ProtocolRequirement(#[source] semver::Error),
     #[error("plugin requires BPP `{required}`, host provides `{host}`")]
     IncompatibleProtocol { required: String, host: String },
-    #[error("browser and media capabilities require a protocol range that excludes BPP 1.0")]
+    #[error(
+        "browser, media, and named HTTP credential capabilities require a protocol range that excludes BPP 1.0"
+    )]
     FeatureRequiresProtocol11,
     #[error("plugin max_concurrency must be greater than zero")]
     ZeroConcurrency,
@@ -672,8 +773,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        BrowserPermission, LocalizedPluginMetadata, ManifestError, PluginManifest, PluginMetadata,
-        is_canonical_locale, url_path_matches_prefix,
+        BrowserPermission, HttpPermission, LocalizedPluginMetadata, ManifestError, PluginManifest,
+        PluginMetadata, is_canonical_locale, is_valid_http_credential_name,
+        url_path_matches_prefix,
     };
 
     #[test]
@@ -1079,5 +1181,154 @@ mod tests {
 
         let long_description = PluginMetadata::single_locale("en", "Example", "x".repeat(4097));
         assert!(long_description.validate().is_err());
+    }
+
+    #[test]
+    fn named_http_credentials_are_requested_as_separate_capabilities() {
+        let manifest = PluginManifest::from_toml(
+            r#"
+manifest_version = 1
+id = "io.github.example.issues"
+version = "0.1.0"
+protocol = ">=1.1,<2.0"
+entry = "component.wasm"
+
+[metadata]
+default_locale = "en"
+[metadata.locales.en]
+name = "Issues"
+description = "Creates issues"
+
+[[permissions.http]]
+host = "api.github.com"
+methods = ["POST"]
+path_prefixes = ["/repos/"]
+credential = "github_issue"
+"#,
+        )
+        .unwrap();
+        let capabilities = manifest.requested_capabilities();
+        assert!(capabilities.contains("http.request"));
+        assert!(capabilities.contains("http.host.api.github.com:443"));
+        assert!(capabilities.contains("http.credential.github_issue"));
+    }
+
+    #[test]
+    fn named_http_credentials_enforce_identifier_boundaries_and_optional_omission() {
+        assert!(is_valid_http_credential_name("a"));
+        assert!(is_valid_http_credential_name(&"a".repeat(64)));
+        for invalid in [
+            String::new(),
+            "_leading".to_owned(),
+            "trailing_".to_owned(),
+            "UPPERCASE".to_owned(),
+            "with-dash".to_owned(),
+            "a".repeat(65),
+        ] {
+            assert!(!is_valid_http_credential_name(&invalid));
+        }
+
+        let omitted: HttpPermission = toml::from_str(
+            r#"
+host = "api.github.com"
+methods = ["GET"]
+path_prefixes = ["/"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(omitted.credential, None);
+        omitted.validate().unwrap();
+    }
+
+    #[test]
+    fn named_http_credentials_require_bpp_1_1() {
+        let source = r#"
+manifest_version = 1
+id = "io.github.example.old-credential"
+version = "0.1.0"
+protocol = "PROTOCOL_REQUIREMENT"
+entry = "component.wasm"
+
+[metadata]
+default_locale = "en"
+[metadata.locales.en]
+name = "Old Credential"
+
+[[permissions.http]]
+host = "api.github.com"
+methods = ["POST"]
+path_prefixes = ["/repos/"]
+credential = "github_issue"
+"#;
+        for requirement in [">=1.0,<2.0", ">=1.0.1,<=1.1.0"] {
+            let error =
+                PluginManifest::from_toml(&source.replace("PROTOCOL_REQUIREMENT", requirement))
+                    .unwrap_err();
+            assert!(matches!(error, ManifestError::FeatureRequiresProtocol11));
+        }
+    }
+
+    #[test]
+    fn http_permission_and_path_prefix_counts_are_bounded() {
+        let mut manifest = PluginManifest::from_toml(
+            r#"
+manifest_version = 1
+id = "io.github.example.bounded"
+version = "0.1.0"
+protocol = ">=1.0,<2.0"
+entry = "component.wasm"
+
+[metadata]
+default_locale = "en"
+[metadata.locales.en]
+name = "Bounded"
+"#,
+        )
+        .unwrap();
+        let permission = HttpPermission {
+            host: "api.github.com".to_owned(),
+            port: 443,
+            methods: BTreeSet::from(["GET".to_owned()]),
+            path_prefixes: BTreeSet::from(["/".to_owned()]),
+            credential: None,
+        };
+        manifest.permissions.http = vec![permission.clone(); 33];
+        assert!(manifest.validate().is_err());
+
+        let mut too_many_paths = permission;
+        too_many_paths.path_prefixes = (0..33).map(|index| format!("/path-{index}")).collect();
+        assert!(too_many_paths.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_overlapping_http_permissions_with_different_credentials() {
+        let error = PluginManifest::from_toml(
+            r#"
+manifest_version = 1
+id = "io.github.example.ambiguous"
+version = "0.1.0"
+protocol = ">=1.1,<2.0"
+entry = "component.wasm"
+
+[metadata]
+default_locale = "en"
+[metadata.locales.en]
+name = "Ambiguous"
+
+[[permissions.http]]
+host = "api.github.com"
+methods = ["POST"]
+path_prefixes = ["/repos/"]
+credential = "github_issue"
+
+[[permissions.http]]
+host = "api.github.com"
+methods = ["POST"]
+path_prefixes = ["/repos/example/"]
+credential = "other_token"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("overlapping HTTP permissions"));
     }
 }

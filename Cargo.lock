@@ -1840,6 +1840,7 @@ dependencies = [
  "plugin-fixtures",
  "reqwest",
  "rusqlite",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1850,6 +1851,7 @@ dependencies = [
  "uuid",
  "wasmparser 0.254.0",
  "wasmtime",
+ "zeroize",
  "zip",
 ]
 

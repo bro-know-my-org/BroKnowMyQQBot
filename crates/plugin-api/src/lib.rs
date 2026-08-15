@@ -10,7 +10,7 @@ pub use id::{PluginId, PluginIdError};
 pub use manifest::{
     BrowserPermission, CommandDeclaration, HttpPermission, LocalizedPluginMetadata, ManifestError,
     PluginManifest, PluginMetadata, PluginPermissions, PluginRuntimeConfig, RuntimeMode,
-    StoragePermission, Subscription, url_path_matches_prefix,
+    StoragePermission, Subscription, is_valid_http_credential_name, url_path_matches_prefix,
 };
 pub use protocol::{
     ActionCompleted, ActionStatus, AssetReference, BrowserColorScheme, BrowserRun,

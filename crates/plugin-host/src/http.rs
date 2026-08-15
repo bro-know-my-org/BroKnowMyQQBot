@@ -2,29 +2,37 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
 use async_trait::async_trait;
-use plugin_api::{HttpPermission, HttpRequest, HttpResponse, url_path_matches_prefix};
+use plugin_api::{
+    HttpPermission, HttpRequest, HttpResponse, is_valid_http_credential_name,
+    url_path_matches_prefix,
+};
 use reqwest::{
     Method,
-    header::{HeaderName, HeaderValue, LOCATION},
+    header::{AUTHORIZATION, HeaderName, HeaderValue, LOCATION},
     redirect::Policy,
 };
+use secrecy::{ExposeSecret as _, SecretString};
 use thiserror::Error;
 use tokio::net::lookup_host;
 use url::{Host, Url};
+use zeroize::Zeroizing;
 
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 const MAX_REQUEST_HEADERS: usize = 64;
 const MAX_REQUEST_HEADER_BYTES: usize = 32 * 1024;
+const MAX_BEARER_CREDENTIAL_BYTES: usize = 8 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 15_000;
 const MAX_REDIRECTS: usize = 3;
 const MAX_RESPONSE_HEADERS: usize = 64;
 const MAX_RESPONSE_HEADER_BYTES: usize = 32 * 1024;
+const HTTP_BEARER_ENV_PREFIX: &str = "BKMQB_PLUGIN_HTTP_BEARER_";
 
 #[derive(Debug, Error)]
 pub enum HttpExecutionError {
@@ -52,8 +60,72 @@ pub trait HttpExecutor: Send + Sync + 'static {
     ) -> Result<HttpResponse, HttpExecutionError>;
 }
 
-#[derive(Debug, Default)]
-pub struct SecureHttpExecutor;
+#[derive(Default)]
+pub struct SecureHttpExecutor {
+    bearer_credentials: BTreeMap<String, SecretString>,
+}
+
+impl std::fmt::Debug for SecureHttpExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecureHttpExecutor")
+            .field("bearer_credential_count", &self.bearer_credentials.len())
+            .finish()
+    }
+}
+
+impl SecureHttpExecutor {
+    pub fn from_environment() -> Result<Self, HttpExecutionError> {
+        let mut bearer_credentials = BTreeMap::new();
+        for (raw_name, raw_value) in env::vars_os() {
+            let Some(name) = raw_name.to_str() else {
+                continue;
+            };
+            let Some(suffix) = name.strip_prefix(HTTP_BEARER_ENV_PREFIX) else {
+                continue;
+            };
+            let credential = suffix.to_ascii_lowercase();
+            if suffix.is_empty()
+                || suffix.bytes().any(|byte| {
+                    !byte.is_ascii_uppercase() && !byte.is_ascii_digit() && byte != b'_'
+                })
+                || !is_valid_http_credential_name(&credential)
+            {
+                return Err(HttpExecutionError::InvalidRequest(format!(
+                    "environment variable `{name}` has an invalid named HTTP credential suffix"
+                )));
+            }
+            let value_bytes = Zeroizing::new(raw_value.into_encoded_bytes());
+            let value = std::str::from_utf8(&value_bytes).map_err(|_| {
+                HttpExecutionError::InvalidRequest(format!(
+                    "environment variable `{name}` is not valid Unicode"
+                ))
+            })?;
+            validate_bearer_credential_value(&credential, value)?;
+            bearer_credentials.insert(
+                credential,
+                SecretString::from(value.to_owned().into_boxed_str()),
+            );
+        }
+        Ok(Self { bearer_credentials })
+    }
+
+    pub fn with_bearer_credential(
+        mut self,
+        name: impl Into<String>,
+        value: SecretString,
+    ) -> Result<Self, HttpExecutionError> {
+        let name = name.into();
+        if !is_valid_http_credential_name(&name) {
+            return Err(HttpExecutionError::InvalidRequest(
+                "named HTTP credential has an invalid name".to_owned(),
+            ));
+        }
+        validate_bearer_credential_value(&name, value.expose_secret())?;
+        self.bearer_credentials.insert(name, value);
+        Ok(self)
+    }
+}
 
 #[async_trait]
 impl HttpExecutor for SecureHttpExecutor {
@@ -75,7 +147,7 @@ impl HttpExecutor for SecureHttpExecutor {
             let remaining = deadline
                 .checked_duration_since(tokio::time::Instant::now())
                 .ok_or_else(|| HttpExecutionError::Transport("request timed out".to_owned()))?;
-            let (host, port) =
+            let (host, port, permission) =
                 authorized_target(&url, method.as_str(), permissions, granted_capabilities)?;
             let addresses = tokio::time::timeout(remaining, resolve_public_addresses(&host, port))
                 .await
@@ -101,6 +173,11 @@ impl HttpExecutor for SecureHttpExecutor {
                 let value = HeaderValue::from_str(value)
                     .map_err(|error| HttpExecutionError::InvalidRequest(error.to_string()))?;
                 builder = builder.header(name, value);
+            }
+            if let Some(credential) = &permission.credential {
+                let value = bearer_authorization_value(&self.bearer_credentials, credential)?;
+                validate_credential_injection_limits(request, &value)?;
+                builder = builder.header(AUTHORIZATION, value);
             }
             if let Some(body) = &request.body {
                 builder = builder.body(body.clone());
@@ -163,6 +240,70 @@ impl HttpExecutor for SecureHttpExecutor {
     }
 }
 
+fn bearer_authorization_value(
+    credentials: &BTreeMap<String, SecretString>,
+    credential: &str,
+) -> Result<HeaderValue, HttpExecutionError> {
+    let secret = credentials.get(credential).ok_or_else(|| {
+        HttpExecutionError::Denied(format!(
+            "named bearer credential `{credential}` is unavailable"
+        ))
+    })?;
+    let authorization =
+        SecretString::from(format!("Bearer {}", secret.expose_secret()).into_boxed_str());
+    let mut value = HeaderValue::from_str(authorization.expose_secret()).map_err(|_| {
+        HttpExecutionError::InvalidRequest(format!(
+            "named bearer credential `{credential}` cannot be represented as an HTTP header"
+        ))
+    })?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+fn validate_bearer_credential_value(
+    credential: &str,
+    value: &str,
+) -> Result<(), HttpExecutionError> {
+    if value.trim().is_empty() {
+        return Err(HttpExecutionError::InvalidRequest(format!(
+            "named HTTP credential `{credential}` is empty"
+        )));
+    }
+    if value.len() > MAX_BEARER_CREDENTIAL_BYTES {
+        return Err(HttpExecutionError::InvalidRequest(format!(
+            "named HTTP credential `{credential}` exceeds {MAX_BEARER_CREDENTIAL_BYTES} bytes"
+        )));
+    }
+    let authorization = SecretString::from(format!("Bearer {value}").into_boxed_str());
+    HeaderValue::from_str(authorization.expose_secret()).map_err(|_| {
+        HttpExecutionError::InvalidRequest(format!(
+            "named HTTP credential `{credential}` cannot be represented as an HTTP header"
+        ))
+    })?;
+    Ok(())
+}
+
+fn validate_credential_injection_limits(
+    request: &HttpRequest,
+    authorization: &HeaderValue,
+) -> Result<(), HttpExecutionError> {
+    let request_header_bytes = request.headers.iter().fold(
+        AUTHORIZATION
+            .as_str()
+            .len()
+            .saturating_add(authorization.as_bytes().len()),
+        |total, (name, value)| total.saturating_add(name.len()).saturating_add(value.len()),
+    );
+    if request.headers.len() >= MAX_REQUEST_HEADERS
+        || request_header_bytes > MAX_REQUEST_HEADER_BYTES
+    {
+        return Err(HttpExecutionError::InvalidRequest(
+            "request headers exceed the configured limit after credential injection".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_request_limits(request: &HttpRequest) -> Result<(), HttpExecutionError> {
     if request.timeout_ms == 0 || request.timeout_ms > MAX_TIMEOUT_MS {
         return Err(HttpExecutionError::InvalidRequest(format!(
@@ -199,12 +340,12 @@ fn validate_request_limits(request: &HttpRequest) -> Result<(), HttpExecutionErr
     Ok(())
 }
 
-fn authorized_target(
+fn authorized_target<'a>(
     url: &Url,
     method: &str,
-    permissions: &[HttpPermission],
+    permissions: &'a [HttpPermission],
     granted_capabilities: &BTreeSet<String>,
-) -> Result<(String, u16), HttpExecutionError> {
+) -> Result<(String, u16, &'a HttpPermission), HttpExecutionError> {
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -222,7 +363,7 @@ fn authorized_target(
     let port = url.port_or_known_default().ok_or_else(|| {
         HttpExecutionError::InvalidRequest("URL does not provide a port".to_owned())
     })?;
-    let permission = permissions.iter().find(|permission| {
+    let mut matching_permissions = permissions.iter().filter(|permission| {
         permission.host == host
             && permission.port == port
             && permission.methods.contains(method)
@@ -231,12 +372,17 @@ fn authorized_target(
                 .iter()
                 .any(|prefix| path_matches(url.path(), prefix))
     });
-    let Some(permission) = permission else {
+    let Some(permission) = matching_permissions.next() else {
         return Err(HttpExecutionError::Denied(format!(
             "{method} {host}:{port}{} is outside the manifest allowlist",
             url.path()
         )));
     };
+    if matching_permissions.any(|other| other.credential != permission.credential) {
+        return Err(HttpExecutionError::Denied(
+            "HTTP target matches permissions with conflicting named credentials".to_owned(),
+        ));
+    }
     if !granted_capabilities.contains("http.request")
         || !granted_capabilities.contains(&permission.capability())
     {
@@ -244,7 +390,15 @@ fn authorized_target(
             "administrator did not grant the HTTP target".to_owned(),
         ));
     }
-    Ok((host.to_owned(), port))
+    if permission
+        .credential_capability()
+        .is_some_and(|capability| !granted_capabilities.contains(&capability))
+    {
+        return Err(HttpExecutionError::Denied(
+            "administrator did not grant the named HTTP credential".to_owned(),
+        ));
+    }
+    Ok((host.to_owned(), port, permission))
 }
 
 fn path_matches(path: &str, prefix: &str) -> bool {
@@ -255,8 +409,10 @@ fn validate_request_header(name: &str) -> Result<(), HttpExecutionError> {
     let lower = name.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
-        "connection"
+        "authorization"
+            | "connection"
             | "content-length"
+            | "cookie"
             | "host"
             | "proxy-authorization"
             | "proxy-connection"
@@ -364,12 +520,21 @@ fn response_headers(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, net::IpAddr, str::FromStr};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        net::IpAddr,
+        str::FromStr,
+    };
 
-    use plugin_api::HttpPermission;
+    use plugin_api::{HttpPermission, HttpRequest};
+    use reqwest::header::HeaderValue;
+    use secrecy::{ExposeSecret as _, SecretString};
     use url::Url;
 
-    use super::{authorized_target, is_public_ip};
+    use super::{
+        MAX_BEARER_CREDENTIAL_BYTES, MAX_REQUEST_HEADERS, SecureHttpExecutor, authorized_target,
+        bearer_authorization_value, is_public_ip, validate_credential_injection_limits,
+    };
 
     fn permission() -> HttpPermission {
         HttpPermission {
@@ -377,6 +542,7 @@ mod tests {
             port: 443,
             methods: BTreeSet::from(["GET".to_owned()]),
             path_prefixes: BTreeSet::from(["/v1/".to_owned()]),
+            credential: None,
         }
     }
 
@@ -402,6 +568,110 @@ mod tests {
             );
         }
         assert!(authorized_target(&allowed, "POST", &[permission], &grants).is_err());
+    }
+
+    #[test]
+    fn named_bearer_permission_requires_an_explicit_grant() {
+        let mut permission = permission();
+        permission.credential = Some("github_issue".to_owned());
+        let url = Url::parse("https://api.example.com/v1/issues").unwrap();
+        let mut grants = BTreeSet::from(["http.request".to_owned(), permission.capability()]);
+        assert!(
+            authorized_target(&url, "GET", std::slice::from_ref(&permission), &grants).is_err()
+        );
+        grants.insert(permission.credential_capability().unwrap());
+        assert!(authorized_target(&url, "GET", std::slice::from_ref(&permission), &grants).is_ok());
+    }
+
+    #[test]
+    fn conflicting_matching_credentials_are_rejected_defensively() {
+        let mut first = permission();
+        first.credential = Some("github_issue".to_owned());
+        let mut second = permission();
+        second.path_prefixes = BTreeSet::from(["/v1/issues/".to_owned()]);
+        second.credential = Some("other_token".to_owned());
+        let url = Url::parse("https://api.example.com/v1/issues/new").unwrap();
+        let grants = BTreeSet::from([
+            "http.request".to_owned(),
+            first.capability(),
+            first.credential_capability().unwrap(),
+            second.credential_capability().unwrap(),
+        ]);
+        assert!(authorized_target(&url, "GET", &[first, second], &grants).is_err());
+    }
+
+    #[test]
+    fn programmatic_credentials_enforce_name_and_value_contracts() {
+        let secret = || SecretString::from("token".to_owned().into_boxed_str());
+        assert!(
+            SecureHttpExecutor::default()
+                .with_bearer_credential("github_issue", secret())
+                .is_ok()
+        );
+        assert!(
+            SecureHttpExecutor::default()
+                .with_bearer_credential("GITHUB_ISSUE", secret())
+                .is_err()
+        );
+        assert!(
+            SecureHttpExecutor::default()
+                .with_bearer_credential(
+                    "github_issue",
+                    SecretString::from(" ".to_owned().into_boxed_str()),
+                )
+                .is_err()
+        );
+        assert!(
+            SecureHttpExecutor::default()
+                .with_bearer_credential(
+                    "github_issue",
+                    SecretString::from("token\r\nforged: value".to_owned().into_boxed_str()),
+                )
+                .is_err()
+        );
+        assert!(
+            SecureHttpExecutor::default()
+                .with_bearer_credential(
+                    "github_issue",
+                    SecretString::from(
+                        "x".repeat(MAX_BEARER_CREDENTIAL_BYTES + 1).into_boxed_str(),
+                    ),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn host_builds_a_sensitive_bearer_header_without_returning_the_secret() {
+        let credentials = BTreeMap::from([(
+            "github_issue".to_owned(),
+            SecretString::from("github_pat_test".to_owned().into_boxed_str()),
+        )]);
+        let value = bearer_authorization_value(&credentials, "github_issue").unwrap();
+        assert!(value.is_sensitive());
+        assert_eq!(value.to_str().unwrap(), "Bearer github_pat_test");
+        assert_eq!(
+            credentials["github_issue"].expose_secret(),
+            "github_pat_test"
+        );
+    }
+
+    #[test]
+    fn credential_injection_obeys_the_total_header_count_limit() {
+        let mut request = HttpRequest {
+            method: "GET".to_owned(),
+            url: "https://api.example.com/v1/issues".to_owned(),
+            headers: (0..MAX_REQUEST_HEADERS)
+                .map(|index| (format!("x-header-{index}"), "value".to_owned()))
+                .collect(),
+            body: None,
+            timeout_ms: 1_000,
+            max_response_bytes: 1_024,
+        };
+        let authorization = HeaderValue::from_static("Bearer token");
+        assert!(validate_credential_injection_limits(&request, &authorization).is_err());
+        request.headers.pop_last();
+        assert!(validate_credential_injection_limits(&request, &authorization).is_ok());
     }
 
     #[test]

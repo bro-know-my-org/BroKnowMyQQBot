@@ -152,12 +152,12 @@ impl std::fmt::Debug for StaticPluginHost {
 impl StaticPluginHost {
     pub fn new(store: PluginStore) -> Self {
         Self {
-            name: "static-plugin-host".to_owned(),
+            name: "plugin-host".to_owned(),
             store,
             plugins: Vec::new(),
             instances: BTreeSet::new(),
             command_names: BTreeSet::new(),
-            http_executor: Arc::new(SecureHttpExecutor),
+            http_executor: Arc::new(SecureHttpExecutor::default()),
             browser_executor: Arc::new(UnavailableBrowserExecutor),
             assets: AssetStore::default(),
             adapters: Arc::new(BTreeMap::new()),
@@ -244,7 +244,7 @@ impl StaticPluginHost {
             self.command_names.insert(command.name.clone());
             self.command_names.extend(command.aliases.iter().cloned());
         }
-        info!(plugin_id = %registered.manifest.id, instance_id = registered.instance_id, "registered static plugin");
+        info!(plugin_id = %registered.manifest.id, instance_id = registered.instance_id, "registered plugin");
         self.plugins.push(registered);
         Ok(())
     }
