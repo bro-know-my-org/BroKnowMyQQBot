@@ -650,16 +650,17 @@ fn schema_node_declares_property(
     {
         return true;
     }
-    if let Some(reference) = node.get("$ref").and_then(Value::as_str)
-        && reference.starts_with('#')
-        && visited_references.insert(reference.to_owned())
-        && root
-            .pointer(reference.strip_prefix('#').unwrap_or_default())
-            .is_some_and(|target| {
-                schema_node_declares_property(root, target, property, visited_references)
-            })
-    {
-        return true;
+    if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+        if reference.starts_with('#')
+            && visited_references.insert(reference.to_owned())
+            && root
+                .pointer(reference.strip_prefix('#').unwrap_or_default())
+                .is_some_and(|target| {
+                    schema_node_declares_property(root, target, property, visited_references)
+                })
+        {
+            return true;
+        }
     }
     ["allOf", "anyOf", "oneOf"]
         .into_iter()

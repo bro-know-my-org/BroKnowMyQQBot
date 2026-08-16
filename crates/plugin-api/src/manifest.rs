@@ -194,13 +194,12 @@ impl PluginManifest {
 fn requirement_matches_bpp_1_0(requirement: &VersionReq) -> bool {
     let mut candidate_patches = BTreeSet::from([0, u64::MAX]);
     for comparator in &requirement.comparators {
-        if comparator.major == 1
-            && comparator.minor.is_none_or(|minor| minor == 0)
-            && let Some(patch) = comparator.patch
-        {
-            candidate_patches.insert(patch);
-            candidate_patches.insert(patch.saturating_sub(1));
-            candidate_patches.insert(patch.saturating_add(1));
+        if comparator.major == 1 && comparator.minor.is_none_or(|minor| minor == 0) {
+            if let Some(patch) = comparator.patch {
+                candidate_patches.insert(patch);
+                candidate_patches.insert(patch.saturating_sub(1));
+                candidate_patches.insert(patch.saturating_add(1));
+            }
         }
     }
     candidate_patches
