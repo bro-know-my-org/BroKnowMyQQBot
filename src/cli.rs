@@ -77,7 +77,7 @@ async fn run_plugin(arguments: &[String]) -> Result<(), Box<dyn std::error::Erro
         inspect_package(Path::new(package), &management_locale_from_environment()).await?;
         return Ok(());
     }
-    if matches!(command, "new" | "check" | "build" | "package") {
+    if matches!(command, "new" | "check" | "build" | "package" | "publish") {
         plugin_dev::run(command, &arguments[1..]).await?;
         return Ok(());
     }
@@ -1389,10 +1389,11 @@ fn print_plugin_help() {
     println!(
         "Plugin management\n\n\
 Usage:\n\
-  bkmqb plugin new [directory] [--id ID] [--name NAME] [--class TYPE] [--language LANG] [--region REGION] [--description TEXT] [--command NAME] [--no-interactive]\n\
+  bkmqb plugin new [directory] [--id ID] [--name NAME] [--class TYPE] [--language LANG] [--region REGION] [--description TEXT] [--command NAME] [--interactive | --no-interactive] [--no-git]\n\
   bkmqb plugin check [directory]\n\
   bkmqb plugin build [directory]\n\
   bkmqb plugin package [directory]\n\
+  bkmqb plugin publish [directory] [--tag vX.Y.Z] [--method actions|local|manual] [--remote NAME] [--interactive | --no-interactive] [--dry-run] [-y]\n\
   bkmqb plugin inspect <package>\n\
   bkmqb plugin marketplace list [query] [--url URL]\n\
   bkmqb plugin marketplace info <plugin> [--url URL]\n\

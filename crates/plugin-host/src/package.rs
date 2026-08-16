@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zip::ZipArchive;
 
-const MAX_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_PLUGIN_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_UNPACKED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FILE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FILE_COUNT: usize = 256;
@@ -46,19 +46,19 @@ impl ValidatedPluginPackage {
             return Err(PluginPackageError::InvalidExtension);
         }
         let mut file = fs::File::open(path).map_err(PluginPackageError::Io)?;
-        let mut bytes = Vec::with_capacity(MAX_PACKAGE_BYTES.min(64 * 1024));
+        let mut bytes = Vec::with_capacity(MAX_PLUGIN_PACKAGE_BYTES.min(64 * 1024));
         file.by_ref()
-            .take(u64::try_from(MAX_PACKAGE_BYTES).unwrap_or(u64::MAX) + 1)
+            .take(u64::try_from(MAX_PLUGIN_PACKAGE_BYTES).unwrap_or(u64::MAX) + 1)
             .read_to_end(&mut bytes)
             .map_err(PluginPackageError::Io)?;
-        if bytes.len() > MAX_PACKAGE_BYTES {
+        if bytes.len() > MAX_PLUGIN_PACKAGE_BYTES {
             return Err(PluginPackageError::PackageTooLarge(bytes.len()));
         }
         Self::from_bytes(&bytes)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PluginPackageError> {
-        if bytes.len() > MAX_PACKAGE_BYTES {
+        if bytes.len() > MAX_PLUGIN_PACKAGE_BYTES {
             return Err(PluginPackageError::PackageTooLarge(bytes.len()));
         }
         let package_sha256 = hex_digest(Sha256::digest(bytes).as_slice());
