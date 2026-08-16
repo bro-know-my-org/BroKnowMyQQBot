@@ -30,20 +30,30 @@ use crate::{
 const MAX_PLUGIN_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PLUGIN_CONFIG_FILE_BYTES: usize = 256 * 1024;
 
-pub(crate) async fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunOutcome {
+    Complete,
+    StartBot,
+}
+
+pub(crate) async fn run(arguments: Vec<String>) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let Some(command) = arguments.first().map(String::as_str) else {
         print_help();
-        return Ok(());
+        return Ok(RunOutcome::Complete);
     };
     match command {
         "help" | "--help" | "-h" => print_help(),
+        "run" => {
+            require_argument_count(&arguments, 1, "bkmqb run")?;
+            return Ok(RunOutcome::StartBot);
+        }
         "version" | "--version" | "-V" => println!("bkmqb {}", env!("CARGO_PKG_VERSION")),
         "config" => run_config(&arguments[1..])?,
         "browser" => browser::run(&arguments[1..]).await?,
         "plugin" => run_plugin(&arguments[1..]).await?,
         other => return Err(format!("unknown bkmqb command `{other}`; run `bkmqb help`").into()),
     }
-    Ok(())
+    Ok(RunOutcome::Complete)
 }
 
 fn run_config(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1377,7 +1387,7 @@ fn now_ms() -> i64 {
 
 fn print_help() {
     println!(
-        "BroKnowMyQQBot command line\n\nUsage:\n  bkmqb\n  bkmqb browser <command>\n  bkmqb config check\n  bkmqb plugin <command>\n  bkmqb version"
+        "BroKnowMyQQBot command line\n\nUsage:\n  bkmqb run\n  bkmqb browser <command>\n  bkmqb config check\n  bkmqb plugin <command>\n  bkmqb version"
     );
 }
 
@@ -1441,6 +1451,22 @@ mod tests {
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
+    }
+
+    #[tokio::test]
+    async fn bot_start_requires_explicit_run_command() {
+        assert_eq!(run(Vec::new()).await.unwrap(), RunOutcome::Complete);
+        assert_eq!(
+            run(vec!["run".to_owned()]).await.unwrap(),
+            RunOutcome::StartBot
+        );
+        assert!(
+            run(vec!["run".to_owned(), "extra".to_owned()])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("usage: bkmqb run")
+        );
     }
 
     impl Drop for TestDirectory {

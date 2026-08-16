@@ -31,11 +31,9 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if arguments.is_empty() {
-        return bootstrap::run().await;
-    }
     match cli::run(arguments).await {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(cli::RunOutcome::Complete) => ExitCode::SUCCESS,
+        Ok(cli::RunOutcome::StartBot) => bootstrap::run().await,
         Err(error) => {
             eprintln!("bkmqb failed: {}", cli::terminal_safe(&error.to_string()));
             ExitCode::FAILURE
