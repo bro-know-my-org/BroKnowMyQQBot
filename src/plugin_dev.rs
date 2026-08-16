@@ -466,17 +466,14 @@ async fn publish_project(mut options: PublishOptions) -> Result<(), Box<dyn std:
             safe_remote_display(&git.remote_url)
         )
     })?;
-    if method == PublishMethod::Actions
-        && !git_command_succeeds(
-            &path,
-            &["cat-file", "-e", "HEAD:.github/workflows/release.yml"],
-        )
-    {
-        return Err("GitHub Actions publishing requires `.github/workflows/release.yml` to be committed in HEAD; commit the generated workflow or choose another method".into());
-    }
+    ensure_actions_workflow_committed(&path, method).await?;
 
     if method == PublishMethod::Local && !options.dry_run {
         ensure_gh_authenticated(&path).await?;
+    }
+
+    if options.dry_run {
+        ensure_release_tag_available(&path, &git.remote_url, &tag).await?;
     }
 
     println!("\nRemote changes:");
@@ -542,6 +539,33 @@ async fn prepare_local_package(
     Ok(package)
 }
 
+async fn ensure_actions_workflow_committed(
+    path: &Path,
+    method: PublishMethod,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if method == PublishMethod::Actions {
+        let output = async_command_output(
+            "git",
+            path,
+            &[
+                "ls-tree",
+                "--name-only",
+                "HEAD",
+                "--",
+                ".github/workflows/release.yml",
+            ],
+        )
+        .await?;
+        if !output.status.success() {
+            return Err(command_failure("git ls-tree", &output).into());
+        }
+        if String::from_utf8(output.stdout)?.trim().is_empty() {
+            return Err("GitHub Actions publishing requires `.github/workflows/release.yml` to be committed in HEAD; commit the generated workflow or choose another method".into());
+        }
+    }
+    Ok(())
+}
+
 async fn publish_manual(
     path: &Path,
     manifest: &PluginManifest,
@@ -550,6 +574,13 @@ async fn publish_manual(
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if dry_run {
+        let source_commit = prepare_manual_source_for_dry_run(path).await?;
+        let remote_url = required_push_remote_url_for_dry_run(path, remote).await?;
+        ensure_release_tag_available(path, &remote_url, tag).await?;
+        println!("\nRemote checks:");
+        println!("  Remote: {remote} -> {}", safe_remote_display(&remote_url));
+        println!("  Commit: {source_commit}");
+        println!("  Available tag: {tag}");
         println!(
             "\nDry run complete; a real manual publish would rebuild and validate the plugin package before printing the guide."
         );
@@ -884,6 +915,61 @@ fn prepare_manual_source(path: &Path) -> Result<String, Box<dyn std::error::Erro
     git_output(path, &["rev-parse", "HEAD"])
 }
 
+async fn prepare_manual_source_for_dry_run(
+    path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let repository_root = async_git_output(path, &["rev-parse", "--show-toplevel"])
+        .await
+        .map_err(|error| {
+            contextual_error(
+                "manual publishing requires a Git repository so the package can be tied to committed source",
+                error,
+            )
+        })?;
+    if absolute_path(path)? != absolute_path(Path::new(&repository_root))? {
+        return Err(
+            "manual publishing currently requires the plugin project to be the Git repository root"
+                .into(),
+        );
+    }
+    let status =
+        async_git_output(path, &["status", "--porcelain", "--untracked-files=normal"]).await?;
+    if !status.trim().is_empty() {
+        return Err(format!(
+            "Git working tree is not clean; commit or discard the following changes before publishing:\n{status}"
+        )
+        .into());
+    }
+    async_git_output(path, &["rev-parse", "HEAD"]).await
+}
+
+async fn required_push_remote_url_for_dry_run(
+    path: &Path,
+    remote: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    validate_remote_name(remote)?;
+    let urls = async_git_output_lines(path, &["remote", "get-url", "--push", "--all", remote])
+        .await
+        .map_err(|error| {
+            contextual_error(
+                format!("could not resolve push URL for Git remote `{remote}`"),
+                error,
+            )
+        })?;
+    if urls.len() != 1 {
+        return Err(format!(
+            "Git remote `{remote}` must have exactly one effective push URL, found {}",
+            urls.len()
+        )
+        .into());
+    }
+    let url = urls.into_iter().next().expect("one push URL");
+    if remote_url_has_credentials(&url) {
+        return Err("Git remote URL must not contain embedded credentials; configure Git or GitHub CLI credentials separately".into());
+    }
+    Ok(url)
+}
+
 fn confirm_remote_publish(
     interactive: bool,
     yes: bool,
@@ -1196,6 +1282,29 @@ async fn wait_for_remote_tag_details(
 struct RemoteTagDetails {
     object_id: String,
     peeled_commit: String,
+}
+
+async fn ensure_release_tag_available(
+    path: &Path,
+    remote_url: &str,
+    tag: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tag_ref = format!("refs/tags/{tag}");
+    let output = async_command_output("git", path, &["rev-parse", "--verify", "--quiet", &tag_ref])
+        .await
+        .map_err(|error| {
+            contextual_error(format!("could not check local release tag `{tag}`"), error)
+        })?;
+    if output.status.success() {
+        return Err(format!("release Git tag `{tag}` already exists locally").into());
+    }
+    if output.status.code() != Some(1) {
+        return Err(command_failure("git rev-parse --verify", &output).into());
+    }
+    if remote_tag_details(path, remote_url, tag).await?.is_some() {
+        return Err(format!("release Git tag `{tag}` already exists on the publish remote").into());
+    }
+    Ok(())
 }
 
 async fn remote_tag_details(
@@ -1918,29 +2027,28 @@ async fn marketplace_issue_state(
             "--hostname",
             "github.com",
             "--paginate",
-            "--slurp",
             &endpoint,
+            "--jq",
+            ".[] | @json",
         ],
     )
     .await?;
     if !output.status.success() {
         return Err(command_failure("gh api --paginate", &output).into());
     }
-    let pages: Value = serde_json::from_slice(&output.stdout)?;
-    let mut flattened = Vec::new();
-    for page in pages
-        .as_array()
-        .ok_or("GitHub paginated issue response is not an array")?
-    {
-        flattened.extend(
-            page.as_array()
-                .ok_or("GitHub paginated issue page is not an array")?
-                .iter()
-                .cloned(),
-        );
-    }
-    let issues = Value::Array(flattened);
+    let issues = parse_issue_json_lines(&output.stdout)?;
     classify_marketplace_issues(&issues, title, expected_body, expected_author)
+}
+
+fn parse_issue_json_lines(output: &[u8]) -> Result<Value, Box<dyn std::error::Error>> {
+    let stdout = std::str::from_utf8(output)?;
+    Ok(Value::Array(
+        stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
 }
 
 fn classify_marketplace_issues(
@@ -2586,6 +2694,34 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[derive(Debug)]
+struct ContextualError {
+    context: String,
+    source: Box<dyn std::error::Error>,
+}
+
+impl std::fmt::Display for ContextualError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.source)
+    }
+}
+
+impl std::error::Error for ContextualError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn contextual_error(
+    context: impl Into<String>,
+    source: Box<dyn std::error::Error>,
+) -> Box<dyn std::error::Error> {
+    Box::new(ContextualError {
+        context: context.into(),
+        source,
+    })
+}
+
 fn command_failure(command: &str, output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if stderr.is_empty() {
@@ -2618,6 +2754,28 @@ async fn async_command_output(
     arguments: &[&str],
 ) -> Result<Output, Box<dyn std::error::Error>> {
     async_command_output_with_timeout(program, path, arguments, READ_COMMAND_TIMEOUT).await
+}
+
+async fn async_git_output(
+    path: &Path,
+    arguments: &[&str],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let output = async_command_output("git", path, arguments).await?;
+    if !output.status.success() {
+        return Err(command_failure(&format!("git {}", arguments.join(" ")), &output).into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+async fn async_git_output_lines(
+    path: &Path,
+    arguments: &[&str],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(async_git_output(path, arguments)
+        .await?
+        .lines()
+        .map(str::to_owned)
+        .collect())
 }
 
 async fn async_command_output_with_timeout(
@@ -3049,6 +3207,46 @@ mod tests {
             .as_nanos()
     }
 
+    fn commit_test_project_with_remote(
+        directory: &Path,
+        remote: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        create_test_project(NewOptions {
+            path: Some(directory.to_path_buf()),
+            interactive: Some(false),
+            initialize_git: true,
+            ..NewOptions::default()
+        })?;
+        git_status(directory, &["config", "user.name", "BKM Test"])?;
+        git_status(directory, &["config", "user.email", "test@example.invalid"])?;
+        git_status(
+            directory,
+            &[
+                "add",
+                "Cargo.toml",
+                "plugin.toml",
+                "src/lib.rs",
+                "wit/bkm-plugin.wit",
+                "README.md",
+                ".gitignore",
+                ".github/workflows/release.yml",
+            ],
+        )?;
+        git_status(directory, &["commit", "-m", "Initial plugin"])?;
+        fs::create_dir_all(remote)?;
+        git_status(remote, &["init", "--bare"])?;
+        git_status(
+            directory,
+            &[
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().ok_or("test remote path is not UTF-8")?,
+            ],
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn non_interactive_scaffold_uses_defaults() {
         let directory = std::env::temp_dir().join(format!(
@@ -3210,6 +3408,19 @@ mod tests {
         for invalid in [".", "origin.", "bad..name"] {
             assert!(validate_remote_name(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn paginated_issue_json_lines_support_gh_without_slurp() {
+        let issues = parse_issue_json_lines(
+            br#"{"title":"first"}
+{"title":"second"}
+"#,
+        )
+        .unwrap();
+        assert_eq!(issues.as_array().unwrap().len(), 2);
+        assert_eq!(issues[0]["title"], "first");
+        assert_eq!(issues[1]["title"], "second");
     }
 
     #[test]
@@ -3378,13 +3589,8 @@ mod tests {
             std::process::id(),
             nonce()
         ));
-        create_test_project(NewOptions {
-            path: Some(directory.clone()),
-            interactive: Some(false),
-            initialize_git: false,
-            ..NewOptions::default()
-        })
-        .unwrap();
+        let remote = directory.with_extension("remote.git");
+        commit_test_project_with_remote(&directory, &remote).unwrap();
         publish_project(PublishOptions {
             path: Some(directory.clone()),
             tag: Some("v0.1.0".to_owned()),
@@ -3397,6 +3603,79 @@ mod tests {
         .unwrap();
         assert!(!directory.join("target").exists());
         fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_dry_run_accepts_detached_head_like_real_manual_publish() {
+        let directory = std::env::temp_dir().join(format!(
+            "bkmqb-plugin-detached-dry-run-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        let remote = directory.with_extension("remote.git");
+        commit_test_project_with_remote(&directory, &remote).unwrap();
+        git_status(&directory, &["checkout", "--detach"]).unwrap();
+
+        publish_project(PublishOptions {
+            path: Some(directory.clone()),
+            tag: Some("v0.1.0".to_owned()),
+            method: Some(PublishMethod::Manual),
+            interactive: Some(false),
+            dry_run: true,
+            ..PublishOptions::default()
+        })
+        .await
+        .unwrap();
+
+        assert!(!directory.join("target").exists());
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(remote).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dry_run_rejects_existing_local_or_remote_release_tag() {
+        let directory = std::env::temp_dir().join(format!(
+            "bkmqb-plugin-occupied-tag-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        let remote = directory.with_extension("remote.git");
+        commit_test_project_with_remote(&directory, &remote).unwrap();
+        git_status(&directory, &["tag", "v0.1.0"]).unwrap();
+
+        let local_error =
+            ensure_release_tag_available(&directory, remote.to_str().unwrap(), "v0.1.0")
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(local_error.contains("already exists locally"));
+
+        git_status(&directory, &["push", "origin", "refs/tags/v0.1.0"]).unwrap();
+        git_status(&directory, &["tag", "-d", "v0.1.0"]).unwrap();
+        let remote_error =
+            ensure_release_tag_available(&directory, remote.to_str().unwrap(), "v0.1.0")
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(remote_error.contains("already exists on the publish remote"));
+
+        let missing_repository_error = ensure_release_tag_available(
+            &directory.join("missing"),
+            remote.to_str().unwrap(),
+            "v0.2.0",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            missing_repository_error
+                .to_string()
+                .contains("could not check local release tag")
+        );
+        assert!(missing_repository_error.source().is_some());
+
+        fs::remove_dir_all(directory).unwrap();
+        fs::remove_dir_all(remote).unwrap();
     }
 
     #[test]

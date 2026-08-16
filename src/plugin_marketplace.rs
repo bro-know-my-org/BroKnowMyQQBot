@@ -282,7 +282,9 @@ impl MarketplacePlugin {
             );
         }
         if self.commands.iter().any(|command| {
-            command.is_empty() || command.len() > 128 || contains_unsafe_display_characters(command)
+            canonical_command(command).is_empty()
+                || command.len() > 128
+                || contains_unsafe_display_characters(command)
         }) || self.capabilities.iter().any(|capability| {
             capability.is_empty()
                 || capability.len() > 256
@@ -294,7 +296,9 @@ impl MarketplacePlugin {
             )
             .into());
         }
-        if contains_duplicates(&self.commands) || contains_duplicates(&self.capabilities) {
+        if contains_canonical_command_duplicates(&self.commands)
+            || contains_duplicates(&self.capabilities)
+        {
             return Err(format!(
                 "marketplace plugin `{}` contains duplicate list entries",
                 self.slug
@@ -345,13 +349,28 @@ impl MarketplacePlugin {
         if package.package_sha256() != self.latest.sha256 {
             return Err("marketplace package hash changed after validation".into());
         }
-        let packaged_commands = manifest
+        let packaged_command_values = manifest
             .commands
             .iter()
             .flat_map(|command| std::iter::once(&command.name).chain(&command.aliases))
+            .map(|command| canonical_command(command))
+            .collect::<Vec<_>>();
+        let packaged_commands = packaged_command_values
+            .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let indexed_commands = self.commands.iter().cloned().collect::<BTreeSet<_>>();
+        if packaged_commands.len() != packaged_command_values.len() {
+            return Err(format!(
+                "package manifest contains duplicate runtime commands for `{}`",
+                self.slug
+            )
+            .into());
+        }
+        let indexed_commands = self
+            .commands
+            .iter()
+            .map(|command| canonical_command(command))
+            .collect::<BTreeSet<_>>();
         if packaged_commands != indexed_commands {
             return Err(format!(
                 "marketplace command summary does not match package manifest for `{}`",
@@ -386,6 +405,18 @@ fn valid_slug(slug: &str) -> bool {
 fn contains_duplicates(values: &[String]) -> bool {
     let unique = values.iter().collect::<BTreeSet<_>>();
     unique.len() != values.len()
+}
+
+fn contains_canonical_command_duplicates(values: &[String]) -> bool {
+    let unique = values
+        .iter()
+        .map(|value| canonical_command(value))
+        .collect::<BTreeSet<_>>();
+    unique.len() != values.len()
+}
+
+fn canonical_command(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 fn contains_unsafe_display_characters(value: &str) -> bool {
@@ -603,7 +634,10 @@ async fn read_bounded_response(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Cursor, Write as _};
+
     use base64::Engine as _;
+    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
     use super::*;
 
@@ -626,6 +660,25 @@ mod tests {
         "capabilities": ["message.reply"]
       }]
     }"#;
+
+    fn ping_package_with_manifest(manifest: &str) -> ValidatedPluginPackage {
+        let fixture = base64::engine::general_purpose::STANDARD
+            .decode(
+                include_str!("../test-support/wasm-plugins/ping/component.bkm-plugin.b64").trim(),
+            )
+            .unwrap();
+        let component = ValidatedPluginPackage::from_bytes(&fixture)
+            .unwrap()
+            .component()
+            .to_vec();
+        let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        archive.start_file("plugin.toml", options).unwrap();
+        archive.write_all(manifest.as_bytes()).unwrap();
+        archive.start_file("component.wasm", options).unwrap();
+        archive.write_all(&component).unwrap();
+        ValidatedPluginPackage::from_bytes(&archive.finish().unwrap().into_inner()).unwrap()
+    }
 
     #[test]
     fn marketplace_index_validates_and_resolves_selectors() {
@@ -794,8 +847,58 @@ mod tests {
         };
         plugin.validate_package(&package).unwrap();
 
+        let mut differently_cased = plugin.clone();
+        differently_cased.commands = differently_cased
+            .commands
+            .into_iter()
+            .map(|command| command.to_ascii_uppercase())
+            .collect();
+        differently_cased.validate().unwrap();
+        differently_cased.validate_package(&package).unwrap();
+
         let mut mismatched = plugin;
         mismatched.commands.push("not-in-package".to_owned());
         assert!(mismatched.validate_package(&package).is_err());
+    }
+
+    #[test]
+    fn marketplace_rejects_package_commands_that_collide_at_runtime() {
+        let manifest_source = include_str!("../test-support/wasm-plugins/ping/plugin.toml")
+            .replacen(
+                "name = \"ping\"",
+                "name = \"ping\"\naliases = [\"PING\"]",
+                1,
+            );
+        let package = ping_package_with_manifest(&manifest_source);
+        let manifest = package.manifest();
+        let plugin = MarketplacePlugin {
+            slug: "wasm-ping".to_owned(),
+            plugin_id: manifest.id.clone(),
+            name: "WASM Ping".to_owned(),
+            summary: "Ping fixture".to_owned(),
+            trust: "community".to_owned(),
+            repository: "https://github.com/example/wasm-ping".to_owned(),
+            commands: vec!["ping".to_owned()],
+            latest: MarketplaceRelease {
+                version: manifest.version.clone(),
+                protocol: manifest.protocol.clone(),
+                download: format!(
+                    "https://github.com/example/wasm-ping/releases/download/v{}/plugin.bkm-plugin",
+                    manifest.version
+                ),
+                sha256: package.package_sha256().to_owned(),
+            },
+            capabilities: manifest.requested_capabilities().into_iter().collect(),
+        };
+
+        let error = plugin.validate_package(&package).unwrap_err().to_string();
+        assert!(error.contains("duplicate runtime commands"));
+    }
+
+    #[test]
+    fn marketplace_command_duplicates_use_runtime_command_semantics() {
+        let mut index: MarketplaceIndex = serde_json::from_str(VALID_INDEX).unwrap();
+        index.plugins[0].commands = vec!["aliasrepo".to_owned(), "AliasRepo".to_owned()];
+        assert!(index.validate().is_err());
     }
 }
