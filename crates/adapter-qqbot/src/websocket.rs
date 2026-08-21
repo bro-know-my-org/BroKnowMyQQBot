@@ -908,6 +908,9 @@ impl QqActionExecutor {
                 )
             }
             "qq.media.upload" => self.execute_media_upload(payload).await,
+            "qq.bot.profile.get" | "qq.group.info.get" | "qq.group.bot-state.get" => {
+                self.execute_profile_action(name, payload).await
+            }
             "qq.guild.list" | "qq.guild.get" | "qq.channel.list" | "qq.channel.get"
             | "qq.channel.create" | "qq.channel.update" | "qq.channel.delete" => {
                 self.execute_channel_action(name, payload).await
@@ -1058,6 +1061,28 @@ impl QqActionExecutor {
             message_id: None,
             raw: serde_json::to_value(response).unwrap_or(Value::Null),
         })
+    }
+
+    async fn execute_profile_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.bot.profile.get" => self.complete_typed_action(name, self.api.bot_profile().await),
+            "qq.group.info.get" => {
+                let action: GroupOpenIdAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.group_info(&action.group_openid).await)
+            }
+            "qq.group.bot-state.get" => {
+                let action: GroupOpenIdAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api.group_bot_state(&action.group_openid).await,
+                )
+            }
+            _ => unreachable!("profile Action dispatcher only calls known names"),
+        }
     }
 
     async fn execute_channel_action(

@@ -8,6 +8,7 @@ pub mod group;
 pub mod guild;
 pub mod message;
 pub mod openapi;
+pub mod profile;
 pub mod reaction;
 
 pub use auth::{AccessToken, AuthError, TokenManager};
@@ -39,6 +40,7 @@ pub use message::{
     MessageRequest, MessageResponse, MessageType, QqMessage,
 };
 pub use openapi::{ApiError, OpenApiClient, OpenApiEnvironment};
+pub use profile::{BotProfile, GroupBotState, GroupInfo};
 pub use reaction::{
     MessageReactionEvent, ReactionEmoji, ReactionTarget, ReactionUser, ReactionUsersPage,
     ReactionUsersRequest, ReactionValidationError,

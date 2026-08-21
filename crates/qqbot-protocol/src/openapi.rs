@@ -28,6 +28,7 @@ use crate::{
         InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
         MessageResponse,
     },
+    profile::{BotProfile, GroupBotState, GroupInfo},
     reaction::{ReactionEmoji, ReactionUsersPage, ReactionUsersRequest, ReactionValidationError},
 };
 
@@ -136,6 +137,23 @@ impl OpenApiClient {
 
     pub async fn gateway_bot(&self) -> Result<GatewayBot, ApiError> {
         let url = self.endpoint(&["gateway", "bot"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn bot_profile(&self) -> Result<BotProfile, ApiError> {
+        let url = self.endpoint(&["users", "@me"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn group_info(&self, group_openid: &str) -> Result<GroupInfo, ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "info"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn group_bot_state(&self, group_openid: &str) -> Result<GroupBotState, ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "bot_state"])?;
         self.get_json(url).await
     }
 
