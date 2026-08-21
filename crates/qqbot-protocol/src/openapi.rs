@@ -10,6 +10,12 @@ use url::Url;
 use crate::{
     auth::{AuthError, TokenManager},
     gateway::{Gateway, GatewayBot},
+    group::{
+        CreateGroupJoinStrategyRequest, GroupJoinRequestPage, GroupJoinStrategyCreated,
+        GroupJoinStrategyPage, GroupJoinStrategyUpdated, GroupJoinStrategyWhitelistUpdated,
+        GroupMuteSetting, PageRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
+        UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
+    },
     message::{
         ChannelMessageRequest, InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse,
         MessageRequest, MessageResponse,
@@ -17,7 +23,7 @@ use crate::{
 };
 
 const PRODUCTION_BASE_URL: &str = "https://api.bot.qq.com/";
-const SANDBOX_BASE_URL: &str = "https://sandbox.api.sgroup.qq.com/";
+const SANDBOX_BASE_URL: &str = "https://api.bot.qq.com/";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// QQ `OpenAPI` environment selection.
@@ -272,6 +278,137 @@ impl OpenApiClient {
         self.delete(url).await
     }
 
+    pub async fn group_mute_setting(
+        &self,
+        group_openid: &str,
+    ) -> Result<GroupMuteSetting, ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "restrict_chat_setting"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn set_group_mute(
+        &self,
+        group_openid: &str,
+        request: &SetGroupMuteRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "restrict_chat_setting"])?;
+        self.post_json_unit(url, request).await
+    }
+
+    pub async fn group_join_requests(
+        &self,
+        group_openid: &str,
+        request: &PageRequest,
+    ) -> Result<GroupJoinRequestPage, ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "join_request_list"])?;
+        // The QQ 2026-08-10 generated contract explicitly defines cursor and
+        // limit as a JSON request body for this GET endpoint.
+        self.get_json_body(url, request).await
+    }
+
+    pub async fn review_group_join_request(
+        &self,
+        group_openid: &str,
+        member_openid: &str,
+        request: &ReviewGroupJoinRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        validate_path_id("member_openid", member_openid)?;
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&[
+            "v2",
+            "groups",
+            group_openid,
+            "approval_join_request",
+            member_openid,
+        ])?;
+        self.post_json_unit(url, request).await
+    }
+
+    pub async fn create_group_join_strategy(
+        &self,
+        request: &CreateGroupJoinStrategyRequest,
+    ) -> Result<GroupJoinStrategyCreated, ApiError> {
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["v2", "groups", "join_approval_strategy"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn group_join_strategies(
+        &self,
+        request: &PageRequest,
+    ) -> Result<GroupJoinStrategyPage, ApiError> {
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["v2", "groups", "join_approval_strategy"])?;
+        // QQ's generated contract also defines pagination as a GET JSON body.
+        self.get_json_body(url, request).await
+    }
+
+    pub async fn update_group_join_strategy(
+        &self,
+        strategy_id: &str,
+        request: &UpdateGroupJoinStrategyRequest,
+    ) -> Result<GroupJoinStrategyUpdated, ApiError> {
+        validate_path_id("strategy_id", strategy_id)?;
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["v2", "groups", "join_approval_strategy", strategy_id])?;
+        self.patch_json(url, request).await
+    }
+
+    pub async fn execute_group_join_strategy(&self, strategy_id: &str) -> Result<(), ApiError> {
+        validate_path_id("strategy_id", strategy_id)?;
+        let url = self.endpoint(&[
+            "v2",
+            "groups",
+            "join_approval_strategy",
+            strategy_id,
+            "execute",
+        ])?;
+        self.post_unit(url).await
+    }
+
+    pub async fn update_group_join_strategy_whitelist(
+        &self,
+        strategy_id: &str,
+        request: &UpdateGroupJoinStrategyWhitelistRequest,
+    ) -> Result<GroupJoinStrategyWhitelistUpdated, ApiError> {
+        validate_path_id("strategy_id", strategy_id)?;
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&[
+            "v2",
+            "groups",
+            "join_approval_strategy",
+            strategy_id,
+            "whitelist_users",
+        ])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn delete_group_join_strategy(&self, strategy_id: &str) -> Result<(), ApiError> {
+        validate_path_id("strategy_id", strategy_id)?;
+        let url = self.endpoint(&["v2", "groups", "join_approval_strategy", strategy_id])?;
+        self.delete(url).await
+    }
+
     fn endpoint(&self, segments: &[&str]) -> Result<Url, ApiError> {
         let mut url = self.base_url.clone();
         let mut path = url.path_segments_mut().map_err(|()| {
@@ -293,6 +430,17 @@ impl OpenApiClient {
         Self::decode(response).await
     }
 
+    async fn get_json_body<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let response = self
+            .send_authorized(|token| self.client.get(url.clone()).qqbot_token(token).json(body))
+            .await?;
+        Self::decode(response).await
+    }
+
     async fn post_json<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>
     where
         T: DeserializeOwned,
@@ -302,6 +450,23 @@ impl OpenApiClient {
             .send_authorized(|token| self.client.post(url.clone()).qqbot_token(token).json(body))
             .await?;
         Self::decode(response).await
+    }
+
+    async fn post_json_unit<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let response = self
+            .send_authorized(|token| self.client.post(url.clone()).qqbot_token(token).json(body))
+            .await?;
+        Self::decode_unit(response).await
+    }
+
+    async fn post_unit(&self, url: Url) -> Result<(), ApiError> {
+        let response = self
+            .send_authorized(|token| self.client.post(url.clone()).qqbot_token(token))
+            .await?;
+        Self::decode_unit(response).await
     }
 
     async fn patch_json<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>
@@ -319,6 +484,10 @@ impl OpenApiClient {
         let response = self
             .send_authorized(|token| self.client.delete(url.clone()).qqbot_token(token))
             .await?;
+        Self::decode_unit(response).await
+    }
+
+    async fn decode_unit(response: Response) -> Result<(), ApiError> {
         let bytes = Self::decode_bytes(response).await?;
         if bytes.is_empty() {
             return Ok(());
@@ -436,6 +605,15 @@ fn validate_channel_document(
     Ok(())
 }
 
+fn validate_path_id(field: &str, value: &str) -> Result<(), ApiError> {
+    if value.trim().is_empty() {
+        return Err(ApiError::InvalidRequest(format!(
+            "QQ OpenAPI path field `{field}` must not be empty"
+        )));
+    }
+    Ok(())
+}
+
 trait RequestBuilderExt {
     fn qqbot_token(self, token: &str) -> Self;
 }
@@ -480,9 +658,16 @@ mod tests {
     use tokio::net::TcpListener;
     use url::Url;
 
-    use crate::{MediaFileType, MediaUploadRequest, MessageRequest, auth::TokenManager};
+    use crate::{
+        CreateGroupJoinStrategyRequest, GroupJoinApprovalOperation, GroupJoinStrategyGroupAction,
+        GroupJoinStrategyGroupOperation, GroupJoinStrategySwitch,
+        GroupJoinStrategyWhitelistOperation, GroupMuteMemberOperation, GroupMuteOperation,
+        MediaFileType, MediaUploadRequest, MessageRequest, PageRequest, ReviewGroupJoinRequest,
+        SetGroupMuteRequest, UpdateGroupJoinStrategyRequest,
+        UpdateGroupJoinStrategyWhitelistRequest, auth::TokenManager,
+    };
 
-    use super::{ApiError, OpenApiClient};
+    use super::{ApiError, OpenApiClient, OpenApiEnvironment};
 
     #[derive(Clone)]
     struct StateData {
@@ -601,6 +786,116 @@ mod tests {
         StatusCode::NO_CONTENT
     }
 
+    async fn group_mute_setting(Path(group): Path<String>) -> Json<Value> {
+        assert_eq!(group, "group/id");
+        Json(json!({
+            "global_rule": {
+                "mode": "none",
+                "schedule_rules": [],
+                "recurring_rules": []
+            },
+            "members": []
+        }))
+    }
+
+    async fn set_group_mute(Path(group): Path<String>, Json(body): Json<Value>) -> StatusCode {
+        assert_eq!(group, "group/id");
+        assert_eq!(body["members"][0]["op"], "add");
+        assert_eq!(body["members"][0]["member_openid"], "member/id");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn group_join_requests(
+        Path(group): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(group, "group/id");
+        assert_eq!(body["limit"], 20);
+        Json(json!({
+            "list": [{
+                "join_request_id":"join/id",
+                "member_openid":"member/id",
+                "apply_at":"2026-08-10T10:00:00Z",
+                "apply_source":"self_apply",
+                "bot":false
+            }],
+            "next_cursor":"next"
+        }))
+    }
+
+    async fn approve_group_join_request(
+        Path((group, member)): Path<(String, String)>,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        assert_eq!(group, "group/id");
+        assert_eq!(member, "member/id");
+        assert_eq!(body["op"], "approve");
+        assert_eq!(body["join_request_id"], "join/id");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn group_join_strategies(Json(body): Json<Value>) -> Json<Value> {
+        assert_eq!(body["limit"], 20);
+        Json(json!({
+            "strategies": [{
+                "strategy_id":"strategy/id",
+                "group_openids":["group/id"],
+                "group_ids":[],
+                "whitelist_user_count":2,
+                "is_enable":"on",
+                "expire_at":"2027-08-10T10:00:00Z",
+                "created_at":"2026-08-10T10:00:00Z",
+                "updated_at":"2026-08-10T10:00:00Z"
+            }],
+            "next_cursor":""
+        }))
+    }
+
+    async fn create_group_join_strategy(Json(body): Json<Value>) -> Json<Value> {
+        assert_eq!(body["group_openids"][0], "group/id");
+        Json(json!({
+            "strategy_id":"strategy/id",
+            "is_enable":"on",
+            "expire_at":"2027-08-10T10:00:00Z"
+        }))
+    }
+
+    async fn update_group_join_strategy(
+        Path(strategy): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(strategy, "strategy/id");
+        assert_eq!(body["group_action"]["op"], "add");
+        Json(json!({
+            "is_enable":"on",
+            "expire_at":"2027-08-10T10:00:00Z"
+        }))
+    }
+
+    async fn delete_group_join_strategy(Path(strategy): Path<String>) -> StatusCode {
+        assert_eq!(strategy, "strategy/id");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn execute_group_join_strategy(Path(strategy): Path<String>) -> StatusCode {
+        assert_eq!(strategy, "strategy/id");
+        StatusCode::ACCEPTED
+    }
+
+    async fn update_group_join_strategy_whitelist(
+        Path(strategy): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(strategy, "strategy/id");
+        assert_eq!(body["op"], "add");
+        assert_eq!(body["whitelist_users"][0], "123456");
+        Json(json!({
+            "strategy_id":"strategy/id",
+            "whitelist_user_count":1,
+            "updated_at":"2026-08-10T10:00:00Z"
+        }))
+    }
+
     async fn client() -> (OpenApiClient, Arc<AtomicUsize>) {
         let token_calls = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
@@ -631,6 +926,34 @@ mod tests {
                 "/channels/{channel}",
                 get(channel).patch(update_channel).delete(delete_channel),
             )
+            .route(
+                "/v2/groups/{group}/restrict_chat_setting",
+                get(group_mute_setting).post(set_group_mute),
+            )
+            .route(
+                "/v2/groups/{group}/join_request_list",
+                get(group_join_requests),
+            )
+            .route(
+                "/v2/groups/{group}/approval_join_request/{member}",
+                post(approve_group_join_request),
+            )
+            .route(
+                "/v2/groups/join_approval_strategy",
+                get(group_join_strategies).post(create_group_join_strategy),
+            )
+            .route(
+                "/v2/groups/join_approval_strategy/{strategy}",
+                delete(delete_group_join_strategy).patch(update_group_join_strategy),
+            )
+            .route(
+                "/v2/groups/join_approval_strategy/{strategy}/execute",
+                post(execute_group_join_strategy),
+            )
+            .route(
+                "/v2/groups/join_approval_strategy/{strategy}/whitelist_users",
+                post(update_group_join_strategy_whitelist),
+            )
             .with_state(StateData {
                 token_calls: Arc::clone(&token_calls),
             });
@@ -650,6 +973,18 @@ mod tests {
             OpenApiClient::with_base_url(base, tokens).unwrap(),
             token_calls,
         )
+    }
+
+    #[test]
+    fn official_environments_use_the_unified_august_api_host() {
+        assert_eq!(
+            OpenApiEnvironment::Production.base_url(),
+            "https://api.bot.qq.com/"
+        );
+        assert_eq!(
+            OpenApiEnvironment::Sandbox.base_url(),
+            "https://api.bot.qq.com/"
+        );
     }
 
     #[tokio::test]
@@ -740,5 +1075,121 @@ mod tests {
             Err(ApiError::InvalidRequest(_))
         ));
         assert_eq!(token_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn group_management_methods_match_the_august_api_contract() {
+        let (client, _) = client().await;
+        assert_eq!(
+            client
+                .group_mute_setting("group/id")
+                .await
+                .unwrap()
+                .global_rule
+                .mode,
+            "none"
+        );
+        client
+            .set_group_mute(
+                "group/id",
+                &SetGroupMuteRequest {
+                    members: vec![GroupMuteMemberOperation {
+                        op: GroupMuteOperation::Add,
+                        member_openid: "member/id".to_owned(),
+                        mute_expire_at: Some("2099-08-11T10:00:00Z".to_owned()),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        let page = PageRequest {
+            cursor: None,
+            limit: Some(20),
+        };
+        assert_eq!(
+            client
+                .group_join_requests("group/id", &page)
+                .await
+                .unwrap()
+                .list[0]
+                .join_request_id,
+            "join/id"
+        );
+        client
+            .review_group_join_request(
+                "group/id",
+                "member/id",
+                &ReviewGroupJoinRequest {
+                    op: GroupJoinApprovalOperation::Approve,
+                    join_request_id: "join/id".to_owned(),
+                    reject_reason: None,
+                    add_to_member_blacklist: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_join_strategy_methods_match_the_august_api_contract() {
+        let (client, _) = client().await;
+        let page = PageRequest {
+            cursor: None,
+            limit: Some(20),
+        };
+        let created = client
+            .create_group_join_strategy(&CreateGroupJoinStrategyRequest {
+                group_openids: vec!["group/id".to_owned()],
+                group_ids: Vec::new(),
+                is_enable: Some(GroupJoinStrategySwitch::On),
+                expire_at: None,
+                remark: Some("trusted users".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.strategy_id, "strategy/id");
+        assert_eq!(
+            client
+                .group_join_strategies(&page)
+                .await
+                .unwrap()
+                .strategies[0]
+                .strategy_id,
+            "strategy/id"
+        );
+        client
+            .update_group_join_strategy(
+                "strategy/id",
+                &UpdateGroupJoinStrategyRequest {
+                    is_enable: None,
+                    expire_at: None,
+                    group_action: Some(GroupJoinStrategyGroupAction {
+                        op: GroupJoinStrategyGroupOperation::Add,
+                        group_openids: vec!["group/id".to_owned()],
+                        group_ids: Vec::new(),
+                    }),
+                    remark: None,
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .update_group_join_strategy_whitelist(
+                "strategy/id",
+                &UpdateGroupJoinStrategyWhitelistRequest {
+                    op: GroupJoinStrategyWhitelistOperation::Add,
+                    whitelist_users: vec!["123456".to_owned()],
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .execute_group_join_strategy("strategy/id")
+            .await
+            .unwrap();
+        client
+            .delete_group_join_strategy("strategy/id")
+            .await
+            .unwrap();
     }
 }

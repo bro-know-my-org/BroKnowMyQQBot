@@ -13,8 +13,10 @@ use bot_core::{
 };
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
-    ApiError, AuthError, ChannelMessageRequest, GatewayPayload, InlineMediaUploadRequest, Intents,
-    MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient,
+    ApiError, AuthError, ChannelMessageRequest, CreateGroupJoinStrategyRequest, GatewayPayload,
+    GroupMuteMemberOperation, InlineMediaUploadRequest, Intents, MediaFileType, MediaUploadRequest,
+    MessageRequest, MessageResponse, OpCode, OpenApiClient, PageRequest, ReviewGroupJoinRequest,
+    SetGroupMuteRequest, UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -498,6 +500,51 @@ struct UpdateChannelAction {
     body: Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct GroupOpenIdAction {
+    group_openid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetGroupMuteAction {
+    group_openid: String,
+    members: Vec<GroupMuteMemberOperation>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupJoinRequestListAction {
+    group_openid: String,
+    #[serde(flatten)]
+    page: PageRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReviewGroupJoinAction {
+    group_openid: String,
+    member_openid: String,
+    #[serde(flatten)]
+    request: ReviewGroupJoinRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupJoinStrategyAction {
+    strategy_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGroupJoinStrategyAction {
+    strategy_id: String,
+    #[serde(flatten)]
+    request: UpdateGroupJoinStrategyRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGroupJoinStrategyWhitelistAction {
+    strategy_id: String,
+    #[serde(flatten)]
+    request: UpdateGroupJoinStrategyWhitelistRequest,
+}
+
 impl QqActionExecutor {
     pub(crate) fn new(
         adapter_id: AdapterId,
@@ -707,6 +754,18 @@ impl QqActionExecutor {
             | "qq.channel.create" | "qq.channel.update" | "qq.channel.delete" => {
                 self.execute_channel_action(name, payload).await
             }
+            "qq.group.mute.get"
+            | "qq.group.mute.set"
+            | "qq.group.join-request.list"
+            | "qq.group.join-request.review"
+            | "qq.group.join-strategy.create"
+            | "qq.group.join-strategy.list"
+            | "qq.group.join-strategy.update"
+            | "qq.group.join-strategy.execute"
+            | "qq.group.join-strategy.whitelist"
+            | "qq.group.join-strategy.delete" => {
+                self.execute_group_management_action(name, payload).await
+            }
             _ => Err(AdapterError::Action(format!(
                 "unsupported QQ platform Action `{name}`"
             ))),
@@ -862,6 +921,148 @@ impl QqActionExecutor {
         }
     }
 
+    async fn execute_group_management_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.group.mute.get" | "qq.group.mute.set" => {
+                self.execute_group_mute_action(name, payload).await
+            }
+            "qq.group.join-request.list" | "qq.group.join-request.review" => {
+                self.execute_group_join_request_action(name, payload).await
+            }
+            _ => self.execute_group_join_strategy_action(name, payload).await,
+        }
+    }
+
+    async fn execute_group_mute_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.group.mute.get" => {
+                let action: GroupOpenIdAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api.group_mute_setting(&action.group_openid).await,
+                )
+            }
+            "qq.group.mute.set" => {
+                let action: SetGroupMuteAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.group.mute.set",
+                    "group",
+                    self.api
+                        .set_group_mute(
+                            &action.group_openid,
+                            &SetGroupMuteRequest {
+                                members: action.members,
+                            },
+                        )
+                        .await,
+                )
+            }
+            _ => unreachable!("group-mute Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_group_join_request_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.group.join-request.list" => {
+                let action: GroupJoinRequestListAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .group_join_requests(&action.group_openid, &action.page)
+                        .await,
+                )
+            }
+            "qq.group.join-request.review" => {
+                let action: ReviewGroupJoinAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.group.join-request.review",
+                    "group",
+                    self.api
+                        .review_group_join_request(
+                            &action.group_openid,
+                            &action.member_openid,
+                            &action.request,
+                        )
+                        .await,
+                )
+            }
+            _ => unreachable!("group-join-request Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_group_join_strategy_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.group.join-strategy.create" => {
+                let request: CreateGroupJoinStrategyRequest =
+                    decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api.create_group_join_strategy(&request).await,
+                )
+            }
+            "qq.group.join-strategy.list" => {
+                let request: PageRequest = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.group_join_strategies(&request).await)
+            }
+            "qq.group.join-strategy.update" => {
+                let action: UpdateGroupJoinStrategyAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .update_group_join_strategy(&action.strategy_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.group.join-strategy.execute" => {
+                let action: GroupJoinStrategyAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.group.join-strategy.execute",
+                    "group",
+                    self.api
+                        .execute_group_join_strategy(&action.strategy_id)
+                        .await,
+                )
+            }
+            "qq.group.join-strategy.whitelist" => {
+                let action: UpdateGroupJoinStrategyWhitelistAction =
+                    decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .update_group_join_strategy_whitelist(&action.strategy_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.group.join-strategy.delete" => {
+                let action: GroupJoinStrategyAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.group.join-strategy.delete",
+                    "group",
+                    self.api
+                        .delete_group_join_strategy(&action.strategy_id)
+                        .await,
+                )
+            }
+            _ => unreachable!("group-join-strategy Action dispatcher only calls known names"),
+        }
+    }
+
     fn complete_unit_action(
         &self,
         action_type: &'static str,
@@ -887,6 +1088,34 @@ impl QqActionExecutor {
     ) -> Result<ActionResult, AdapterError> {
         match result {
             Ok(raw) => {
+                info!(adapter_id = %self.adapter_id, action_type, "QQ platform action succeeded");
+                Ok(ActionResult {
+                    message_id: None,
+                    raw,
+                })
+            }
+            Err(error) => {
+                warn!(adapter_id = %self.adapter_id, action_type, error = %error, "QQ platform action failed");
+                Err(map_action_error(&error))
+            }
+        }
+    }
+
+    fn complete_typed_action<T>(
+        &self,
+        action_type: &str,
+        result: Result<T, ApiError>,
+    ) -> Result<ActionResult, AdapterError>
+    where
+        T: Serialize,
+    {
+        match result {
+            Ok(result) => {
+                let raw = serde_json::to_value(result).map_err(|error| {
+                    AdapterError::ActionUnknown(format!(
+                        "QQ platform action `{action_type}` response could not be encoded: {error}"
+                    ))
+                })?;
                 info!(adapter_id = %self.adapter_id, action_type, "QQ platform action succeeded");
                 Ok(ActionResult {
                     message_id: None,

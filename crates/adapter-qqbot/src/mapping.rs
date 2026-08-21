@@ -6,7 +6,8 @@ use bot_core::{
     AdapterId, CommonMessage, Event, EventEnvelope, EventId, MessageSegment, MessageTarget, Sender,
 };
 use chrono::{DateTime, Utc};
-use qqbot_protocol::{GatewayPayload, QqMessage};
+use qqbot_protocol::{GatewayPayload, GroupJoinRequestEvent, QqMessage};
+use serde::Deserialize as _;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
@@ -36,28 +37,29 @@ const NOTICE_EVENTS: &[&str] = &[
     "MESSAGE_AUDIT_PASS",
     "MESSAGE_AUDIT_REJECT",
 ];
+const REQUEST_EVENTS: &[&str] = &["GROUP_JOIN_REQUEST"];
 
 #[derive(Debug, Error)]
 pub(crate) enum MappingError {
-    #[error("QQ message dispatch `{event_type}` could not be decoded")]
+    #[error("QQ dispatch `{event_type}` could not be decoded")]
     Decode {
         event_type: String,
         #[source]
         source: serde_json::Error,
     },
-    #[error("QQ message dispatch `{event_type}` is missing {field}")]
+    #[error("QQ dispatch `{event_type}` is missing {field}")]
     MissingField {
         event_type: String,
         field: &'static str,
     },
-    #[error("QQ message dispatch `{event_type}` has an invalid timestamp")]
+    #[error("QQ dispatch `{event_type}` has an invalid timestamp")]
     InvalidTimestamp {
         event_type: String,
         #[source]
         source: chrono::ParseError,
     },
-    #[error("QQ notice dispatch `{event_type}` contains invalid data")]
-    InvalidNoticeData { event_type: String },
+    #[error("QQ structured dispatch `{event_type}` contains invalid data")]
+    InvalidEventData { event_type: String },
 }
 
 pub(crate) fn map_dispatch(
@@ -68,7 +70,11 @@ pub(crate) fn map_dispatch(
         return Ok(None);
     };
     if NOTICE_EVENTS.contains(&event_type) {
-        return map_notice(adapter, payload, event_type).map(Some);
+        return map_structured_event(adapter, payload, event_type, "timestamp", Event::Notice)
+            .map(Some);
+    }
+    if REQUEST_EVENTS.contains(&event_type) {
+        return map_group_join_request(adapter, payload, event_type).map(Some);
     }
     if !GROUP_EVENTS.contains(&event_type)
         && !PRIVATE_EVENTS.contains(&event_type)
@@ -151,13 +157,37 @@ pub(crate) fn map_dispatch(
     }))
 }
 
-fn map_notice(
+fn map_group_join_request(
     adapter: &AdapterId,
     payload: &GatewayPayload,
     event_type: &str,
 ) -> Result<EventEnvelope, MappingError> {
+    let request =
+        GroupJoinRequestEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    if request.group_openid.trim().is_empty()
+        || request.request.join_request_id.trim().is_empty()
+        || request.request.member_openid.trim().is_empty()
+        || request.request.apply_source.trim().is_empty()
+    {
+        return Err(MappingError::InvalidEventData {
+            event_type: event_type.to_owned(),
+        });
+    }
+    map_structured_event(adapter, payload, event_type, "apply_at", Event::Request)
+}
+
+fn map_structured_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+    timestamp_field: &str,
+    wrap: fn(serde_json::Value) -> Event,
+) -> Result<EventEnvelope, MappingError> {
     if !payload.d.is_object() {
-        return Err(MappingError::InvalidNoticeData {
+        return Err(MappingError::InvalidEventData {
             event_type: event_type.to_owned(),
         });
     }
@@ -183,7 +213,7 @@ fn map_notice(
             },
             Ok,
         )?;
-    let timestamp = match payload.d.get("timestamp") {
+    let timestamp = match payload.d.get(timestamp_field) {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(value)) => Some(
             DateTime::parse_from_rfc3339(value)
@@ -194,7 +224,7 @@ fn map_notice(
                 .with_timezone(&Utc),
         ),
         Some(_) => {
-            return Err(MappingError::InvalidNoticeData {
+            return Err(MappingError::InvalidEventData {
                 event_type: event_type.to_owned(),
             });
         }
@@ -204,7 +234,7 @@ fn map_notice(
         adapter: adapter.clone(),
         delivery_id: None,
         timestamp,
-        event: Event::Notice(serde_json::json!({
+        event: wrap(serde_json::json!({
             "type": event_type,
             "data": payload.d,
         })),
@@ -286,6 +316,108 @@ mod tests {
         };
         assert_eq!(notice["type"], "GROUP_ADD_ROBOT");
         assert_eq!(notice["data"]["group_openid"], "group-id");
+    }
+
+    #[test]
+    fn maps_group_join_request_as_request_event() {
+        let payload = GatewayPayload {
+            id: Some("request-event-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "group_openid":"group-id",
+                "join_request_id":"join-request-id",
+                "member_openid":"member-id",
+                "apply_at":"2099-08-10T10:00:00Z",
+                "apply_source":"self_apply"
+            }),
+            s: Some(4),
+            t: Some("GROUP_JOIN_REQUEST".to_owned()),
+        };
+
+        let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            envelope.timestamp.unwrap().to_rfc3339(),
+            "2099-08-10T10:00:00+00:00"
+        );
+        let Event::Request(request) = envelope.event else {
+            panic!("expected request event");
+        };
+        assert_eq!(request["type"], "GROUP_JOIN_REQUEST");
+        assert_eq!(request["data"]["join_request_id"], "join-request-id");
+    }
+
+    #[test]
+    fn rejects_malformed_group_join_requests() {
+        let base = GatewayPayload {
+            id: Some("request-event-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "group_openid":"group-id",
+                "join_request_id":"join-request-id",
+                "member_openid":"member-id",
+                "apply_at":"2099-08-10T10:00:00Z",
+                "apply_source":"self_apply"
+            }),
+            s: Some(4),
+            t: Some("GROUP_JOIN_REQUEST".to_owned()),
+        };
+
+        for invalid in [
+            json!({
+                "join_request_id":"join-request-id",
+                "member_openid":"member-id",
+                "apply_at":"2099-08-10T10:00:00Z",
+                "apply_source":"self_apply"
+            }),
+            json!({
+                "group_openid":" ",
+                "join_request_id":"join-request-id",
+                "member_openid":"member-id",
+                "apply_at":"2099-08-10T10:00:00Z",
+                "apply_source":"self_apply"
+            }),
+            json!({
+                "group_openid":"group-id",
+                "join_request_id":" ",
+                "member_openid":"member-id",
+                "apply_at":"2099-08-10T10:00:00Z",
+                "apply_source":"self_apply"
+            }),
+            json!({
+                "group_openid":"group-id",
+                "join_request_id":"join-request-id",
+                "member_openid":" ",
+                "apply_at":"2099-08-10T10:00:00Z",
+                "apply_source":"self_apply"
+            }),
+            json!({
+                "group_openid":"group-id",
+                "join_request_id":"join-request-id",
+                "member_openid":"member-id",
+                "apply_at":"2099-08-10T10:00:00Z",
+                "apply_source":" "
+            }),
+            json!({
+                "group_openid":"group-id",
+                "join_request_id":"join-request-id",
+                "member_openid":"member-id",
+                "apply_at":42,
+                "apply_source":"self_apply"
+            }),
+            json!({
+                "group_openid":"group-id",
+                "join_request_id":"join-request-id",
+                "member_openid":"member-id",
+                "apply_at":"not-a-timestamp",
+                "apply_source":"self_apply"
+            }),
+        ] {
+            let mut payload = base.clone();
+            payload.d = invalid;
+            assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
+        }
     }
 
     #[test]

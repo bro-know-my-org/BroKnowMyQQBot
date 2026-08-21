@@ -139,6 +139,22 @@ impl MessageRequest {
         }
     }
 
+    /// Builds a Markdown message that fails instead of sending when QQ cannot
+    /// transfer an image resource referenced by the Markdown payload.
+    pub fn markdown_with_image_verification(
+        mut markdown: serde_json::Value,
+        keyboard: Option<serde_json::Value>,
+    ) -> Result<Self, &'static str> {
+        let object = markdown
+            .as_object_mut()
+            .ok_or("QQ Markdown payload must be a JSON object")?;
+        object.insert(
+            "force_verify_image_resource".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+        Ok(Self::markdown(markdown, keyboard))
+    }
+
     pub fn ark(ark: serde_json::Value) -> Self {
         Self {
             msg_type: MessageType::ARK,
@@ -465,6 +481,18 @@ mod tests {
             message.author.member_openid.as_deref(),
             Some("member-open-id")
         );
+    }
+
+    #[test]
+    fn enables_strict_markdown_image_verification() {
+        let request = MessageRequest::markdown_with_image_verification(
+            json!({"custom_template_id":"template-id"}),
+            None,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["markdown"]["force_verify_image_resource"], true);
+        assert!(MessageRequest::markdown_with_image_verification(json!([]), None).is_err());
     }
 
     #[test]
