@@ -22,7 +22,8 @@ pub use group::{
     UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
 };
 pub use message::{
-    ChannelMessageRequest, InlineMediaUploadRequest, MediaFileType, MediaUploadRequest,
-    MediaUploadResponse, MessageRequest, MessageResponse, MessageType, QqMessage,
+    ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
+    InlineMediaUploadRequest, MediaFileType, MediaUploadRequest, MediaUploadResponse,
+    MessageRequest, MessageResponse, MessageType, QqMessage,
 };
 pub use openapi::{ApiError, OpenApiClient, OpenApiEnvironment};

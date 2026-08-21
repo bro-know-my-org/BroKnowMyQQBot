@@ -257,6 +257,28 @@ pub struct ChannelMessageRequest {
     msg_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateDirectMessageRequest {
+    pub recipient_id: String,
+    pub source_guild_id: String,
+}
+
+impl CreateDirectMessageRequest {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.recipient_id.trim().is_empty() || self.source_guild_id.trim().is_empty() {
+            return Err("QQ direct-message session requires recipient_id and source_guild_id");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectMessageSession {
+    pub guild_id: String,
+    pub channel_id: String,
+    pub create_time: String,
+}
+
 impl ChannelMessageRequest {
     pub fn text(content: impl Into<String>) -> Self {
         Self {

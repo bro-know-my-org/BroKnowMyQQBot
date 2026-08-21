@@ -21,4 +21,4 @@ pub use protocol::{
     StateOp, StateValue, StaticPlugin,
 };
 
-pub const BPP_VERSION: &str = "1.1.0";
+pub const BPP_VERSION: &str = "1.2.0";

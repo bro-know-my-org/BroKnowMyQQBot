@@ -134,6 +134,7 @@ pub(super) fn wit_target(target: MessageTarget) -> types::MessageTarget {
         MessageTarget::Group { group_id } => types::MessageTarget::Group(group_id),
         MessageTarget::Private { user_id } => types::MessageTarget::Private(user_id),
         MessageTarget::Channel { channel_id } => types::MessageTarget::Channel(channel_id),
+        MessageTarget::GuildDirect { guild_id } => types::MessageTarget::GuildDirect(guild_id),
     }
 }
 
@@ -454,6 +455,9 @@ fn plugin_target(target: types::MessageTarget) -> PluginMessageTarget {
         types::MessageTarget::Group(group_id) => PluginMessageTarget::Group { group_id },
         types::MessageTarget::Private(user_id) => PluginMessageTarget::Private { user_id },
         types::MessageTarget::Channel(channel_id) => PluginMessageTarget::Channel { channel_id },
+        types::MessageTarget::GuildDirect(guild_id) => {
+            PluginMessageTarget::GuildDirect { guild_id }
+        }
     }
 }
 
@@ -462,6 +466,7 @@ pub(super) fn core_target(target: types::MessageTarget) -> MessageTarget {
         types::MessageTarget::Group(group_id) => MessageTarget::Group { group_id },
         types::MessageTarget::Private(user_id) => MessageTarget::Private { user_id },
         types::MessageTarget::Channel(channel_id) => MessageTarget::Channel { channel_id },
+        types::MessageTarget::GuildDirect(guild_id) => MessageTarget::GuildDirect { guild_id },
     }
 }
 

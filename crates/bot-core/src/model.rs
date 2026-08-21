@@ -71,13 +71,14 @@ pub enum MessageTarget {
     Group { group_id: String },
     Private { user_id: String },
     Channel { channel_id: String },
+    GuildDirect { guild_id: String },
 }
 
 impl MessageTarget {
     pub const fn scope(&self) -> MessageScope {
         match self {
             Self::Group { .. } => MessageScope::Group,
-            Self::Private { .. } => MessageScope::Private,
+            Self::Private { .. } | Self::GuildDirect { .. } => MessageScope::Private,
             Self::Channel { .. } => MessageScope::Channel,
         }
     }
@@ -353,6 +354,14 @@ mod tests {
             group_id: "opaque".to_owned(),
         };
         assert_eq!(target.scope(), MessageScope::Group);
+        let direct = MessageTarget::GuildDirect {
+            guild_id: "opaque-guild".to_owned(),
+        };
+        assert_eq!(direct.scope(), MessageScope::Private);
+        assert_eq!(
+            serde_json::to_value(direct).unwrap(),
+            serde_json::json!({"scope":"guild_direct","guild_id":"opaque-guild"})
+        );
     }
 
     #[test]

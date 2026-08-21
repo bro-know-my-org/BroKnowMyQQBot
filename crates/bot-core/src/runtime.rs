@@ -1118,6 +1118,9 @@ fn runtime_partition_key(event: &crate::EventEnvelope) -> String {
             crate::MessageTarget::Channel { channel_id } => {
                 format!("{adapter}:channel:{channel_id}")
             }
+            crate::MessageTarget::GuildDirect { guild_id } => {
+                format!("{adapter}:guild-direct:{guild_id}")
+            }
         },
         _ => format!("{adapter}:event:{}", event.id),
     }

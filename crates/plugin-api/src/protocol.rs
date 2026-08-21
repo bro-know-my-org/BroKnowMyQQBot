@@ -264,6 +264,7 @@ pub enum PluginMessageTarget {
     Group { group_id: String },
     Private { user_id: String },
     Channel { channel_id: String },
+    GuildDirect { guild_id: String },
 }
 
 const fn default_consume_asset() -> bool {

@@ -104,6 +104,11 @@ impl Intents {
     pub const fn with_public_guild_messages(self) -> Self {
         self.union(Self::PUBLIC_GUILD_MESSAGES)
     }
+
+    #[must_use]
+    pub const fn with_direct_messages(self) -> Self {
+        self.union(Self::DIRECT_MESSAGE)
+    }
 }
 
 impl Serialize for Intents {
@@ -178,10 +183,11 @@ mod tests {
     fn intents_use_numeric_wire_format_and_keep_unknown_bits() {
         let intents = Intents::empty()
             .with_group_and_c2c()
-            .with_public_guild_messages();
+            .with_public_guild_messages()
+            .with_direct_messages();
         assert_eq!(
             serde_json::to_value(intents).unwrap(),
-            (1_u32 << 25) | (1_u32 << 30)
+            (1_u32 << 12) | (1_u32 << 25) | (1_u32 << 30)
         );
 
         let decoded: Intents = serde_json::from_str("2147483648").unwrap();

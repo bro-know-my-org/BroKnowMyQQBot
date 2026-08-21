@@ -76,6 +76,19 @@ async fn channel_reply(
     (StatusCode::OK, Json(json!({"id":"reply-message-id"})))
 }
 
+async fn direct_reply(
+    State(state): State<HttpState>,
+    Path(guild_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(guild_id, "direct-guild-id");
+    assert_eq!(headers["authorization"], "QQBot access-token");
+    state.replies.send(body).await.unwrap();
+    state.shutdown.shutdown();
+    (StatusCode::OK, Json(json!({"id":"reply-message-id"})))
+}
+
 async fn start_gateway(message: &str) -> (String, JoinHandle<()>) {
     start_gateway_dispatch(
         "GROUP_AT_MESSAGE_CREATE",
@@ -151,6 +164,7 @@ async fn start_http(
         .route("/v2/groups/{group_id}/messages", post(group_reply))
         .route("/v2/users/{user_id}/messages", post(c2c_reply))
         .route("/channels/{channel_id}/messages", post(channel_reply))
+        .route("/dms/{guild_id}/messages", post(direct_reply))
         .with_state(HttpState {
             gateway_url,
             replies: reply_sender,
@@ -269,6 +283,24 @@ async fn channel_websocket_event_replies_through_channel_openapi() {
             "id":"source-message-id",
             "content":"/ping",
             "channel_id":"channel-id",
+            "author":{"id":"author-id"}
+        }),
+    )
+    .await;
+    assert_eq!(reply["content"], "pong");
+    assert_eq!(reply["msg_id"], "source-message-id");
+    assert!(reply.get("msg_type").is_none());
+}
+
+#[tokio::test]
+async fn guild_direct_event_replies_through_dms_openapi() {
+    let reply = run_ping_dispatch(
+        "DIRECT_MESSAGE_CREATE",
+        json!({
+            "id":"source-message-id",
+            "content":"/ping",
+            "guild_id":"direct-guild-id",
+            "channel_id":"direct-channel-id",
             "author":{"id":"author-id"}
         }),
     )

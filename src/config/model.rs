@@ -17,11 +17,13 @@ pub(crate) struct BotConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct QqConfig {
     pub(crate) enabled: bool,
     pub(crate) environment: String,
     pub(crate) transport: String,
     pub(crate) public_guild_messages: bool,
+    pub(crate) direct_messages: bool,
     pub(crate) extended_events: QqExtendedEvents,
     pub(crate) check_only: bool,
     pub(crate) webhook: QqWebhookConfig,
@@ -34,6 +36,7 @@ impl Default for QqConfig {
             environment: "production".to_owned(),
             transport: "websocket".to_owned(),
             public_guild_messages: false,
+            direct_messages: false,
             extended_events: QqExtendedEvents::default(),
             check_only: false,
             webhook: QqWebhookConfig::default(),

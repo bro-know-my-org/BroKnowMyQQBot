@@ -22,7 +22,7 @@ pub(crate) fn run(
     let languages = ["English (default)", "简体中文"];
     let language_default = usize::from(config.logging.console.language == "zh-CN");
     let language = Select::with_theme(&theme)
-        .with_prompt("1/8 Language / 语言")
+        .with_prompt("1/9 Language / 语言")
         .items(&languages)
         .default(language_default)
         .interact()?;
@@ -71,6 +71,15 @@ pub(crate) fn run(
         .with_prompt(text.public_guild_prompt)
         .default(config.qq.public_guild_messages)
         .interact()?;
+    if config.qq.environment == "production" {
+        config.qq.direct_messages = Confirm::with_theme(&theme)
+            .with_prompt(text.direct_messages_prompt)
+            .default(config.qq.direct_messages)
+            .interact()?;
+    } else {
+        config.qq.direct_messages = false;
+        println!("{}", text.direct_messages_disabled);
+    }
     config.qq.check_only = Confirm::with_theme(&theme)
         .with_prompt(text.check_only_prompt)
         .default(config.qq.check_only)
@@ -173,6 +182,8 @@ struct SetupText {
     app_id_prompt: &'static str,
     app_secret_prompt: &'static str,
     public_guild_prompt: &'static str,
+    direct_messages_prompt: &'static str,
+    direct_messages_disabled: &'static str,
     check_only_prompt: &'static str,
     profiles: [&'static str; 2],
     profile_prompt: &'static str,
@@ -188,14 +199,16 @@ impl SetupText {
             Self {
                 title: "BroKnowMyQQBot 单 Bot 首次启动配置",
                 environments: ["production（正式环境）", "sandbox（沙箱环境）"],
-                environment_prompt: "2/8 选择 QQ Bot 环境",
-                app_id_prompt: "3/8 输入 QQ AppID",
-                app_secret_prompt: "4/8 输入 QQ AppSecret（输入内容不会显示）",
-                public_guild_prompt: "5/8 是否启用公域频道消息 Intent？没有权限请选择否",
-                check_only_prompt: "6/8 首次启动是否只做凭据、Gateway 与插件预检？",
+                environment_prompt: "2/9 选择 QQ Bot 环境",
+                app_id_prompt: "3/9 输入 QQ AppID",
+                app_secret_prompt: "4/9 输入 QQ AppSecret（输入内容不会显示）",
+                public_guild_prompt: "5/9 是否启用公域频道消息 Intent？没有权限请选择否",
+                direct_messages_prompt: "6/9 是否启用频道私信 Intent？仅正式环境私域机器人可用",
+                direct_messages_disabled: "6/9 频道私信 Intent 不支持沙箱环境，已保持关闭",
+                check_only_prompt: "7/9 首次启动是否只做凭据、Gateway 与插件预检？",
                 profiles: ["基础插件（Ping/Help/Counter/Echo）", "完整功能测试插件"],
-                profile_prompt: "7/8 选择插件组合",
-                message_content_prompt: "8/8 是否在控制台和消息日志中完整记录消息正文？",
+                profile_prompt: "8/9 选择插件组合",
+                message_content_prompt: "9/9 是否在控制台和消息日志中完整记录消息正文？",
                 completed: "配置完成",
                 configuration: "普通配置",
                 credentials: "登录凭据",
@@ -204,17 +217,19 @@ impl SetupText {
             Self {
                 title: "BroKnowMyQQBot first-run setup",
                 environments: ["production", "sandbox"],
-                environment_prompt: "2/8 Select the QQ Bot environment",
-                app_id_prompt: "3/8 Enter the QQ AppID",
-                app_secret_prompt: "4/8 Enter the QQ AppSecret (input is hidden)",
-                public_guild_prompt: "5/8 Enable the public guild message intent?",
-                check_only_prompt: "6/8 Run credential, Gateway, and plugin checks only?",
+                environment_prompt: "2/9 Select the QQ Bot environment",
+                app_id_prompt: "3/9 Enter the QQ AppID",
+                app_secret_prompt: "4/9 Enter the QQ AppSecret (input is hidden)",
+                public_guild_prompt: "5/9 Enable the public guild message intent?",
+                direct_messages_prompt: "6/9 Enable the guild direct-message intent? Production private-domain bots only.",
+                direct_messages_disabled: "6/9 Guild direct-message intent is unavailable in sandbox and remains disabled.",
+                check_only_prompt: "7/9 Run credential, Gateway, and plugin checks only?",
                 profiles: [
                     "Basic plugins (Ping/Help/Counter/Echo)",
                     "Full smoke-test plugins",
                 ],
-                profile_prompt: "7/8 Select the plugin profile",
-                message_content_prompt: "8/8 Record complete message content in console and message logs?",
+                profile_prompt: "8/9 Select the plugin profile",
+                message_content_prompt: "9/9 Record complete message content in console and message logs?",
                 completed: "Setup complete",
                 configuration: "Configuration",
                 credentials: "Credentials",

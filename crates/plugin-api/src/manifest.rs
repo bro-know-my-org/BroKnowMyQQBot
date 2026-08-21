@@ -1259,7 +1259,7 @@ methods = ["POST"]
 path_prefixes = ["/repos/"]
 credential = "github_issue"
 "#;
-        for requirement in [">=1.0,<2.0", ">=1.0.1,<=1.1.0"] {
+        for requirement in [">=1.0,<2.0", ">=1.0.1,<=1.2.0"] {
             let error =
                 PluginManifest::from_toml(&source.replace("PROTOCOL_REQUIREMENT", requirement))
                     .unwrap_err();

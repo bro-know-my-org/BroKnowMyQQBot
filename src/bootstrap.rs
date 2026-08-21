@@ -252,6 +252,9 @@ async fn build_adapters(
         if config.qq.public_guild_messages {
             intents = intents.with_public_guild_messages();
         }
+        if config.qq.direct_messages {
+            intents = intents.with_direct_messages();
+        }
         if config.qq.extended_events.is_enabled() {
             intents |= Intents::GUILDS
                 | Intents::GUILD_MEMBERS

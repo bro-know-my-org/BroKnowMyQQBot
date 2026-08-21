@@ -3108,7 +3108,7 @@ fn source_template(class_name: &str, command: &str) -> String {
 
 fn readme_template(display_name: &str, command: &str) -> String {
     format!(
-        "# {display_name}\n\nGenerated BPP 1.1 plugin.\n\n```bash\nbkmqb plugin check\nbkmqb plugin build\nbkmqb plugin inspect target/bkmqb/*.bkm-plugin\nbkmqb plugin install target/bkmqb/*.bkm-plugin\nbkmqb plugin publish\n```\n\nThe starter command is `/{command}`.\n"
+        "# {display_name}\n\nGenerated BPP 1.2 plugin.\n\n```bash\nbkmqb plugin check\nbkmqb plugin build\nbkmqb plugin inspect target/bkmqb/*.bkm-plugin\nbkmqb plugin install target/bkmqb/*.bkm-plugin\nbkmqb plugin publish\n```\n\nThe starter command is `/{command}`.\n"
     )
 }
 
@@ -3269,7 +3269,7 @@ mod tests {
         assert!(
             fs::read_to_string(directory.join("README.md"))
                 .unwrap()
-                .contains("Generated BPP 1.1 plugin")
+                .contains("Generated BPP 1.2 plugin")
         );
         fs::remove_dir_all(directory).unwrap();
     }

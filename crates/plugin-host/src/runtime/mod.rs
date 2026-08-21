@@ -1596,6 +1596,7 @@ fn message_target_partition_key(target: &MessageTarget) -> String {
         MessageTarget::Group { group_id } => format!("group:{group_id}"),
         MessageTarget::Private { user_id } => format!("private:{user_id}"),
         MessageTarget::Channel { channel_id } => format!("channel:{channel_id}"),
+        MessageTarget::GuildDirect { guild_id } => format!("guild-direct:{guild_id}"),
     }
 }
 

@@ -17,7 +17,7 @@ fn formal_wit_contract_parses_with_expected_identity() {
     assert_eq!(package.name.name, "plugin");
     assert_eq!(
         package.name.version.as_ref().map(ToString::to_string),
-        Some("1.1.0".to_owned())
+        Some("1.2.0".to_owned())
     );
     assert!(package.worlds.contains_key("plugin"));
     assert!(package.interfaces.contains_key("types"));
@@ -26,6 +26,18 @@ fn formal_wit_contract_parses_with_expected_identity() {
     assert!(package.interfaces.contains_key("handler"));
     let types_id = package.interfaces["types"];
     let types = &resolve.interfaces[types_id];
+    let message_target_id = types.types["message-target"];
+    let TypeDefKind::Variant(message_target) = &resolve.types[message_target_id].kind else {
+        panic!("BPP message-target must be a variant");
+    };
+    assert_eq!(
+        message_target
+            .cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect::<Vec<_>>(),
+        ["group", "private", "channel", "guild-direct"]
+    );
     let command_payload_id = types.types["command-payload"];
     let TypeDefKind::Variant(command_payload) = &resolve.types[command_payload_id].kind else {
         panic!("BPP command-payload must be a variant");

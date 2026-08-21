@@ -13,9 +13,10 @@ use bot_core::{
 };
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
-    ApiError, AuthError, ChannelMessageRequest, CreateGroupJoinStrategyRequest, GatewayPayload,
-    GroupMuteMemberOperation, InlineMediaUploadRequest, Intents, MediaFileType, MediaUploadRequest,
-    MessageRequest, MessageResponse, OpCode, OpenApiClient, PageRequest, ReviewGroupJoinRequest,
+    ApiError, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
+    CreateGroupJoinStrategyRequest, GatewayPayload, GroupMuteMemberOperation,
+    InlineMediaUploadRequest, Intents, MediaFileType, MediaUploadRequest, MessageRequest,
+    MessageResponse, OpCode, OpenApiClient, PageRequest, ReviewGroupJoinRequest,
     SetGroupMuteRequest, UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -602,6 +603,15 @@ impl QqActionExecutor {
                             )
                             .await
                     }
+                    MessageTarget::GuildDirect { guild_id } => {
+                        self.api
+                            .send_direct_message(
+                                guild_id,
+                                &ChannelMessageRequest::text(reply.content)
+                                    .with_reply_to(reply.source_message_id),
+                            )
+                            .await
+                    }
                 };
                 self.complete_message_action("message.reply", message_scope, result, message_log)
             }
@@ -625,6 +635,14 @@ impl QqActionExecutor {
                         self.api
                             .send_channel_message(
                                 channel_id,
+                                &ChannelMessageRequest::text(message.content),
+                            )
+                            .await
+                    }
+                    MessageTarget::GuildDirect { guild_id } => {
+                        self.api
+                            .send_direct_message(
+                                guild_id,
                                 &ChannelMessageRequest::text(message.content),
                             )
                             .await
@@ -658,6 +676,11 @@ impl QqActionExecutor {
                             .recall_channel_message(channel_id, &message_id)
                             .await
                     }
+                    MessageTarget::GuildDirect { guild_id } => {
+                        self.api
+                            .recall_direct_message(guild_id, &message_id, false)
+                            .await
+                    }
                 };
                 self.complete_unit_action("message.recall", message_scope_name(&target), result)
             }
@@ -674,6 +697,14 @@ impl QqActionExecutor {
         attachment: MediaAttachment,
         caption: Option<String>,
     ) -> Result<ActionResult, AdapterError> {
+        if matches!(
+            target,
+            MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. }
+        ) {
+            return Err(AdapterError::Action(
+                "QQ guild inline media is not supported".to_owned(),
+            ));
+        }
         if caption.as_deref().is_some_and(|value| !value.is_empty()) {
             return Err(AdapterError::Action(
                 "QQ media messages do not support a caption in the same action".to_owned(),
@@ -717,10 +748,8 @@ impl QqActionExecutor {
             MessageTarget::Private { user_id } => {
                 self.api.upload_c2c_inline_media(user_id, &request).await
             }
-            MessageTarget::Channel { .. } => {
-                return Err(AdapterError::Action(
-                    "QQ channel inline media is not supported".to_owned(),
-                ));
+            MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
+                unreachable!("guild target returned above")
             }
         }
         .map_err(|error| map_action_error(&error))?;
@@ -735,7 +764,9 @@ impl QqActionExecutor {
             MessageTarget::Private { user_id } => {
                 self.api.send_c2c_message(user_id, &message).await
             }
-            MessageTarget::Channel { .. } => unreachable!("channel target returned above"),
+            MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
+                unreachable!("guild target returned above")
+            }
         };
         self.complete_message_action(action_kind, message_scope_name(&target), result, None)
     }
@@ -748,6 +779,13 @@ impl QqActionExecutor {
         match name {
             "qq.message.markdown" | "qq.message.ark" => {
                 self.execute_rich_message(name, payload).await
+            }
+            "qq.dms.create" => {
+                let request: CreateDirectMessageRequest = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api.create_direct_message_session(&request).await,
+                )
             }
             "qq.media.upload" => self.execute_media_upload(payload).await,
             "qq.guild.list" | "qq.guild.get" | "qq.channel.list" | "qq.channel.get"
@@ -831,6 +869,18 @@ impl QqActionExecutor {
                 };
                 self.api.send_channel_message(&channel_id, &request).await
             }
+            MessageTarget::GuildDirect { guild_id } => {
+                let request = if name == "qq.message.markdown" {
+                    ChannelMessageRequest::markdown(body, keyboard)
+                } else {
+                    ChannelMessageRequest::ark(body)
+                };
+                let request = match reply_to.as_deref() {
+                    Some(reply) => request.with_reply_to(reply),
+                    None => request,
+                };
+                self.api.send_direct_message(&guild_id, &request).await
+            }
         };
         self.complete_message_action(
             if name == "qq.message.markdown" {
@@ -857,9 +907,9 @@ impl QqActionExecutor {
             MessageTarget::Private { user_id } => {
                 self.api.upload_c2c_media(user_id, &request).await
             }
-            MessageTarget::Channel { .. } => {
+            MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
                 return Err(AdapterError::Action(
-                    "QQ channel media upload is not supported by this endpoint".to_owned(),
+                    "QQ guild media upload is not supported by this endpoint".to_owned(),
                 ));
             }
         }
@@ -1216,7 +1266,7 @@ fn require_object(name: &str, field: &str, value: &Value) -> Result<(), AdapterE
 const fn message_scope_name(target: &MessageTarget) -> &'static str {
     match target {
         MessageTarget::Group { .. } => "group",
-        MessageTarget::Private { .. } => "private",
+        MessageTarget::Private { .. } | MessageTarget::GuildDirect { .. } => "private",
         MessageTarget::Channel { .. } => "channel",
     }
 }
@@ -1266,6 +1316,7 @@ impl MessageActionLog {
             MessageTarget::Group { group_id } => group_id.clone(),
             MessageTarget::Private { user_id } => user_id.clone(),
             MessageTarget::Channel { channel_id } => channel_id.clone(),
+            MessageTarget::GuildDirect { guild_id } => guild_id.clone(),
         };
         Self { target_id, content }
     }
@@ -1277,6 +1328,7 @@ impl From<&bot_core::CommonMessage> for MessageLog {
             MessageTarget::Group { group_id } => group_id.clone(),
             MessageTarget::Private { user_id } => user_id.clone(),
             MessageTarget::Channel { channel_id } => channel_id.clone(),
+            MessageTarget::GuildDirect { guild_id } => guild_id.clone(),
         };
         Self {
             message_id: message.message_id.clone(),

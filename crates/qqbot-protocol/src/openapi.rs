@@ -17,8 +17,9 @@ use crate::{
         UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
     },
     message::{
-        ChannelMessageRequest, InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse,
-        MessageRequest, MessageResponse,
+        ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
+        InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
+        MessageResponse,
     },
 };
 
@@ -160,6 +161,30 @@ impl OpenApiClient {
         self.post_json(url, request).await
     }
 
+    pub async fn create_direct_message_session(
+        &self,
+        request: &CreateDirectMessageRequest,
+    ) -> Result<DirectMessageSession, ApiError> {
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["users", "@me", "dms"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn send_direct_message(
+        &self,
+        guild_id: &str,
+        request: &ChannelMessageRequest,
+    ) -> Result<MessageResponse, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let url = self.endpoint(&["dms", guild_id, "messages"])?;
+        self.post_json(url, request).await
+    }
+
     pub async fn upload_c2c_media(
         &self,
         user_openid: &str,
@@ -226,6 +251,20 @@ impl OpenApiClient {
         message_id: &str,
     ) -> Result<(), ApiError> {
         let url = self.endpoint(&["channels", channel_id, "messages", message_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn recall_direct_message(
+        &self,
+        guild_id: &str,
+        message_id: &str,
+        hide_tip: bool,
+    ) -> Result<(), ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        validate_path_id("message_id", message_id)?;
+        let mut url = self.endpoint(&["dms", guild_id, "messages", message_id])?;
+        url.query_pairs_mut()
+            .append_pair("hidetip", if hide_tip { "true" } else { "false" });
         self.delete(url).await
     }
 
@@ -648,7 +687,7 @@ mod tests {
 
     use axum::{
         Json, Router,
-        extract::{Path, State},
+        extract::{Path, Query, State},
         http::{HeaderMap, StatusCode},
         routing::{delete, get, post},
     };
@@ -659,11 +698,11 @@ mod tests {
     use url::Url;
 
     use crate::{
-        CreateGroupJoinStrategyRequest, GroupJoinApprovalOperation, GroupJoinStrategyGroupAction,
-        GroupJoinStrategyGroupOperation, GroupJoinStrategySwitch,
-        GroupJoinStrategyWhitelistOperation, GroupMuteMemberOperation, GroupMuteOperation,
-        MediaFileType, MediaUploadRequest, MessageRequest, PageRequest, ReviewGroupJoinRequest,
-        SetGroupMuteRequest, UpdateGroupJoinStrategyRequest,
+        ChannelMessageRequest, CreateDirectMessageRequest, CreateGroupJoinStrategyRequest,
+        GroupJoinApprovalOperation, GroupJoinStrategyGroupAction, GroupJoinStrategyGroupOperation,
+        GroupJoinStrategySwitch, GroupJoinStrategyWhitelistOperation, GroupMuteMemberOperation,
+        GroupMuteOperation, MediaFileType, MediaUploadRequest, MessageRequest, PageRequest,
+        ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateGroupJoinStrategyRequest,
         UpdateGroupJoinStrategyWhitelistRequest, auth::TokenManager,
     };
 
@@ -783,6 +822,36 @@ mod tests {
 
     async fn delete_channel(Path(channel): Path<String>) -> StatusCode {
         assert_eq!(channel, "channel/id");
+        StatusCode::NO_CONTENT
+    }
+
+    async fn create_direct_message(Json(body): Json<Value>) -> Json<Value> {
+        assert_eq!(body["recipient_id"], "recipient/id");
+        assert_eq!(body["source_guild_id"], "source/guild");
+        Json(json!({
+            "guild_id":"direct/guild",
+            "channel_id":"direct/channel",
+            "create_time":"2099-08-10T10:00:00Z"
+        }))
+    }
+
+    async fn send_direct_message(
+        Path(guild): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        assert_eq!(guild, "direct/guild");
+        assert_eq!(body["content"], "private pong");
+        assert_eq!(body["msg_id"], "source-message");
+        Json(json!({"id":"direct-message"}))
+    }
+
+    async fn recall_direct_message(
+        Path((guild, message)): Path<(String, String)>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> StatusCode {
+        assert_eq!(guild, "direct/guild");
+        assert_eq!(message, "direct/message");
+        assert_eq!(query.get("hidetip").map(String::as_str), Some("true"));
         StatusCode::NO_CONTENT
     }
 
@@ -915,6 +984,12 @@ mod tests {
             .route(
                 "/channels/{channel}/messages/{message}",
                 delete(recall_channel_message),
+            )
+            .route("/users/@me/dms", post(create_direct_message))
+            .route("/dms/{guild}/messages", post(send_direct_message))
+            .route(
+                "/dms/{guild}/messages/{message}",
+                delete(recall_direct_message),
             )
             .route("/users/@me/guilds", get(guilds))
             .route("/guilds/{guild}", get(guild))
@@ -1126,6 +1201,31 @@ mod tests {
                     add_to_member_blacklist: None,
                 },
             )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_message_methods_use_the_official_dms_paths() {
+        let (client, _) = client().await;
+        let session = client
+            .create_direct_message_session(&CreateDirectMessageRequest {
+                recipient_id: "recipient/id".to_owned(),
+                source_guild_id: "source/guild".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.guild_id, "direct/guild");
+        let sent = client
+            .send_direct_message(
+                "direct/guild",
+                &ChannelMessageRequest::text("private pong").with_reply_to("source-message"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.id.as_deref(), Some("direct-message"));
+        client
+            .recall_direct_message("direct/guild", "direct/message", true)
             .await
             .unwrap();
     }

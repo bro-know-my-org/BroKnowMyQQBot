@@ -474,6 +474,9 @@ fn message_target(target: PluginMessageTarget) -> bot_core::MessageTarget {
         PluginMessageTarget::Channel { channel_id } => {
             bot_core::MessageTarget::Channel { channel_id }
         }
+        PluginMessageTarget::GuildDirect { guild_id } => {
+            bot_core::MessageTarget::GuildDirect { guild_id }
+        }
     }
 }
 

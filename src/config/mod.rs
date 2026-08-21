@@ -143,6 +143,7 @@ impl BotConfig {
             "BKMQB_QQ_PUBLIC_GUILD_MESSAGES",
             &mut self.qq.public_guild_messages,
         )?;
+        apply_bool_override("BKMQB_QQ_DIRECT_MESSAGES", &mut self.qq.direct_messages)?;
         apply_bool_override("BKMQB_QQ_EXTENDED_EVENTS", &mut self.qq.extended_events.0)?;
         apply_bool_override("BKMQB_QQ_CHECK_ONLY", &mut self.qq.check_only)?;
         if let Ok(value) = env::var("BKMQB_QQ_WEBHOOK_LISTEN") {
@@ -230,6 +231,11 @@ impl BotConfig {
         if self.qq.enabled && !matches!(self.qq.environment.as_str(), "production" | "sandbox") {
             return Err(ConfigError::InvalidValue(
                 "qq.environment must be `production` or `sandbox`".to_owned(),
+            ));
+        }
+        if self.qq.enabled && self.qq.environment == "sandbox" && self.qq.direct_messages {
+            return Err(ConfigError::InvalidValue(
+                "qq.direct_messages is unavailable in the QQ sandbox environment".to_owned(),
             ));
         }
         if self.qq.enabled && !matches!(self.qq.transport.as_str(), "websocket" | "webhook") {
@@ -905,6 +911,7 @@ mod tests {
                 [qq]
                 environment = "sandbox"
                 public_guild_messages = true
+                direct_messages = false
                 extended_events = true
                 check_only = true
 
@@ -940,6 +947,7 @@ mod tests {
         config.validate().unwrap();
         assert_eq!(config.qq.environment, "sandbox");
         assert!(config.qq.public_guild_messages);
+        assert!(!config.qq.direct_messages);
         assert!(config.qq.extended_events.is_enabled());
         assert_eq!(config.runtime.event_concurrency, 8);
         assert_eq!(config.runtime.queue_capacity, 64);
@@ -955,6 +963,15 @@ mod tests {
         assert!(config.logging.console.message_content);
         assert!(config.logging.files.message_content);
         assert_eq!(BotConfig::default().logging.console.language, "en");
+    }
+
+    #[test]
+    fn rejects_guild_direct_messages_in_sandbox() {
+        let mut config = BotConfig::default();
+        config.qq.environment = "sandbox".to_owned();
+        config.qq.direct_messages = true;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("unavailable in the QQ sandbox"));
     }
 
     #[test]

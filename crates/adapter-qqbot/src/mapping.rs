@@ -14,6 +14,7 @@ use thiserror::Error;
 const GROUP_EVENTS: &[&str] = &["GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE"];
 const PRIVATE_EVENTS: &[&str] = &["C2C_MESSAGE_CREATE"];
 const CHANNEL_EVENTS: &[&str] = &["AT_MESSAGE_CREATE", "MESSAGE_CREATE"];
+const GUILD_DIRECT_EVENTS: &[&str] = &["DIRECT_MESSAGE_CREATE"];
 const NOTICE_EVENTS: &[&str] = &[
     "GUILD_CREATE",
     "GUILD_UPDATE",
@@ -79,6 +80,7 @@ pub(crate) fn map_dispatch(
     if !GROUP_EVENTS.contains(&event_type)
         && !PRIVATE_EVENTS.contains(&event_type)
         && !CHANNEL_EVENTS.contains(&event_type)
+        && !GUILD_DIRECT_EVENTS.contains(&event_type)
     {
         return Ok(None);
     }
@@ -100,9 +102,13 @@ pub(crate) fn map_dispatch(
                 "author.user_openid",
             )?,
         }
-    } else {
+    } else if CHANNEL_EVENTS.contains(&event_type) {
         MessageTarget::Channel {
             channel_id: required(message.channel_id.clone(), event_type, "channel_id")?,
+        }
+    } else {
+        MessageTarget::GuildDirect {
+            guild_id: required(message.guild_id.clone(), event_type, "guild_id")?,
         }
     };
     let sender_id = [
@@ -291,6 +297,37 @@ mod tests {
                 group_id: "group-id".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn maps_guild_direct_message_to_private_scoped_target() {
+        let payload = GatewayPayload {
+            id: Some("event-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "id":"message-id",
+                "content":"/ping",
+                "guild_id":"direct-guild-id",
+                "channel_id":"direct-channel-id",
+                "author":{"id":"member-id"}
+            }),
+            s: Some(2),
+            t: Some("DIRECT_MESSAGE_CREATE".to_owned()),
+        };
+
+        let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+            .unwrap()
+            .unwrap();
+        let Event::Message(message) = envelope.event else {
+            panic!("expected common message");
+        };
+        assert_eq!(
+            message.target,
+            MessageTarget::GuildDirect {
+                guild_id: "direct-guild-id".to_owned()
+            }
+        );
+        assert_eq!(message.scope(), bot_core::MessageScope::Private);
     }
 
     #[test]

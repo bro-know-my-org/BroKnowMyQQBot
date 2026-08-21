@@ -1,4 +1,4 @@
-package bkm:plugin@1.1.0;
+package bkm:plugin@1.2.0;
 
 interface types {
     enum host-error-code {
@@ -63,6 +63,7 @@ interface types {
         group(string),
         private(string),
         channel(string),
+        guild-direct(string),
     }
 
     record sender {

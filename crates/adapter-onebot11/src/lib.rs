@@ -536,9 +536,11 @@ impl OneBot11Adapter {
                         "send_private_msg".to_owned(),
                         json!({"user_id": id_param(&user_id), "message": message}),
                     )),
-                    MessageTarget::Channel { .. } => Err(AdapterError::Action(
-                        "OneBot 11 does not support the common channel target".to_owned(),
-                    )),
+                    MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
+                        Err(AdapterError::Action(
+                            "OneBot 11 does not support QQ guild targets".to_owned(),
+                        ))
+                    }
                 }
             }
             Action::SendMessage(send) => match send.target {
@@ -550,9 +552,9 @@ impl OneBot11Adapter {
                     "send_private_msg".to_owned(),
                     json!({"user_id": id_param(&user_id), "message": [MessageSegment::text(send.content)]}),
                 )),
-                MessageTarget::Channel { .. } => Err(AdapterError::Action(
-                    "OneBot 11 does not support the common channel target".to_owned(),
-                )),
+                MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => Err(
+                    AdapterError::Action("OneBot 11 does not support QQ guild targets".to_owned()),
+                ),
             },
             Action::ReplyMedia(reply) => {
                 let mut message = vec![
@@ -571,9 +573,11 @@ impl OneBot11Adapter {
                         "send_private_msg".to_owned(),
                         json!({"user_id": id_param(&user_id), "message": message}),
                     )),
-                    MessageTarget::Channel { .. } => Err(AdapterError::Action(
-                        "OneBot 11 does not support the common channel target".to_owned(),
-                    )),
+                    MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
+                        Err(AdapterError::Action(
+                            "OneBot 11 does not support QQ guild targets".to_owned(),
+                        ))
+                    }
                 }
             }
             Action::SendMedia(send) => {
@@ -590,15 +594,22 @@ impl OneBot11Adapter {
                         "send_private_msg".to_owned(),
                         json!({"user_id": id_param(&user_id), "message": message}),
                     )),
-                    MessageTarget::Channel { .. } => Err(AdapterError::Action(
-                        "OneBot 11 does not support the common channel target".to_owned(),
-                    )),
+                    MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
+                        Err(AdapterError::Action(
+                            "OneBot 11 does not support QQ guild targets".to_owned(),
+                        ))
+                    }
                 }
             }
-            Action::Recall { message_id, .. } => Ok((
-                "delete_msg".to_owned(),
-                json!({"message_id": id_param(&message_id)}),
-            )),
+            Action::Recall { target, message_id } => match target {
+                MessageTarget::Group { .. } | MessageTarget::Private { .. } => Ok((
+                    "delete_msg".to_owned(),
+                    json!({"message_id": id_param(&message_id)}),
+                )),
+                MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => Err(
+                    AdapterError::Action("OneBot 11 does not support QQ guild targets".to_owned()),
+                ),
+            },
             Action::Platform { name, payload }
                 if matches!(
                     name.as_str(),
@@ -732,13 +743,21 @@ impl Adapter for OneBot11Adapter {
     async fn execute(&self, action: Action) -> Result<ActionResult, AdapterError> {
         if matches!(
             &action,
-            Action::ReplyMedia(reply) if matches!(reply.target, MessageTarget::Channel { .. })
+            Action::ReplyMedia(reply)
+                if matches!(
+                    reply.target,
+                    MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. }
+                )
         ) || matches!(
             &action,
-            Action::SendMedia(send) if matches!(send.target, MessageTarget::Channel { .. })
+            Action::SendMedia(send)
+                if matches!(
+                    send.target,
+                    MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. }
+                )
         ) {
             return Err(AdapterError::Action(
-                "OneBot 11 does not support the common channel target".to_owned(),
+                "OneBot 11 does not support QQ guild targets".to_owned(),
             ));
         }
         let media_bytes = if let Some(attachment) = action_media_attachment(&action) {
@@ -1983,6 +2002,15 @@ mod tests {
         .unwrap();
         assert_eq!(action, "delete_msg");
         assert_eq!(params["message_id"], "0007");
+
+        let error = OneBot11Adapter::action_request(Action::Recall {
+            target: MessageTarget::GuildDirect {
+                guild_id: "direct-guild".to_owned(),
+            },
+            message_id: "0008".to_owned(),
+        })
+        .unwrap_err();
+        assert!(matches!(error, AdapterError::Action(message) if message.contains("guild")));
     }
 
     #[test]
