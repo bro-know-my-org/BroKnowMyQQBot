@@ -18,8 +18,8 @@ use qqbot_protocol::{
     GuildMemberPageRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation,
     InlineMediaUploadRequest, Intents, MediaFileType, MediaUploadRequest, MessageRequest,
     MessageResponse, OpCode, OpenApiClient, PageRequest, RemoveGuildMemberRequest,
-    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateGroupJoinStrategyRequest,
-    UpdateGroupJoinStrategyWhitelistRequest,
+    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateChannelPermissionsRequest,
+    UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -564,6 +564,34 @@ struct GuildRoleMemberAction {
 }
 
 #[derive(Debug, Deserialize)]
+struct ChannelMemberPermissionAction {
+    channel_id: String,
+    user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateChannelMemberPermissionAction {
+    channel_id: String,
+    user_id: String,
+    #[serde(flatten)]
+    request: UpdateChannelPermissionsRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelRolePermissionAction {
+    channel_id: String,
+    role_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateChannelRolePermissionAction {
+    channel_id: String,
+    role_id: String,
+    #[serde(flatten)]
+    request: UpdateChannelPermissionsRequest,
+}
+
+#[derive(Debug, Deserialize)]
 struct GroupOpenIdAction {
     group_openid: String,
 }
@@ -864,7 +892,11 @@ impl QqActionExecutor {
             | "qq.guild.role.update"
             | "qq.guild.role.delete"
             | "qq.guild.role.member.add"
-            | "qq.guild.role.member.remove" => {
+            | "qq.guild.role.member.remove"
+            | "qq.channel.member.permission.get"
+            | "qq.channel.member.permission.update"
+            | "qq.channel.role.permission.get"
+            | "qq.channel.role.permission.update" => {
                 self.execute_guild_management_action(name, payload).await
             }
             "qq.group.mute.get"
@@ -1161,6 +1193,54 @@ impl QqActionExecutor {
                     )
                 };
                 self.complete_unit_action(action_type, "guild", result)
+            }
+            "qq.channel.member.permission.get" => {
+                let action: ChannelMemberPermissionAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .channel_member_permissions(&action.channel_id, &action.user_id)
+                        .await,
+                )
+            }
+            "qq.channel.member.permission.update" => {
+                let action: UpdateChannelMemberPermissionAction =
+                    decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.channel.member.permission.update",
+                    "channel",
+                    self.api
+                        .update_channel_member_permissions(
+                            &action.channel_id,
+                            &action.user_id,
+                            &action.request,
+                        )
+                        .await,
+                )
+            }
+            "qq.channel.role.permission.get" => {
+                let action: ChannelRolePermissionAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .channel_role_permissions(&action.channel_id, &action.role_id)
+                        .await,
+                )
+            }
+            "qq.channel.role.permission.update" => {
+                let action: UpdateChannelRolePermissionAction =
+                    decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.channel.role.permission.update",
+                    "channel",
+                    self.api
+                        .update_channel_role_permissions(
+                            &action.channel_id,
+                            &action.role_id,
+                            &action.request,
+                        )
+                        .await,
+                )
             }
             _ => unreachable!("guild management Action dispatcher only calls known names"),
         }
@@ -1543,6 +1623,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::HttpStatus { .. }
         | ApiError::Platform { .. }
         | ApiError::ResponseTooLarge
+        | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidRequest(_)
         | ApiError::InvalidUrl(_) => AdapterError::Action(error.to_string()),
@@ -1846,6 +1927,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
     match error {
         ApiError::InvalidUrl(_)
         | ApiError::InvalidRequest(_)
+        | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildRequest(_) => true,
         ApiError::Authentication(AuthError::HttpStatus { status })
         | ApiError::HttpStatus { status, .. } => status.is_client_error() && status.as_u16() != 429,

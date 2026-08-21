@@ -49,6 +49,49 @@ impl fmt::Display for GuildRequestValidationError {
 
 impl std::error::Error for GuildRequestValidationError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPermissionField {
+    Add,
+    Remove,
+}
+
+impl fmt::Display for ChannelPermissionField {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPermissionValidationError {
+    InvalidBitmap { field: ChannelPermissionField },
+    BitmapOverflow { field: ChannelPermissionField },
+    ManageChannelPermission { field: ChannelPermissionField },
+}
+
+impl fmt::Display for ChannelPermissionValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidBitmap { field } => write!(
+                formatter,
+                "QQ channel permission `{field}` must be an unsigned decimal bitmap"
+            ),
+            Self::BitmapOverflow { field } => write!(
+                formatter,
+                "QQ channel permission `{field}` exceeds the u64 bitmap range"
+            ),
+            Self::ManageChannelPermission { field } => write!(
+                formatter,
+                "QQ channel permission `{field}` must not modify the manage-channel bit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChannelPermissionValidationError {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuildUser {
     pub id: String,
@@ -138,6 +181,50 @@ pub struct GuildRoleMemberPage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnlineMemberCount {
     pub online_nums: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelMemberPermissions {
+    pub channel_id: String,
+    pub user_id: String,
+    pub permissions: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelRolePermissions {
+    pub channel_id: String,
+    pub role_id: String,
+    pub permissions: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Permission bitmap changes for a channel member or role.
+///
+/// QQ expects both fields as unsigned decimal strings. When the same bit is
+/// present in both fields, removal takes precedence.
+pub struct UpdateChannelPermissionsRequest {
+    pub add: String,
+    pub remove: String,
+}
+
+impl UpdateChannelPermissionsRequest {
+    pub fn validate(&self) -> Result<(), ChannelPermissionValidationError> {
+        const MANAGE_CHANNEL_PERMISSION: u64 = 1 << 1;
+
+        let add = validate_permission_bitmap(ChannelPermissionField::Add, &self.add)?;
+        let remove = validate_permission_bitmap(ChannelPermissionField::Remove, &self.remove)?;
+        if add & MANAGE_CHANNEL_PERMISSION != 0 {
+            return Err(ChannelPermissionValidationError::ManageChannelPermission {
+                field: ChannelPermissionField::Add,
+            });
+        }
+        if remove & MANAGE_CHANNEL_PERMISSION != 0 {
+            return Err(ChannelPermissionValidationError::ManageChannelPermission {
+                field: ChannelPermissionField::Remove,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +374,18 @@ fn validate_page_cursor_and_limit(
         return Err(GuildRequestValidationError::PageLimitOutOfRange { limit });
     }
     Ok(())
+}
+
+fn validate_permission_bitmap(
+    field: ChannelPermissionField,
+    value: &str,
+) -> Result<u64, ChannelPermissionValidationError> {
+    if value.is_empty() || value.bytes().any(|byte| !byte.is_ascii_digit()) {
+        return Err(ChannelPermissionValidationError::InvalidBitmap { field });
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| ChannelPermissionValidationError::BitmapOverflow { field })
 }
 
 #[cfg(test)]

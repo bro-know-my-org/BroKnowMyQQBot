@@ -141,6 +141,8 @@ struct GuildManagementObservations {
     update_role_bodies: Mutex<Vec<Value>>,
     role_member_put_bodies: Mutex<Vec<(String, Value)>>,
     role_member_delete_bodies: Mutex<Vec<(String, Value)>>,
+    member_permission_updates: Mutex<Vec<Value>>,
+    role_permission_updates: Mutex<Vec<Value>>,
 }
 
 async fn add_role_member(
@@ -175,6 +177,56 @@ async fn remove_role_member(
     StatusCode::NO_CONTENT
 }
 
+async fn member_permissions(Path((channel, user)): Path<(String, String)>) -> Json<Value> {
+    assert_eq!(channel, "channel/id");
+    assert_eq!(user, "user/id");
+    Json(json!({
+        "channel_id":"channel/id",
+        "user_id":"user/id",
+        "permissions":"4"
+    }))
+}
+
+async fn update_member_permissions(
+    State(observations): State<Arc<GuildManagementObservations>>,
+    Path((channel, user)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> StatusCode {
+    assert_eq!(channel, "channel/id");
+    assert_eq!(user, "user/id");
+    observations
+        .member_permission_updates
+        .lock()
+        .unwrap()
+        .push(body);
+    StatusCode::NO_CONTENT
+}
+
+async fn role_permissions(Path((channel, role)): Path<(String, String)>) -> Json<Value> {
+    assert_eq!(channel, "channel/id");
+    assert_eq!(role, "role/id");
+    Json(json!({
+        "channel_id":"channel/id",
+        "role_id":"role/id",
+        "permissions":"5"
+    }))
+}
+
+async fn update_role_permissions(
+    State(observations): State<Arc<GuildManagementObservations>>,
+    Path((channel, role)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> StatusCode {
+    assert_eq!(channel, "channel/id");
+    assert_eq!(role, "role/id");
+    observations
+        .role_permission_updates
+        .lock()
+        .unwrap()
+        .push(body);
+    StatusCode::NO_CONTENT
+}
+
 async fn adapter() -> (
     QqWebSocketAdapter,
     JoinHandle<()>,
@@ -198,6 +250,14 @@ async fn adapter() -> (
         .route(
             "/guilds/{guild}/members/{user}/roles/{role}",
             put(add_role_member).delete(remove_role_member),
+        )
+        .route(
+            "/channels/{channel}/members/{user}/permissions",
+            get(member_permissions).put(update_member_permissions),
+        )
+        .route(
+            "/channels/{channel}/roles/{role}/permissions",
+            get(role_permissions).put(update_role_permissions),
         )
         .with_state(Arc::clone(&observations));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -238,6 +298,14 @@ async fn invalid_adapter() -> (QqWebSocketAdapter, JoinHandle<()>, Arc<AtomicUsi
             "/guilds/{guild}/members/{user}/roles/{role}",
             put(counted_unit).delete(counted_unit),
         )
+        .route(
+            "/channels/{channel}/members/{user}/permissions",
+            put(counted_unit),
+        )
+        .route(
+            "/channels/{channel}/roles/{role}/permissions",
+            put(counted_unit),
+        )
         .with_state(Arc::clone(&calls));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -268,6 +336,108 @@ async fn platform(adapter: &QqWebSocketAdapter, name: &str, payload: Value) -> V
         .await
         .unwrap()
         .raw
+}
+
+#[tokio::test]
+async fn exposes_channel_permission_actions() {
+    let (adapter, server_task, observations) = adapter().await;
+    let member = platform(
+        &adapter,
+        "qq.channel.member.permission.get",
+        json!({"channel_id":"channel/id","user_id":"user/id"}),
+    )
+    .await;
+    assert_eq!(member["permissions"], "4");
+    assert_eq!(member["user_id"], "user/id");
+    let role = platform(
+        &adapter,
+        "qq.channel.role.permission.get",
+        json!({"channel_id":"channel/id","role_id":"role/id"}),
+    )
+    .await;
+    assert_eq!(role["permissions"], "5");
+    assert_eq!(role["role_id"], "role/id");
+
+    for (name, target) in [
+        ("qq.channel.member.permission.update", "user_id"),
+        ("qq.channel.role.permission.update", "role_id"),
+    ] {
+        let mut payload = json!({"channel_id":"channel/id","add":"5","remove":"4"});
+        payload[target] = json!(if target == "user_id" {
+            "user/id"
+        } else {
+            "role/id"
+        });
+        assert_eq!(platform(&adapter, name, payload).await, Value::Null);
+    }
+    assert_eq!(
+        *observations.member_permission_updates.lock().unwrap(),
+        vec![json!({"add":"5","remove":"4"})]
+    );
+    assert_eq!(
+        *observations.role_permission_updates.lock().unwrap(),
+        vec![json!({"add":"5","remove":"4"})]
+    );
+    server_task.abort();
+    assert!(server_task.await.is_err_and(|error| error.is_cancelled()));
+}
+
+#[tokio::test]
+async fn rejects_invalid_channel_permission_actions_before_io() {
+    let (adapter, server_task, calls) = invalid_adapter().await;
+    let cases = [
+        (
+            "qq.channel.member.permission.get",
+            json!({"channel_id":" ","user_id":"user/id"}),
+            "`channel_id`",
+        ),
+        (
+            "qq.channel.member.permission.get",
+            json!({"channel_id":"channel/id","user_id":" "}),
+            "`user_id`",
+        ),
+        (
+            "qq.channel.role.permission.get",
+            json!({"channel_id":"channel/id","role_id":" "}),
+            "`role_id`",
+        ),
+        (
+            "qq.channel.member.permission.update",
+            json!({"channel_id":"channel/id","user_id":"user/id","add":"-1","remove":"0"}),
+            "`add`",
+        ),
+        (
+            "qq.channel.role.permission.update",
+            json!({"channel_id":"channel/id","role_id":"role/id","add":"0","remove":" "}),
+            "`remove`",
+        ),
+        (
+            "qq.channel.member.permission.update",
+            json!({"channel_id":"channel/id","user_id":"user/id","add":"2","remove":"0"}),
+            "manage-channel bit",
+        ),
+        (
+            "qq.channel.role.permission.update",
+            json!({"channel_id":"channel/id","role_id":"role/id","add":"0","remove":"2"}),
+            "manage-channel bit",
+        ),
+    ];
+    for (name, payload, expected) in cases {
+        let error = adapter
+            .execute(Action::Platform {
+                name: name.to_owned(),
+                payload,
+            })
+            .await
+            .unwrap_err();
+        let AdapterError::Action(message) = error else {
+            panic!("expected Action error for {name}");
+        };
+        assert!(message.contains(expected), "unexpected error: {message}");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    server_task.abort();
+    assert!(server_task.await.is_err_and(|error| error.is_cancelled()));
 }
 
 #[tokio::test]

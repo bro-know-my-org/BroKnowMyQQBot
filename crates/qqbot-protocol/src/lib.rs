@@ -23,10 +23,12 @@ pub use group::{
     UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
 };
 pub use guild::{
-    CreateGuildRoleResult, GuildChannelReference, GuildMember, GuildMemberPageRequest,
-    GuildRequestValidationError, GuildRole, GuildRoleMemberPage, GuildRoleMemberPageRequest,
-    GuildRoleMemberRequest, GuildRoleMutation, GuildRoles, GuildUser, OnlineMemberCount,
-    RemoveGuildMemberRequest, UpdateGuildRoleResult,
+    ChannelMemberPermissions, ChannelPermissionField, ChannelPermissionValidationError,
+    ChannelRolePermissions, CreateGuildRoleResult, GuildChannelReference, GuildMember,
+    GuildMemberPageRequest, GuildRequestValidationError, GuildRole, GuildRoleMemberPage,
+    GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation, GuildRoles, GuildUser,
+    OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
+    UpdateGuildRoleResult,
 };
 pub use message::{
     ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,

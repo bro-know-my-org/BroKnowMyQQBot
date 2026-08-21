@@ -17,9 +17,11 @@ use crate::{
         UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
     },
     guild::{
+        ChannelMemberPermissions, ChannelPermissionValidationError, ChannelRolePermissions,
         CreateGuildRoleResult, GuildMember, GuildMemberPageRequest, GuildRequestValidationError,
         GuildRoleMemberPage, GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation,
-        GuildRoles, OnlineMemberCount, RemoveGuildMemberRequest, UpdateGuildRoleResult,
+        GuildRoles, OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
+        UpdateGuildRoleResult,
     },
     message::{
         ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
@@ -79,6 +81,8 @@ pub enum ApiError {
     InvalidRequest(String),
     #[error("invalid QQ guild request: {0}")]
     InvalidGuildRequest(#[source] GuildRequestValidationError),
+    #[error("invalid QQ channel permission request: {0}")]
+    InvalidChannelPermissionRequest(#[source] ChannelPermissionValidationError),
 }
 
 /// Authenticated QQ `OpenAPI` client.
@@ -446,6 +450,58 @@ impl OpenApiClient {
         validate_guild_role_member_request(guild_id, user_id, role_id, request)?;
         let url = self.endpoint(&["guilds", guild_id, "members", user_id, "roles", role_id])?;
         self.delete_json_unit(url, request).await
+    }
+
+    pub async fn channel_member_permissions(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+    ) -> Result<ChannelMemberPermissions, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("user_id", user_id)?;
+        let url = self.endpoint(&["channels", channel_id, "members", user_id, "permissions"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn update_channel_member_permissions(
+        &self,
+        channel_id: &str,
+        user_id: &str,
+        request: &UpdateChannelPermissionsRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("user_id", user_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidChannelPermissionRequest)?;
+        let url = self.endpoint(&["channels", channel_id, "members", user_id, "permissions"])?;
+        self.put_json_unit(url, request).await
+    }
+
+    pub async fn channel_role_permissions(
+        &self,
+        channel_id: &str,
+        role_id: &str,
+    ) -> Result<ChannelRolePermissions, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("role_id", role_id)?;
+        let url = self.endpoint(&["channels", channel_id, "roles", role_id, "permissions"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn update_channel_role_permissions(
+        &self,
+        channel_id: &str,
+        role_id: &str,
+        request: &UpdateChannelPermissionsRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("role_id", role_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidChannelPermissionRequest)?;
+        let url = self.endpoint(&["channels", channel_id, "roles", role_id, "permissions"])?;
+        self.put_json_unit(url, request).await
     }
 
     pub async fn group_mute_setting(
