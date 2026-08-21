@@ -85,6 +85,7 @@ bitflags! {
         const DIRECT_MESSAGE = 1 << 12;
         const OPEN_FORUMS_EVENT = 1 << 18;
         const AUDIO_OR_LIVE_CHANNEL_MEMBER = 1 << 19;
+        const GROUP_MEMBER_EVENT = 1 << 24;
         const GROUP_AND_C2C_EVENT = 1 << 25;
         const INTERACTION = 1 << 26;
         const MESSAGE_AUDIT = 1 << 27;
@@ -192,5 +193,9 @@ mod tests {
 
         let decoded: Intents = serde_json::from_str("2147483648").unwrap();
         assert_eq!(decoded.bits(), 1_u32 << 31);
+        assert_eq!(
+            serde_json::to_value(Intents::GROUP_MEMBER_EVENT).unwrap(),
+            1_u32 << 24
+        );
     }
 }

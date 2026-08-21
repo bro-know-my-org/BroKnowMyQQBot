@@ -7,7 +7,8 @@ use bot_core::{
 };
 use chrono::{DateTime, Utc};
 use qqbot_protocol::{
-    GatewayPayload, GroupJoinRequestEvent, MessageReactionEvent, QqMessage, ReactionValidationError,
+    GatewayPayload, GroupJoinRequestEvent, GroupMemberEvent, GroupMemberEventValidationError,
+    MessageReactionEvent, QqMessage, ReactionValidationError,
 };
 use serde::Deserialize as _;
 use sha2::{Digest as _, Sha256};
@@ -33,6 +34,8 @@ const NOTICE_EVENTS: &[&str] = &[
     "GROUP_DEL_ROBOT",
     "GROUP_MSG_REJECT",
     "GROUP_MSG_RECEIVE",
+    "GROUP_MEMBER_ADD",
+    "GROUP_MEMBER_REMOVE",
     "FRIEND_ADD",
     "FRIEND_DEL",
     "C2C_MSG_REJECT",
@@ -61,6 +64,8 @@ pub(crate) enum MappingError {
         #[source]
         source: chrono::ParseError,
     },
+    #[error("QQ dispatch `{event_type}` has invalid Unix timestamp {timestamp}")]
+    InvalidUnixTimestamp { event_type: String, timestamp: u64 },
     #[error("QQ structured dispatch `{event_type}` contains invalid data")]
     InvalidEventData { event_type: String },
     #[error("QQ reaction dispatch `{event_type}` contains invalid data")]
@@ -68,6 +73,12 @@ pub(crate) enum MappingError {
         event_type: String,
         #[source]
         source: ReactionValidationError,
+    },
+    #[error("QQ group member dispatch `{event_type}` contains invalid data")]
+    InvalidGroupMember {
+        event_type: String,
+        #[source]
+        source: GroupMemberEventValidationError,
     },
 }
 
@@ -78,15 +89,8 @@ pub(crate) fn map_dispatch(
     let Some(event_type) = payload.t.as_deref() else {
         return Ok(None);
     };
-    if matches!(
-        event_type,
-        "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE"
-    ) {
-        return map_message_reaction(adapter, payload, event_type).map(Some);
-    }
-    if NOTICE_EVENTS.contains(&event_type) {
-        return map_structured_event(adapter, payload, event_type, "timestamp", Event::Notice)
-            .map(Some);
+    if let Some(mapped) = map_typed_notice(adapter, payload, event_type) {
+        return mapped.map(Some);
     }
     if REQUEST_EVENTS.contains(&event_type) {
         return map_group_join_request(adapter, payload, event_type).map(Some);
@@ -177,6 +181,29 @@ pub(crate) fn map_dispatch(
     }))
 }
 
+fn map_typed_notice(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Option<Result<EventEnvelope, MappingError>> {
+    match event_type {
+        "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
+            Some(map_message_reaction(adapter, payload, event_type))
+        }
+        "GROUP_MEMBER_ADD" | "GROUP_MEMBER_REMOVE" => {
+            Some(map_group_member(adapter, payload, event_type))
+        }
+        _ if NOTICE_EVENTS.contains(&event_type) => Some(map_structured_event(
+            adapter,
+            payload,
+            event_type,
+            Some("timestamp"),
+            Event::Notice,
+        )),
+        _ => None,
+    }
+}
+
 fn map_message_reaction(
     adapter: &AdapterId,
     payload: &GatewayPayload,
@@ -193,7 +220,41 @@ fn map_message_reaction(
             event_type: event_type.to_owned(),
             source,
         })?;
-    map_structured_event(adapter, payload, event_type, "timestamp", Event::Notice)
+    map_structured_event(
+        adapter,
+        payload,
+        event_type,
+        Some("timestamp"),
+        Event::Notice,
+    )
+}
+
+fn map_group_member(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        GroupMemberEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidGroupMember {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    let timestamp = i64::try_from(event.timestamp)
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+        .ok_or_else(|| MappingError::InvalidUnixTimestamp {
+            event_type: event_type.to_owned(),
+            timestamp: event.timestamp,
+        })?;
+    let mut envelope = map_structured_event(adapter, payload, event_type, None, Event::Notice)?;
+    envelope.timestamp = Some(timestamp);
+    Ok(envelope)
 }
 
 fn map_group_join_request(
@@ -215,14 +276,20 @@ fn map_group_join_request(
             event_type: event_type.to_owned(),
         });
     }
-    map_structured_event(adapter, payload, event_type, "apply_at", Event::Request)
+    map_structured_event(
+        adapter,
+        payload,
+        event_type,
+        Some("apply_at"),
+        Event::Request,
+    )
 }
 
 fn map_structured_event(
     adapter: &AdapterId,
     payload: &GatewayPayload,
     event_type: &str,
-    timestamp_field: &str,
+    timestamp_field: Option<&str>,
     wrap: fn(serde_json::Value) -> Event,
 ) -> Result<EventEnvelope, MappingError> {
     if !payload.d.is_object() {
@@ -252,7 +319,7 @@ fn map_structured_event(
             },
             Ok,
         )?;
-    let timestamp = match payload.d.get(timestamp_field) {
+    let timestamp = match timestamp_field.and_then(|field| payload.d.get(field)) {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(value)) => Some(
             DateTime::parse_from_rfc3339(value)
@@ -300,7 +367,7 @@ mod tests {
     use qqbot_protocol::{GatewayPayload, OpCode};
     use serde_json::json;
 
-    use super::map_dispatch;
+    use super::{MappingError, map_dispatch};
 
     #[test]
     fn maps_group_at_message() {
@@ -466,6 +533,104 @@ mod tests {
             };
             assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
         }
+    }
+
+    #[test]
+    fn validates_and_maps_group_member_events() {
+        for event_type in ["GROUP_MEMBER_ADD", "GROUP_MEMBER_REMOVE"] {
+            let payload = GatewayPayload {
+                id: Some(format!("{event_type}-id")),
+                op: OpCode::DISPATCH,
+                d: json!({
+                    "timestamp":1_787_392_800,
+                    "group_openid":"group-id",
+                    "member_openid":"member-id",
+                    "user_openid":"",
+                    "__none":1
+                }),
+                s: Some(5),
+                t: Some(event_type.to_owned()),
+            };
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                envelope.timestamp.unwrap().to_rfc3339(),
+                "2026-08-22T10:00:00+00:00"
+            );
+            let Event::Notice(notice) = envelope.event else {
+                panic!("expected group member notice");
+            };
+            assert_eq!(notice["type"], event_type);
+            assert_eq!(
+                notice["data"],
+                json!({
+                    "timestamp":1_787_392_800,
+                    "group_openid":"group-id",
+                    "member_openid":"member-id",
+                    "user_openid":"",
+                    "__none":1
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_group_member_events() {
+        let base = GatewayPayload {
+            id: Some("group-member-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "timestamp":1_787_392_800,
+                "group_openid":"group-id",
+                "member_openid":"member-id",
+                "user_openid":"user-id"
+            }),
+            s: Some(5),
+            t: Some("GROUP_MEMBER_ADD".to_owned()),
+        };
+        let missing_user = GatewayPayload {
+            d: json!({
+                "timestamp":1_787_392_800,
+                "group_openid":"group-id",
+                "member_openid":"member-id"
+            }),
+            ..base.clone()
+        };
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &missing_user),
+            Err(MappingError::Decode { .. })
+        ));
+
+        let blank_group = GatewayPayload {
+            d: json!({
+                "timestamp":1_787_392_800,
+                "group_openid":" ",
+                "member_openid":"member-id",
+                "user_openid":"user-id"
+            }),
+            ..base.clone()
+        };
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &blank_group),
+            Err(MappingError::InvalidGroupMember { source, .. })
+                if source.field == "group_openid"
+        ));
+
+        let invalid_timestamp = GatewayPayload {
+            d: json!({
+                "timestamp":18_446_744_073_709_551_615_u64,
+                "group_openid":"group-id",
+                "member_openid":"member-id",
+                "user_openid":"user-id"
+            }),
+            ..base
+        };
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &invalid_timestamp),
+            Err(MappingError::InvalidUnixTimestamp { timestamp, .. })
+                if timestamp == u64::MAX
+        ));
     }
 
     #[test]

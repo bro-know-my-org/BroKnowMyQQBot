@@ -1,12 +1,58 @@
 //! QQ group-management protocol types introduced by the 2026-08-10 API update.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 const MAX_PAGE_LIMIT: u32 = 100;
 const MAX_MUTE_MEMBERS: usize = 10;
 const MAX_STRATEGY_GROUPS: usize = 100;
 const MAX_STRATEGY_REMARK_CHARS: usize = 255;
 const MAX_WHITELIST_USERS_PER_REQUEST: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupMemberEventValidationError {
+    pub field: &'static str,
+}
+
+impl fmt::Display for GroupMemberEventValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "QQ group member event `{}` must not be empty",
+            self.field
+        )
+    }
+}
+
+impl std::error::Error for GroupMemberEventValidationError {}
+
+/// Payload for QQ `GROUP_MEMBER_ADD` and `GROUP_MEMBER_REMOVE` events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMemberEvent {
+    /// Unix timestamp in seconds.
+    pub timestamp: u64,
+    /// Group identifier; must not be blank.
+    pub group_openid: String,
+    /// Member identifier; must not be blank.
+    pub member_openid: String,
+    /// User identifier. Required on the wire, but QQ may send an empty value.
+    pub user_openid: String,
+}
+
+impl GroupMemberEvent {
+    /// Validates the required non-blank group and member identifiers.
+    pub fn validate(&self) -> Result<(), GroupMemberEventValidationError> {
+        for (field, value) in [
+            ("group_openid", self.group_openid.as_str()),
+            ("member_openid", self.member_openid.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(GroupMemberEventValidationError { field });
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GroupMuteSetting {
@@ -388,8 +434,8 @@ fn validate_remark(remark: Option<&str>) -> Result<(), &'static str> {
 mod tests {
     use super::{
         CreateGroupJoinStrategyRequest, GroupJoinApprovalOperation, GroupJoinStrategySwitch,
-        GroupJoinStrategyWhitelistOperation, GroupMuteMemberOperation, GroupMuteOperation,
-        PageRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
+        GroupJoinStrategyWhitelistOperation, GroupMemberEvent, GroupMuteMemberOperation,
+        GroupMuteOperation, PageRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
         UpdateGroupJoinStrategyWhitelistRequest,
     };
 
@@ -467,5 +513,19 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn decodes_official_group_member_event_shape() {
+        let event: GroupMemberEvent = serde_json::from_str(
+            r#"{"timestamp":1787392800,"group_openid":"group","member_openid":"member","user_openid":""}"#,
+        )
+        .unwrap();
+        assert_eq!(event.timestamp, 1_787_392_800);
+        assert!(event.validate().is_ok());
+        assert!(serde_json::from_str::<GroupMemberEvent>(
+            r#"{"timestamp":"1787392800","group_openid":"group","member_openid":"member","user_openid":""}"#
+        )
+        .is_err());
     }
 }

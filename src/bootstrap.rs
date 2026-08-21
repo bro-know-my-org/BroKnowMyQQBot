@@ -248,19 +248,7 @@ async fn build_adapters(
             "production" => OpenApiEnvironment::Production,
             _ => unreachable!("configuration validation only accepts known QQ environments"),
         };
-        let mut intents = Intents::empty().with_group_and_c2c();
-        if config.qq.public_guild_messages {
-            intents = intents.with_public_guild_messages();
-        }
-        if config.qq.direct_messages {
-            intents = intents.with_direct_messages();
-        }
-        if config.qq.extended_events.is_enabled() {
-            intents |= Intents::GUILDS
-                | Intents::GUILD_MEMBERS
-                | Intents::GUILD_MESSAGE_REACTIONS
-                | Intents::MESSAGE_AUDIT;
-        }
+        let intents = configured_qq_intents(config);
         let webhook_secret = (config.qq.transport == "webhook")
             .then(|| SecretString::from(app_secret.clone().into_boxed_str()));
         let tokens = TokenManager::new(
@@ -292,6 +280,24 @@ async fn build_adapters(
         adapters.push(Arc::new(adapter));
     }
     Ok(AdapterSet { adapters, qq_api })
+}
+
+fn configured_qq_intents(config: &BotConfig) -> Intents {
+    let mut intents = Intents::empty().with_group_and_c2c();
+    if config.qq.public_guild_messages {
+        intents = intents.with_public_guild_messages();
+    }
+    if config.qq.direct_messages {
+        intents = intents.with_direct_messages();
+    }
+    if config.qq.extended_events.is_enabled() {
+        intents |= Intents::GUILDS
+            | Intents::GUILD_MEMBERS
+            | Intents::GUILD_MESSAGE_REACTIONS
+            | Intents::GROUP_MEMBER_EVENT
+            | Intents::MESSAGE_AUDIT;
+    }
+    intents
 }
 
 fn build_qq_adapter(
@@ -363,4 +369,30 @@ fn configured_credentials() -> Result<(String, String), AppError> {
         required_env("BKMQB_QQ_OFFICIAL_APP_ID")?,
         required_env("BKMQB_QQ_OFFICIAL_APP_SECRET")?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use qqbot_protocol::Intents;
+
+    use super::{BotConfig, configured_qq_intents};
+
+    #[test]
+    fn extended_events_control_group_member_intent() {
+        let enabled: BotConfig = toml::from_str("[qq]\nextended_events = true").unwrap();
+        let enabled_intents = configured_qq_intents(&enabled);
+        assert_eq!(
+            enabled_intents,
+            Intents::GROUP_AND_C2C_EVENT
+                | Intents::GUILDS
+                | Intents::GUILD_MEMBERS
+                | Intents::GUILD_MESSAGE_REACTIONS
+                | Intents::GROUP_MEMBER_EVENT
+                | Intents::MESSAGE_AUDIT
+        );
+
+        let disabled: BotConfig = toml::from_str("[qq]\nextended_events = false").unwrap();
+        let disabled_intents = configured_qq_intents(&disabled);
+        assert_eq!(disabled_intents, Intents::GROUP_AND_C2C_EVENT);
+    }
 }

@@ -18,9 +18,10 @@ pub use group::{
     GroupJoinStrategy, GroupJoinStrategyCreated, GroupJoinStrategyGroupAction,
     GroupJoinStrategyGroupOperation, GroupJoinStrategyPage, GroupJoinStrategySwitch,
     GroupJoinStrategyUpdated, GroupJoinStrategyWhitelistOperation,
-    GroupJoinStrategyWhitelistUpdated, GroupJoinVerifyInfo, GroupMuteGlobalRule,
-    GroupMuteMemberOperation, GroupMuteOperation, GroupMuteRecurringRule, GroupMuteScheduleRule,
-    GroupMuteSetting, GroupMutedMember, PageRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
+    GroupJoinStrategyWhitelistUpdated, GroupJoinVerifyInfo, GroupMemberEvent,
+    GroupMemberEventValidationError, GroupMuteGlobalRule, GroupMuteMemberOperation,
+    GroupMuteOperation, GroupMuteRecurringRule, GroupMuteScheduleRule, GroupMuteSetting,
+    GroupMutedMember, PageRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
     UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
 };
 pub use guild::{
