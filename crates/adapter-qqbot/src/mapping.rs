@@ -6,7 +6,9 @@ use bot_core::{
     AdapterId, CommonMessage, Event, EventEnvelope, EventId, MessageSegment, MessageTarget, Sender,
 };
 use chrono::{DateTime, Utc};
-use qqbot_protocol::{GatewayPayload, GroupJoinRequestEvent, QqMessage};
+use qqbot_protocol::{
+    GatewayPayload, GroupJoinRequestEvent, MessageReactionEvent, QqMessage, ReactionValidationError,
+};
 use serde::Deserialize as _;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -61,6 +63,12 @@ pub(crate) enum MappingError {
     },
     #[error("QQ structured dispatch `{event_type}` contains invalid data")]
     InvalidEventData { event_type: String },
+    #[error("QQ reaction dispatch `{event_type}` contains invalid data")]
+    InvalidReaction {
+        event_type: String,
+        #[source]
+        source: ReactionValidationError,
+    },
 }
 
 pub(crate) fn map_dispatch(
@@ -70,6 +78,12 @@ pub(crate) fn map_dispatch(
     let Some(event_type) = payload.t.as_deref() else {
         return Ok(None);
     };
+    if matches!(
+        event_type,
+        "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE"
+    ) {
+        return map_message_reaction(adapter, payload, event_type).map(Some);
+    }
     if NOTICE_EVENTS.contains(&event_type) {
         return map_structured_event(adapter, payload, event_type, "timestamp", Event::Notice)
             .map(Some);
@@ -161,6 +175,25 @@ pub(crate) fn map_dispatch(
         }),
         raw,
     }))
+}
+
+fn map_message_reaction(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let reaction =
+        MessageReactionEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    reaction
+        .validate()
+        .map_err(|source| MappingError::InvalidReaction {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_structured_event(adapter, payload, event_type, "timestamp", Event::Notice)
 }
 
 fn map_group_join_request(
@@ -353,6 +386,86 @@ mod tests {
         };
         assert_eq!(notice["type"], "GROUP_ADD_ROBOT");
         assert_eq!(notice["data"]["group_openid"], "group-id");
+    }
+
+    #[test]
+    fn validates_and_maps_message_reaction_events() {
+        for event_type in ["MESSAGE_REACTION_ADD", "MESSAGE_REACTION_REMOVE"] {
+            let payload = GatewayPayload {
+                id: Some(format!("{event_type}-id")),
+                op: OpCode::DISPATCH,
+                d: json!({
+                    "user_id":"user-id",
+                    "emoji":{"id":"203","type":1},
+                    "channel_id":"channel-id",
+                    "guild_id":"guild-id",
+                    "target":{"id":"message-id","type":0}
+                }),
+                s: Some(4),
+                t: Some(event_type.to_owned()),
+            };
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            let Event::Notice(notice) = envelope.event else {
+                panic!("expected reaction notice");
+            };
+            assert_eq!(notice["type"], event_type);
+            assert_eq!(notice["data"]["emoji"]["id"], "203");
+            assert_eq!(notice["data"]["target"]["id"], "message-id");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_message_reaction_events() {
+        let base = GatewayPayload {
+            id: Some("reaction-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "user_id":"user-id",
+                "emoji":{"id":"203","type":1},
+                "channel_id":"channel-id",
+                "guild_id":"guild-id",
+                "target":{"id":"message-id","type":0}
+            }),
+            s: Some(4),
+            t: Some("MESSAGE_REACTION_ADD".to_owned()),
+        };
+        for invalid in [
+            json!({
+                "emoji":{"id":"203","type":1},
+                "channel_id":"channel-id",
+                "guild_id":"guild-id",
+                "target":{"id":"message-id","type":0}
+            }),
+            json!({
+                "user_id":"user-id",
+                "emoji":{"id":"203","type":3},
+                "channel_id":"channel-id",
+                "guild_id":"guild-id",
+                "target":{"id":"message-id","type":0}
+            }),
+            json!({
+                "user_id":"user-id",
+                "emoji":{"id":"203","type":1},
+                "channel_id":"channel-id",
+                "guild_id":"guild-id",
+                "target":{"id":" ","type":0}
+            }),
+            json!({
+                "user_id":"user-id",
+                "emoji":{"id":"203","type":1},
+                "channel_id":"channel-id",
+                "guild_id":"guild-id",
+                "target":{"id":"message-id","type":4}
+            }),
+        ] {
+            let payload = GatewayPayload {
+                d: invalid,
+                ..base.clone()
+            };
+            assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
+        }
     }
 
     #[test]

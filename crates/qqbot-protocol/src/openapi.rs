@@ -28,6 +28,7 @@ use crate::{
         InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
         MessageResponse,
     },
+    reaction::{ReactionEmoji, ReactionUsersPage, ReactionUsersRequest, ReactionValidationError},
 };
 
 const PRODUCTION_BASE_URL: &str = "https://api.bot.qq.com/";
@@ -83,6 +84,8 @@ pub enum ApiError {
     InvalidGuildRequest(#[source] GuildRequestValidationError),
     #[error("invalid QQ channel permission request: {0}")]
     InvalidChannelPermissionRequest(#[source] ChannelPermissionValidationError),
+    #[error("invalid QQ reaction request: {0}")]
+    InvalidReactionRequest(#[source] ReactionValidationError),
 }
 
 /// Authenticated QQ `OpenAPI` client.
@@ -504,6 +507,67 @@ impl OpenApiClient {
         self.put_json_unit(url, request).await
     }
 
+    pub async fn add_channel_message_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &ReactionEmoji,
+    ) -> Result<(), ApiError> {
+        let url = self.reaction_endpoint(channel_id, message_id, emoji)?;
+        self.put(url).await
+    }
+
+    pub async fn remove_channel_message_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &ReactionEmoji,
+    ) -> Result<(), ApiError> {
+        let url = self.reaction_endpoint(channel_id, message_id, emoji)?;
+        self.delete(url).await
+    }
+
+    pub async fn channel_message_reaction_users(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &ReactionEmoji,
+        request: &ReactionUsersRequest,
+    ) -> Result<ReactionUsersPage, ApiError> {
+        let mut url = self.reaction_endpoint(channel_id, message_id, emoji)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidReactionRequest)?;
+        if let Some(cookie) = request.cookie.as_deref() {
+            url.query_pairs_mut().append_pair("cookie", cookie);
+        }
+        if let Some(limit) = request.limit {
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.to_string());
+        }
+        self.get_json(url).await
+    }
+
+    fn reaction_endpoint(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &ReactionEmoji,
+    ) -> Result<Url, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("message_id", message_id)?;
+        emoji.validate().map_err(ApiError::InvalidReactionRequest)?;
+        self.endpoint(&[
+            "channels",
+            channel_id,
+            "messages",
+            message_id,
+            "reactions",
+            &emoji.emoji_type.to_string(),
+            &emoji.id,
+        ])
+    }
+
     pub async fn group_mute_setting(
         &self,
         group_openid: &str,
@@ -712,6 +776,13 @@ impl OpenApiClient {
     {
         let response = self
             .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token).json(body))
+            .await?;
+        Self::decode_unit(response).await
+    }
+
+    async fn put(&self, url: Url) -> Result<(), ApiError> {
+        let response = self
+            .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token))
             .await?;
         Self::decode_unit(response).await
     }

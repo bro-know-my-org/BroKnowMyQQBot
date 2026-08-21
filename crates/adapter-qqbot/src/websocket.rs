@@ -17,9 +17,10 @@ use qqbot_protocol::{
     CreateGroupJoinStrategyRequest, GatewayPayload, GroupMuteMemberOperation,
     GuildMemberPageRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation,
     InlineMediaUploadRequest, Intents, MediaFileType, MediaUploadRequest, MessageRequest,
-    MessageResponse, OpCode, OpenApiClient, PageRequest, RemoveGuildMemberRequest,
-    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateChannelPermissionsRequest,
-    UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
+    MessageResponse, OpCode, OpenApiClient, PageRequest, ReactionEmoji, ReactionUsersRequest,
+    RemoveGuildMemberRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
+    UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
+    UpdateGroupJoinStrategyWhitelistRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -592,6 +593,35 @@ struct UpdateChannelRolePermissionAction {
 }
 
 #[derive(Debug, Deserialize)]
+struct ReactionAction {
+    channel_id: String,
+    message_id: String,
+    emoji_type: u32,
+    emoji_id: String,
+}
+
+impl ReactionAction {
+    fn into_parts(self) -> (String, String, ReactionEmoji) {
+        (
+            self.channel_id,
+            self.message_id,
+            ReactionEmoji {
+                id: self.emoji_id,
+                emoji_type: self.emoji_type,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReactionUsersAction {
+    #[serde(flatten)]
+    reaction: ReactionAction,
+    #[serde(flatten)]
+    page: ReactionUsersRequest,
+}
+
+#[derive(Debug, Deserialize)]
 struct GroupOpenIdAction {
     group_openid: String,
 }
@@ -899,6 +929,9 @@ impl QqActionExecutor {
             | "qq.channel.role.permission.update" => {
                 self.execute_guild_management_action(name, payload).await
             }
+            "qq.channel.reaction.add"
+            | "qq.channel.reaction.remove"
+            | "qq.channel.reaction.users" => self.execute_reaction_action(name, payload).await,
             "qq.group.mute.get"
             | "qq.group.mute.set"
             | "qq.group.join-request.list"
@@ -1259,6 +1292,51 @@ impl QqActionExecutor {
                 self.execute_group_join_request_action(name, payload).await
             }
             _ => self.execute_group_join_strategy_action(name, payload).await,
+        }
+    }
+
+    async fn execute_reaction_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.channel.reaction.add" | "qq.channel.reaction.remove" => {
+                let action: ReactionAction = decode_platform_payload(name, payload)?;
+                let (channel_id, message_id, emoji) = action.into_parts();
+                let (action_type, result) = if name == "qq.channel.reaction.add" {
+                    (
+                        "qq.channel.reaction.add",
+                        self.api
+                            .add_channel_message_reaction(&channel_id, &message_id, &emoji)
+                            .await,
+                    )
+                } else {
+                    (
+                        "qq.channel.reaction.remove",
+                        self.api
+                            .remove_channel_message_reaction(&channel_id, &message_id, &emoji)
+                            .await,
+                    )
+                };
+                self.complete_unit_action(action_type, "channel", result)
+            }
+            "qq.channel.reaction.users" => {
+                let action: ReactionUsersAction = decode_platform_payload(name, payload)?;
+                let (channel_id, message_id, emoji) = action.reaction.into_parts();
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .channel_message_reaction_users(
+                            &channel_id,
+                            &message_id,
+                            &emoji,
+                            &action.page,
+                        )
+                        .await,
+                )
+            }
+            _ => unreachable!("reaction Action dispatcher only calls known names"),
         }
     }
 
@@ -1625,6 +1703,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::ResponseTooLarge
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildRequest(_)
+        | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidRequest(_)
         | ApiError::InvalidUrl(_) => AdapterError::Action(error.to_string()),
     }
@@ -1928,7 +2007,8 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         ApiError::InvalidUrl(_)
         | ApiError::InvalidRequest(_)
         | ApiError::InvalidChannelPermissionRequest(_)
-        | ApiError::InvalidGuildRequest(_) => true,
+        | ApiError::InvalidGuildRequest(_)
+        | ApiError::InvalidReactionRequest(_) => true,
         ApiError::Authentication(AuthError::HttpStatus { status })
         | ApiError::HttpStatus { status, .. } => status.is_client_error() && status.as_u16() != 429,
         ApiError::Authentication(AuthError::Request(_) | AuthError::InvalidResponse(_))
