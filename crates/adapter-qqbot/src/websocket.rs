@@ -14,13 +14,14 @@ use bot_core::{
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
     ApiError, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
-    CreateGroupJoinStrategyRequest, GatewayPayload, GenerateShareLinkRequest,
+    CreateGroupJoinStrategyRequest, CreatePanelRequest, GatewayPayload, GenerateShareLinkRequest,
     GroupMuteMemberOperation, GuildMemberPageRequest, GuildRoleMemberPageRequest,
     GuildRoleMemberRequest, GuildRoleMutation, InlineMediaUploadRequest, Intents, MediaFileType,
     MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient, PageRequest,
-    ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest, ReviewGroupJoinRequest,
-    SetGroupMuteRequest, UpdateBotMenuRequest, UpdateChannelPermissionsRequest,
-    UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
+    PanelListRequest, ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest,
+    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
+    UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
+    UpdateGroupJoinStrategyWhitelistRequest, UpdatePanelRequest, UpdatePanelTargetsRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -666,6 +667,25 @@ struct UpdateGroupJoinStrategyWhitelistAction {
     request: UpdateGroupJoinStrategyWhitelistRequest,
 }
 
+#[derive(Debug, Deserialize)]
+struct PanelIdAction {
+    panel_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePanelAction {
+    panel_id: String,
+    #[serde(flatten)]
+    request: UpdatePanelRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePanelTargetsAction {
+    panel_id: String,
+    #[serde(flatten)]
+    request: UpdatePanelTargetsRequest,
+}
+
 impl QqActionExecutor {
     pub(crate) fn new(
         adapter_id: AdapterId,
@@ -914,6 +934,12 @@ impl QqActionExecutor {
             "qq.bot.share-link.create" | "qq.bot.menu.get" | "qq.bot.menu.update" => {
                 self.execute_bot_configuration_action(name, payload).await
             }
+            "qq.bot.panel.list"
+            | "qq.bot.panel.create"
+            | "qq.bot.panel.get"
+            | "qq.bot.panel.update"
+            | "qq.bot.panel.delete"
+            | "qq.bot.panel.target.update" => self.execute_panel_action(name, payload).await,
             "qq.guild.list" | "qq.guild.get" | "qq.channel.list" | "qq.channel.get"
             | "qq.channel.create" | "qq.channel.update" | "qq.channel.delete" => {
                 self.execute_channel_action(name, payload).await
@@ -1113,6 +1139,55 @@ impl QqActionExecutor {
                 self.complete_typed_action(name, self.api.update_bot_menu(&request).await)
             }
             _ => unreachable!("bot-configuration Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_panel_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.bot.panel.list" => {
+                let request: PanelListRequest = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.panels(&request).await)
+            }
+            "qq.bot.panel.create" => {
+                let request: CreatePanelRequest = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.create_panel(&request).await)
+            }
+            "qq.bot.panel.get" => {
+                let action: PanelIdAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.panel(&action.panel_id).await)
+            }
+            "qq.bot.panel.update" => {
+                let action: UpdatePanelAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .update_panel(&action.panel_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.bot.panel.delete" => {
+                let action: PanelIdAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.bot.panel.delete",
+                    "panel",
+                    self.api.delete_panel(&action.panel_id).await,
+                )
+            }
+            "qq.bot.panel.target.update" => {
+                let action: UpdatePanelTargetsAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.bot.panel.target.update",
+                    "panel",
+                    self.api
+                        .update_panel_targets(&action.panel_id, &action.request)
+                        .await,
+                )
+            }
+            _ => unreachable!("panel Action dispatcher only calls known names"),
         }
     }
 
@@ -1833,6 +1908,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
+        | ApiError::InvalidPanelRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_)
         | ApiError::InvalidRequest(_)
@@ -2140,6 +2216,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
+        | ApiError::InvalidPanelRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_) => true,
         ApiError::Authentication(AuthError::HttpStatus { status })

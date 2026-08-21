@@ -9,6 +9,7 @@ pub mod guild;
 pub mod menu;
 pub mod message;
 pub mod openapi;
+pub mod panel;
 pub mod profile;
 pub mod reaction;
 
@@ -46,6 +47,11 @@ pub use message::{
     MessageRequest, MessageResponse, MessageType, QqMessage,
 };
 pub use openapi::{ApiError, OpenApiClient, OpenApiEnvironment};
+pub use panel::{
+    CreatePanelRequest, CreatePanelResponse, Panel, PanelDetail, PanelItem, PanelItemType,
+    PanelListRequest, PanelPage, PanelRecord, PanelScope, PanelTargetOperation, PanelTargetType,
+    PanelValidationError, PanelVersion, UpdatePanelRequest, UpdatePanelTargetsRequest,
+};
 pub use profile::{BotProfile, GroupBotState, GroupInfo};
 pub use reaction::{
     MessageReactionEvent, ReactionEmoji, ReactionTarget, ReactionUser, ReactionUsersPage,

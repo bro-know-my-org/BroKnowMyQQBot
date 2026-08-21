@@ -32,6 +32,10 @@ use crate::{
         InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
         MessageResponse,
     },
+    panel::{
+        CreatePanelRequest, CreatePanelResponse, PanelDetail, PanelListRequest, PanelPage,
+        PanelValidationError, PanelVersion, UpdatePanelRequest, UpdatePanelTargetsRequest,
+    },
     profile::{BotProfile, GroupBotState, GroupInfo},
     reaction::{ReactionEmoji, ReactionUsersPage, ReactionUsersRequest, ReactionValidationError},
 };
@@ -95,6 +99,8 @@ pub enum ApiError {
     InvalidMenuRequest(#[source] MenuValidationError),
     #[error("invalid QQ share-link request: {0}")]
     InvalidShareLinkRequest(#[source] ShareLinkValidationError),
+    #[error("invalid QQ command-panel request: {0}")]
+    InvalidPanelRequest(#[source] PanelValidationError),
 }
 
 /// Authenticated QQ `OpenAPI` client.
@@ -188,6 +194,64 @@ impl OpenApiClient {
         request.validate().map_err(ApiError::InvalidMenuRequest)?;
         let url = self.endpoint(&["v2", "menu"])?;
         self.put_json(url, request).await
+    }
+
+    pub async fn panels(&self, request: &PanelListRequest) -> Result<PanelPage, ApiError> {
+        request.validate().map_err(ApiError::InvalidPanelRequest)?;
+        let mut url = self.endpoint(&["v2", "panels"])?;
+        url.query_pairs_mut()
+            .append_pair("scope", request.scope.as_str());
+        if let Some(cursor) = request.cursor.as_deref() {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        if let Some(limit) = request.limit {
+            url.query_pairs_mut()
+                .append_pair("limit", &limit.to_string());
+        }
+        self.get_json(url).await
+    }
+
+    pub async fn create_panel(
+        &self,
+        request: &CreatePanelRequest,
+    ) -> Result<CreatePanelResponse, ApiError> {
+        request.validate().map_err(ApiError::InvalidPanelRequest)?;
+        let url = self.endpoint(&["v2", "panels"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn panel(&self, panel_id: &str) -> Result<PanelDetail, ApiError> {
+        validate_path_id("panel_id", panel_id)?;
+        let url = self.endpoint(&["v2", "panels", panel_id])?;
+        self.get_json(url).await
+    }
+
+    pub async fn update_panel(
+        &self,
+        panel_id: &str,
+        request: &UpdatePanelRequest,
+    ) -> Result<PanelVersion, ApiError> {
+        validate_path_id("panel_id", panel_id)?;
+        request.validate().map_err(ApiError::InvalidPanelRequest)?;
+        let url = self.endpoint(&["v2", "panels", panel_id])?;
+        self.put_json(url, request).await
+    }
+
+    pub async fn delete_panel(&self, panel_id: &str) -> Result<(), ApiError> {
+        validate_path_id("panel_id", panel_id)?;
+        let url = self.endpoint(&["v2", "panels", panel_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn update_panel_targets(
+        &self,
+        panel_id: &str,
+        request: &UpdatePanelTargetsRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("panel_id", panel_id)?;
+        request.validate().map_err(ApiError::InvalidPanelRequest)?;
+        let url = self.endpoint(&["v2", "panels", panel_id, "target"])?;
+        self.put_json_unit(url, request).await
     }
 
     pub async fn send_c2c_message(
