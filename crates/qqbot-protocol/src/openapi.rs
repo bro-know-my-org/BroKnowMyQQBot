@@ -23,6 +23,10 @@ use crate::{
         GuildRoles, OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
         UpdateGuildRoleResult,
     },
+    menu::{
+        BotMenuResponse, BotMenuVersion, GenerateShareLinkRequest, MenuValidationError, ShareLink,
+        ShareLinkValidationError, UpdateBotMenuRequest,
+    },
     message::{
         ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
         InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
@@ -87,6 +91,10 @@ pub enum ApiError {
     InvalidChannelPermissionRequest(#[source] ChannelPermissionValidationError),
     #[error("invalid QQ reaction request: {0}")]
     InvalidReactionRequest(#[source] ReactionValidationError),
+    #[error("invalid QQ bot menu request: {0}")]
+    InvalidMenuRequest(#[source] MenuValidationError),
+    #[error("invalid QQ share-link request: {0}")]
+    InvalidShareLinkRequest(#[source] ShareLinkValidationError),
 }
 
 /// Authenticated QQ `OpenAPI` client.
@@ -155,6 +163,31 @@ impl OpenApiClient {
         validate_path_id("group_openid", group_openid)?;
         let url = self.endpoint(&["v2", "groups", group_openid, "bot_state"])?;
         self.get_json(url).await
+    }
+
+    pub async fn generate_share_link(
+        &self,
+        request: &GenerateShareLinkRequest,
+    ) -> Result<ShareLink, ApiError> {
+        request
+            .validate()
+            .map_err(ApiError::InvalidShareLinkRequest)?;
+        let url = self.endpoint(&["v2", "generate_url_link"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn bot_menu(&self) -> Result<BotMenuResponse, ApiError> {
+        let url = self.endpoint(&["v2", "menu"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn update_bot_menu(
+        &self,
+        request: &UpdateBotMenuRequest,
+    ) -> Result<BotMenuVersion, ApiError> {
+        request.validate().map_err(ApiError::InvalidMenuRequest)?;
+        let url = self.endpoint(&["v2", "menu"])?;
+        self.put_json(url, request).await
     }
 
     pub async fn send_c2c_message(
@@ -796,6 +829,17 @@ impl OpenApiClient {
             .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token).json(body))
             .await?;
         Self::decode_unit(response).await
+    }
+
+    async fn put_json<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let response = self
+            .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token).json(body))
+            .await?;
+        Self::decode(response).await
     }
 
     async fn put(&self, url: Url) -> Result<(), ApiError> {

@@ -14,13 +14,13 @@ use bot_core::{
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
     ApiError, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
-    CreateGroupJoinStrategyRequest, GatewayPayload, GroupMuteMemberOperation,
-    GuildMemberPageRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation,
-    InlineMediaUploadRequest, Intents, MediaFileType, MediaUploadRequest, MessageRequest,
-    MessageResponse, OpCode, OpenApiClient, PageRequest, ReactionEmoji, ReactionUsersRequest,
-    RemoveGuildMemberRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
-    UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
-    UpdateGroupJoinStrategyWhitelistRequest,
+    CreateGroupJoinStrategyRequest, GatewayPayload, GenerateShareLinkRequest,
+    GroupMuteMemberOperation, GuildMemberPageRequest, GuildRoleMemberPageRequest,
+    GuildRoleMemberRequest, GuildRoleMutation, InlineMediaUploadRequest, Intents, MediaFileType,
+    MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient, PageRequest,
+    ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest, ReviewGroupJoinRequest,
+    SetGroupMuteRequest, UpdateBotMenuRequest, UpdateChannelPermissionsRequest,
+    UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -911,6 +911,9 @@ impl QqActionExecutor {
             "qq.bot.profile.get" | "qq.group.info.get" | "qq.group.bot-state.get" => {
                 self.execute_profile_action(name, payload).await
             }
+            "qq.bot.share-link.create" | "qq.bot.menu.get" | "qq.bot.menu.update" => {
+                self.execute_bot_configuration_action(name, payload).await
+            }
             "qq.guild.list" | "qq.guild.get" | "qq.channel.list" | "qq.channel.get"
             | "qq.channel.create" | "qq.channel.update" | "qq.channel.delete" => {
                 self.execute_channel_action(name, payload).await
@@ -1082,6 +1085,34 @@ impl QqActionExecutor {
                 )
             }
             _ => unreachable!("profile Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_bot_configuration_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.bot.share-link.create" => {
+                reject_unknown_action_fields(name, &payload)?;
+                let request: GenerateShareLinkRequest = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.generate_share_link(&request).await)
+            }
+            "qq.bot.menu.get" => {
+                if !matches!(&payload, Value::Object(object) if object.is_empty()) {
+                    return Err(AdapterError::Action(format!(
+                        "invalid {name} payload: expected an empty JSON object"
+                    )));
+                }
+                self.complete_typed_action(name, self.api.bot_menu().await)
+            }
+            "qq.bot.menu.update" => {
+                reject_unknown_action_fields(name, &payload)?;
+                let request: UpdateBotMenuRequest = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.update_bot_menu(&request).await)
+            }
+            _ => unreachable!("bot-configuration Action dispatcher only calls known names"),
         }
     }
 
@@ -1641,6 +1672,79 @@ fn require_object(name: &str, field: &str, value: &Value) -> Result<(), AdapterE
     })
 }
 
+fn reject_unknown_action_fields(name: &str, payload: &Value) -> Result<(), AdapterError> {
+    match name {
+        "qq.bot.share-link.create" => {
+            reject_unknown_object_fields(name, "payload", payload, &["callback_data"])
+        }
+        "qq.bot.menu.update" => {
+            reject_unknown_object_fields(name, "payload", payload, &["menu"])?;
+            let Some(menu) = payload.get("menu") else {
+                return Ok(());
+            };
+            reject_unknown_object_fields(name, "menu", menu, &["items"])?;
+            let Some(items) = menu.get("items").and_then(Value::as_array) else {
+                return Ok(());
+            };
+            for (index, item) in items.iter().enumerate() {
+                reject_unknown_object_fields(
+                    name,
+                    &format!("menu.items[{index}]"),
+                    item,
+                    &[
+                        "name",
+                        "type",
+                        "sub_menu_items",
+                        "send_message",
+                        "link",
+                        "switch",
+                    ],
+                )?;
+                if let Some(switch) = item.get("switch") {
+                    reject_unknown_object_fields(
+                        name,
+                        &format!("menu.items[{index}].switch"),
+                        switch,
+                        &["switch_id", "default"],
+                    )?;
+                }
+                if let Some(sub_items) = item.get("sub_menu_items").and_then(Value::as_array) {
+                    for (sub_index, sub_item) in sub_items.iter().enumerate() {
+                        reject_unknown_object_fields(
+                            name,
+                            &format!("menu.items[{index}].sub_menu_items[{sub_index}]"),
+                            sub_item,
+                            &["name", "type", "send_message", "link"],
+                        )?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn reject_unknown_object_fields(
+    name: &str,
+    path: &str,
+    value: &Value,
+    allowed: &[&str],
+) -> Result<(), AdapterError> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(AdapterError::Action(format!(
+            "invalid {name} payload: unknown field `{field}` at {path}"
+        )));
+    }
+    Ok(())
+}
+
 const fn message_scope_name(target: &MessageTarget) -> &'static str {
     match target {
         MessageTarget::Group { .. } => "group",
@@ -1728,7 +1832,9 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::ResponseTooLarge
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildRequest(_)
+        | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidReactionRequest(_)
+        | ApiError::InvalidShareLinkRequest(_)
         | ApiError::InvalidRequest(_)
         | ApiError::InvalidUrl(_) => AdapterError::Action(error.to_string()),
     }
@@ -2033,7 +2139,9 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::InvalidRequest(_)
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildRequest(_)
-        | ApiError::InvalidReactionRequest(_) => true,
+        | ApiError::InvalidMenuRequest(_)
+        | ApiError::InvalidReactionRequest(_)
+        | ApiError::InvalidShareLinkRequest(_) => true,
         ApiError::Authentication(AuthError::HttpStatus { status })
         | ApiError::HttpStatus { status, .. } => status.is_client_error() && status.as_u16() != 429,
         ApiError::Authentication(AuthError::Request(_) | AuthError::InvalidResponse(_))

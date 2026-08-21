@@ -6,6 +6,7 @@ pub mod auth;
 pub mod gateway;
 pub mod group;
 pub mod guild;
+pub mod menu;
 pub mod message;
 pub mod openapi;
 pub mod profile;
@@ -33,6 +34,11 @@ pub use guild::{
     GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation, GuildRoles, GuildUser,
     OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
     UpdateGuildRoleResult,
+};
+pub use menu::{
+    BotMenu, BotMenuItem, BotMenuItemType, BotMenuResponse, BotMenuSwitch, BotMenuVersion,
+    BotSubMenuItem, BotSubMenuItemType, GenerateShareLinkRequest, MenuValidationError, ShareLink,
+    ShareLinkValidationError, UpdateBotMenuRequest,
 };
 pub use message::{
     ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
