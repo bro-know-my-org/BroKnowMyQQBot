@@ -108,6 +108,124 @@ pub struct GuildUser {
     pub union_user_account: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuildDispatchValidationError {
+    pub field: &'static str,
+}
+
+impl fmt::Display for GuildDispatchValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "QQ guild dispatch `{}` must not be empty",
+            self.field
+        )
+    }
+}
+
+impl std::error::Error for GuildDispatchValidationError {}
+
+/// Payload shared by QQ `GUILD_CREATE`, `GUILD_UPDATE`, and `GUILD_DELETE`.
+///
+/// The generated QQ event pages list `joined_at` and `op_user_id`, while the
+/// update/delete examples may omit them, so both are optional on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuildEvent {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub owner_id: String,
+    pub member_count: u64,
+    pub max_members: u64,
+    pub description: String,
+    /// Generic Guild objects call this field `owner`; current generated event
+    /// examples omit it, so dispatch decoding keeps it optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_user_id: Option<String>,
+}
+
+impl GuildEvent {
+    pub fn validate(&self) -> Result<(), GuildDispatchValidationError> {
+        validate_dispatch_fields([
+            ("id", self.id.as_str()),
+            ("owner_id", self.owner_id.as_str()),
+        ])?;
+        validate_optional_dispatch_field("joined_at", self.joined_at.as_deref())?;
+        validate_optional_dispatch_field("op_user_id", self.op_user_id.as_deref())
+    }
+}
+
+/// Payload shared by QQ `CHANNEL_CREATE`, `CHANNEL_UPDATE`, and
+/// `CHANNEL_DELETE`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelEvent {
+    pub id: String,
+    pub guild_id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub channel_type: u64,
+    pub sub_type: u64,
+    pub owner_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_type: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speak_permission: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_user_id: Option<String>,
+}
+
+impl ChannelEvent {
+    pub fn validate(&self) -> Result<(), GuildDispatchValidationError> {
+        validate_dispatch_fields([
+            ("id", self.id.as_str()),
+            ("guild_id", self.guild_id.as_str()),
+            ("owner_id", self.owner_id.as_str()),
+        ])?;
+        validate_optional_dispatch_field("op_user_id", self.op_user_id.as_deref())
+    }
+}
+
+/// Payload shared by QQ `GUILD_MEMBER_ADD`, `GUILD_MEMBER_UPDATE`, and
+/// `GUILD_MEMBER_REMOVE`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuildMemberEvent {
+    pub guild_id: String,
+    pub joined_at: String,
+    pub nick: String,
+    pub op_user_id: String,
+    pub roles: Vec<String>,
+    pub user: GuildUser,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deaf: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mute: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
+}
+
+impl GuildMemberEvent {
+    pub fn validate(&self) -> Result<(), GuildDispatchValidationError> {
+        validate_dispatch_fields([
+            ("guild_id", self.guild_id.as_str()),
+            ("joined_at", self.joined_at.as_str()),
+            ("op_user_id", self.op_user_id.as_str()),
+            ("user.id", self.user.id.as_str()),
+        ])
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuildMember {
     pub user: GuildUser,
@@ -388,12 +506,72 @@ fn validate_permission_bitmap(
         .map_err(|_| ChannelPermissionValidationError::BitmapOverflow { field })
 }
 
+fn validate_dispatch_fields<const N: usize>(
+    fields: [(&'static str, &str); N],
+) -> Result<(), GuildDispatchValidationError> {
+    for (field, value) in fields {
+        if value.trim().is_empty() {
+            return Err(GuildDispatchValidationError { field });
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_dispatch_field(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), GuildDispatchValidationError> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(GuildDispatchValidationError { field });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        GuildRequestValidationError, GuildRoleMemberRequest, GuildRoleMutation,
-        RemoveGuildMemberRequest,
+        ChannelEvent, GuildEvent, GuildRequestValidationError, GuildRoleMemberRequest,
+        GuildRoleMutation, RemoveGuildMemberRequest,
     };
+    use serde_json::json;
+
+    #[test]
+    fn decodes_optional_guild_and_channel_model_fields() {
+        let guild: GuildEvent = serde_json::from_value(json!({
+            "id":"guild-id",
+            "name":"guild",
+            "icon":"https://example.com/icon.png",
+            "owner_id":"owner-id",
+            "owner":true,
+            "member_count":12,
+            "max_members":1000,
+            "description":"description"
+        }))
+        .unwrap();
+        assert_eq!(guild.owner, Some(true));
+        assert_eq!(guild.joined_at, None);
+
+        let channel: ChannelEvent = serde_json::from_value(json!({
+            "id":"channel-id",
+            "guild_id":"guild-id",
+            "name":"channel",
+            "type":10006,
+            "sub_type":0,
+            "position":2,
+            "parent_id":"parent-id",
+            "owner_id":"owner-id",
+            "private_type":2,
+            "speak_permission":1,
+            "application_id":"1000001",
+            "permissions":"7"
+        }))
+        .unwrap();
+        assert_eq!(channel.parent_id.as_deref(), Some("parent-id"));
+        assert_eq!(channel.private_type, Some(2));
+        assert_eq!(channel.speak_permission, Some(1));
+        assert_eq!(channel.application_id.as_deref(), Some("1000001"));
+        assert_eq!(channel.permissions.as_deref(), Some("7"));
+    }
 
     #[test]
     fn validates_role_mutations_and_member_removal_ranges() {

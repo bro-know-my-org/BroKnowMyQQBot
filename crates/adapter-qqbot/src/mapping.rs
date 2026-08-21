@@ -7,7 +7,8 @@ use bot_core::{
 };
 use chrono::{DateTime, Utc};
 use qqbot_protocol::{
-    GatewayPayload, GroupJoinRequestEvent, GroupMemberEvent, GroupMemberEventValidationError,
+    ChannelEvent, GatewayPayload, GroupJoinRequestEvent, GroupMemberEvent,
+    GroupMemberEventValidationError, GuildDispatchValidationError, GuildEvent, GuildMemberEvent,
     MessageReactionEvent, QqMessage, ReactionValidationError,
 };
 use serde::Deserialize as _;
@@ -79,6 +80,12 @@ pub(crate) enum MappingError {
         event_type: String,
         #[source]
         source: GroupMemberEventValidationError,
+    },
+    #[error("QQ guild dispatch `{event_type}` contains invalid data")]
+    InvalidGuildDispatch {
+        event_type: String,
+        #[source]
+        source: GuildDispatchValidationError,
     },
 }
 
@@ -187,6 +194,15 @@ fn map_typed_notice(
     event_type: &str,
 ) -> Option<Result<EventEnvelope, MappingError>> {
     match event_type {
+        "GUILD_CREATE" | "GUILD_UPDATE" | "GUILD_DELETE" => {
+            Some(map_guild_event(adapter, payload, event_type))
+        }
+        "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => {
+            Some(map_channel_event(adapter, payload, event_type))
+        }
+        "GUILD_MEMBER_ADD" | "GUILD_MEMBER_UPDATE" | "GUILD_MEMBER_REMOVE" => {
+            Some(map_guild_member_event(adapter, payload, event_type))
+        }
         "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
             Some(map_message_reaction(adapter, payload, event_type))
         }
@@ -202,6 +218,73 @@ fn map_typed_notice(
         )),
         _ => None,
     }
+}
+
+fn map_guild_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = GuildEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+        event_type: event_type.to_owned(),
+        source,
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidGuildDispatch {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    validate_optional_rfc3339(event.joined_at.as_deref(), event_type)?;
+    map_structured_event(adapter, payload, event_type, None, Event::Notice)
+}
+
+fn map_channel_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = ChannelEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+        event_type: event_type.to_owned(),
+        source,
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidGuildDispatch {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_structured_event(adapter, payload, event_type, None, Event::Notice)
+}
+
+fn map_guild_member_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        GuildMemberEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidGuildDispatch {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    validate_optional_rfc3339(Some(&event.joined_at), event_type)?;
+    map_structured_event(adapter, payload, event_type, None, Event::Notice)
+}
+
+fn validate_optional_rfc3339(value: Option<&str>, event_type: &str) -> Result<(), MappingError> {
+    if let Some(value) = value {
+        DateTime::parse_from_rfc3339(value).map_err(|source| MappingError::InvalidTimestamp {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    }
+    Ok(())
 }
 
 fn map_message_reaction(
@@ -453,6 +536,242 @@ mod tests {
         };
         assert_eq!(notice["type"], "GROUP_ADD_ROBOT");
         assert_eq!(notice["data"]["group_openid"], "group-id");
+    }
+
+    #[test]
+    fn validates_and_maps_guild_lifecycle_events() {
+        let events = [
+            (
+                "GUILD_CREATE",
+                json!({
+                    "id":"guild-id",
+                    "name":"guild",
+                    "icon":"https://example.com/icon.png",
+                    "owner_id":"owner-id",
+                    "member_count":100,
+                    "max_members":1000,
+                    "description":"description",
+                    "joined_at":"2026-01-01T00:00:00+08:00",
+                    "op_user_id":"operator-id",
+                    "__none":1
+                }),
+            ),
+            (
+                "GUILD_UPDATE",
+                json!({
+                    "id":"guild-id",
+                    "name":"updated guild",
+                    "icon":"https://example.com/icon.png",
+                    "owner_id":"owner-id",
+                    "member_count":12,
+                    "max_members":1000,
+                    "description":"updated description"
+                }),
+            ),
+            (
+                "GUILD_DELETE",
+                json!({
+                    "id":"guild-id",
+                    "name":"deleted guild",
+                    "icon":"https://example.com/icon.png",
+                    "owner_id":"owner-id",
+                    "member_count":12,
+                    "max_members":1000,
+                    "description":"deleted"
+                }),
+            ),
+        ];
+        for (event_type, data) in events {
+            let payload = GatewayPayload {
+                id: Some(format!("{event_type}-id")),
+                op: OpCode::DISPATCH,
+                d: data,
+                s: Some(4),
+                t: Some(event_type.to_owned()),
+            };
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            assert!(envelope.timestamp.is_none());
+            let Event::Notice(notice) = envelope.event else {
+                panic!("expected guild notice");
+            };
+            assert_eq!(notice["type"], event_type);
+            assert_eq!(notice["data"]["id"], "guild-id");
+            if event_type == "GUILD_CREATE" {
+                assert_eq!(notice["data"]["__none"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn validates_and_maps_channel_lifecycle_events() {
+        for event_type in ["CHANNEL_CREATE", "CHANNEL_UPDATE", "CHANNEL_DELETE"] {
+            let payload = GatewayPayload {
+                id: Some(format!("{event_type}-id")),
+                op: OpCode::DISPATCH,
+                d: json!({
+                    "id":"channel-id",
+                    "guild_id":"guild-id",
+                    "name":"channel",
+                    "type":0,
+                    "sub_type":0,
+                    "position":1,
+                    "owner_id":"owner-id",
+                    "__none":1
+                }),
+                s: Some(4),
+                t: Some(event_type.to_owned()),
+            };
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            assert!(envelope.timestamp.is_none());
+            let Event::Notice(notice) = envelope.event else {
+                panic!("expected channel notice");
+            };
+            assert_eq!(notice["type"], event_type);
+            assert_eq!(notice["data"]["position"], 1);
+            assert_eq!(notice["data"]["__none"], 1);
+        }
+    }
+
+    #[test]
+    fn validates_and_maps_guild_member_events() {
+        for event_type in [
+            "GUILD_MEMBER_ADD",
+            "GUILD_MEMBER_UPDATE",
+            "GUILD_MEMBER_REMOVE",
+        ] {
+            let payload = GatewayPayload {
+                id: Some(format!("{event_type}-id")),
+                op: OpCode::DISPATCH,
+                d: json!({
+                    "guild_id":"guild-id",
+                    "joined_at":"2021-10-21T11:20:18+08:00",
+                    "nick":"",
+                    "op_user_id":"operator-id",
+                    "roles":[],
+                    "user":{
+                        "id":"user-id",
+                        "username":"member",
+                        "avatar":"https://example.com/avatar.png",
+                        "bot":false
+                    },
+                    "mute":false,
+                    "__none":1
+                }),
+                s: Some(4),
+                t: Some(event_type.to_owned()),
+            };
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            assert!(envelope.timestamp.is_none());
+            let Event::Notice(notice) = envelope.event else {
+                panic!("expected guild member notice");
+            };
+            assert_eq!(notice["type"], event_type);
+            assert_eq!(notice["data"]["nick"], "");
+            assert_eq!(notice["data"]["roles"], json!([]));
+            assert_eq!(notice["data"]["mute"], false);
+            assert_eq!(notice["data"]["__none"], 1);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_guild_channel_and_member_events() {
+        let guild = GatewayPayload {
+            id: Some("guild-event-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "id":"guild-id",
+                "name":"guild",
+                "icon":"https://example.com/icon.png",
+                "owner_id":"owner-id",
+                "member_count":12,
+                "max_members":1000,
+                "description":"description",
+                "joined_at":"not-a-timestamp"
+            }),
+            s: Some(4),
+            t: Some("GUILD_CREATE".to_owned()),
+        };
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &guild),
+            Err(MappingError::InvalidTimestamp { .. })
+        ));
+        let mut blank_guild = guild;
+        blank_guild.d["joined_at"] = json!("2026-01-01T00:00:00+08:00");
+        blank_guild.d["id"] = json!(" ");
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &blank_guild),
+            Err(MappingError::InvalidGuildDispatch { source, .. }) if source.field == "id"
+        ));
+
+        let channel = GatewayPayload {
+            id: Some("channel-event-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "id":"channel-id",
+                "guild_id":" ",
+                "name":"channel",
+                "type":0,
+                "sub_type":0,
+                "owner_id":"owner-id"
+            }),
+            s: Some(4),
+            t: Some("CHANNEL_UPDATE".to_owned()),
+        };
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &channel),
+            Err(MappingError::InvalidGuildDispatch { source, .. })
+                if source.field == "guild_id"
+        ));
+
+        let member = GatewayPayload {
+            id: Some("member-event-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "guild_id":"guild-id",
+                "joined_at":"not-a-timestamp",
+                "nick":"member",
+                "op_user_id":"operator-id",
+                "roles":["2"],
+                "user":{
+                    "id":"user-id",
+                    "username":"member",
+                    "avatar":"https://example.com/avatar.png",
+                    "bot":false
+                }
+            }),
+            s: Some(4),
+            t: Some("GUILD_MEMBER_ADD".to_owned()),
+        };
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &member),
+            Err(MappingError::InvalidTimestamp { .. })
+        ));
+        let mut missing_joined_at = member.clone();
+        missing_joined_at
+            .d
+            .as_object_mut()
+            .unwrap()
+            .remove("joined_at");
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &missing_joined_at),
+            Err(MappingError::Decode { .. })
+        ));
+        let mut missing_operator = member;
+        missing_operator
+            .d
+            .as_object_mut()
+            .unwrap()
+            .remove("op_user_id");
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &missing_operator),
+            Err(MappingError::Decode { .. })
+        ));
     }
 
     #[test]

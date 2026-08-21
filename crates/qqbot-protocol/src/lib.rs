@@ -25,8 +25,9 @@ pub use group::{
     UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
 };
 pub use guild::{
-    ChannelMemberPermissions, ChannelPermissionField, ChannelPermissionValidationError,
-    ChannelRolePermissions, CreateGuildRoleResult, GuildChannelReference, GuildMember,
+    ChannelEvent, ChannelMemberPermissions, ChannelPermissionField,
+    ChannelPermissionValidationError, ChannelRolePermissions, CreateGuildRoleResult,
+    GuildChannelReference, GuildDispatchValidationError, GuildEvent, GuildMember, GuildMemberEvent,
     GuildMemberPageRequest, GuildRequestValidationError, GuildRole, GuildRoleMemberPage,
     GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation, GuildRoles, GuildUser,
     OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
