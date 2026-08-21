@@ -6,6 +6,7 @@ pub mod auth;
 pub mod gateway;
 pub mod group;
 pub mod guild;
+pub mod interaction;
 pub mod menu;
 pub mod message;
 pub mod openapi;
@@ -35,6 +36,9 @@ pub use guild::{
     GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation, GuildRoles, GuildUser,
     OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
     UpdateGuildRoleResult,
+};
+pub use interaction::{
+    InteractionData, InteractionEvent, InteractionResponseRequest, InteractionValidationError,
 };
 pub use menu::{
     BotMenu, BotMenuItem, BotMenuItemType, BotMenuResponse, BotMenuSwitch, BotMenuVersion,

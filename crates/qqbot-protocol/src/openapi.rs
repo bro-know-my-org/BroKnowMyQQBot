@@ -23,6 +23,7 @@ use crate::{
         GuildRoles, OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
         UpdateGuildRoleResult,
     },
+    interaction::{InteractionResponseRequest, InteractionValidationError},
     menu::{
         BotMenuResponse, BotMenuVersion, GenerateShareLinkRequest, MenuValidationError, ShareLink,
         ShareLinkValidationError, UpdateBotMenuRequest,
@@ -95,6 +96,8 @@ pub enum ApiError {
     InvalidChannelPermissionRequest(#[source] ChannelPermissionValidationError),
     #[error("invalid QQ reaction request: {0}")]
     InvalidReactionRequest(#[source] ReactionValidationError),
+    #[error("invalid QQ interaction request: {0}")]
+    InvalidInteractionRequest(#[source] InteractionValidationError),
     #[error("invalid QQ bot menu request: {0}")]
     InvalidMenuRequest(#[source] MenuValidationError),
     #[error("invalid QQ share-link request: {0}")]
@@ -107,6 +110,7 @@ pub enum ApiError {
 #[derive(Clone)]
 pub struct OpenApiClient {
     client: Client,
+    single_send_client: Client,
     base_url: Url,
     tokens: TokenManager,
 }
@@ -133,8 +137,15 @@ impl OpenApiClient {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(ApiError::Request)?;
+        let single_send_client = Client::builder()
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .map_err(ApiError::Request)?;
         Ok(Self {
             client,
+            single_send_client,
             base_url,
             tokens,
         })
@@ -683,6 +694,18 @@ impl OpenApiClient {
         ])
     }
 
+    pub async fn respond_interaction(
+        &self,
+        interaction_id: &str,
+        request: &InteractionResponseRequest,
+    ) -> Result<(), ApiError> {
+        request
+            .validate(interaction_id)
+            .map_err(ApiError::InvalidInteractionRequest)?;
+        let url = self.endpoint(&["interactions", interaction_id])?;
+        self.put_json_unit_once(url, request).await
+    }
+
     pub async fn group_mute_setting(
         &self,
         group_openid: &str,
@@ -893,6 +916,27 @@ impl OpenApiClient {
             .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token).json(body))
             .await?;
         Self::decode_unit(response).await
+    }
+
+    async fn put_json_unit_once<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let token = self.tokens.access_token().await?;
+        let response = self
+            .single_send_client
+            .put(url)
+            .qqbot_token(token.expose())
+            .json(body)
+            .send()
+            .await
+            .map_err(ApiError::Request)?;
+        let unauthorized = response.status() == StatusCode::UNAUTHORIZED;
+        let result = Self::decode_unit(response).await;
+        if unauthorized {
+            let _ = self.tokens.refresh_if_current(&token).await;
+        }
+        result
     }
 
     async fn put_json<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>

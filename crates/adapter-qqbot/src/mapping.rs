@@ -9,7 +9,8 @@ use chrono::{DateTime, Utc};
 use qqbot_protocol::{
     ChannelEvent, GatewayPayload, GroupJoinRequestEvent, GroupMemberEvent,
     GroupMemberEventValidationError, GuildDispatchValidationError, GuildEvent, GuildMemberEvent,
-    MessageReactionEvent, QqMessage, ReactionValidationError,
+    InteractionEvent, InteractionValidationError, MessageReactionEvent, QqMessage,
+    ReactionValidationError,
 };
 use serde::Deserialize as _;
 use sha2::{Digest as _, Sha256};
@@ -87,6 +88,12 @@ pub(crate) enum MappingError {
         #[source]
         source: GuildDispatchValidationError,
     },
+    #[error("QQ interaction dispatch `{event_type}` contains invalid data")]
+    InvalidInteraction {
+        event_type: String,
+        #[source]
+        source: InteractionValidationError,
+    },
 }
 
 pub(crate) fn map_dispatch(
@@ -98,6 +105,9 @@ pub(crate) fn map_dispatch(
     };
     if let Some(mapped) = map_typed_notice(adapter, payload, event_type) {
         return mapped.map(Some);
+    }
+    if event_type == "INTERACTION_CREATE" {
+        return map_interaction_event(adapter, payload, event_type).map(Some);
     }
     if REQUEST_EVENTS.contains(&event_type) {
         return map_group_join_request(adapter, payload, event_type).map(Some);
@@ -340,6 +350,37 @@ fn map_group_member(
     Ok(envelope)
 }
 
+fn map_interaction_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let interaction =
+        InteractionEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    interaction
+        .validate()
+        .map_err(|source| MappingError::InvalidInteraction {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    let wrap: fn(serde_json::Value) -> Event = if interaction.requires_response() {
+        Event::Request
+    } else {
+        Event::Notice
+    };
+    map_structured_event_with_fallback_id(
+        adapter,
+        payload,
+        event_type,
+        Some("timestamp"),
+        wrap,
+        Some(&interaction.id),
+    )
+}
+
 fn map_group_join_request(
     adapter: &AdapterId,
     payload: &GatewayPayload,
@@ -375,6 +416,17 @@ fn map_structured_event(
     timestamp_field: Option<&str>,
     wrap: fn(serde_json::Value) -> Event,
 ) -> Result<EventEnvelope, MappingError> {
+    map_structured_event_with_fallback_id(adapter, payload, event_type, timestamp_field, wrap, None)
+}
+
+fn map_structured_event_with_fallback_id(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+    timestamp_field: Option<&str>,
+    wrap: fn(serde_json::Value) -> Event,
+    fallback_id: Option<&str>,
+) -> Result<EventEnvelope, MappingError> {
     if !payload.d.is_object() {
         return Err(MappingError::InvalidEventData {
             event_type: event_type.to_owned(),
@@ -387,6 +439,9 @@ fn map_structured_event(
         .filter(|value| !value.trim().is_empty())
         .map_or_else(
             || {
+                if let Some(fallback_id) = fallback_id {
+                    return Ok(fallback_id.to_owned());
+                }
                 let sequence = payload.s.ok_or_else(|| MappingError::MissingField {
                     event_type: event_type.to_owned(),
                     field: "dispatch id or sequence",
@@ -950,6 +1005,196 @@ mod tests {
             Err(MappingError::InvalidUnixTimestamp { timestamp, .. })
                 if timestamp == u64::MAX
         ));
+    }
+
+    #[test]
+    fn maps_interaction_requests_and_notices_with_data_id() {
+        for (interaction_type, expected_request) in [
+            (11, true),
+            (12, true),
+            (13, false),
+            (18, false),
+            (999, false),
+        ] {
+            let payload = GatewayPayload {
+                id: Some(format!("gateway-{interaction_type}")),
+                op: OpCode::DISPATCH,
+                d: json!({
+                    "id":format!("interaction-{interaction_type}"),
+                    "type":interaction_type,
+                    "scene":"group",
+                    "chat_type":1,
+                    "timestamp":"2026-08-22T10:00:00+08:00",
+                    "group_openid":"group-id",
+                    "group_member_openid":"member-id",
+                    "data":{
+                        "type":interaction_type,
+                        "resolved":{"button_data":"approve"},
+                        "future_data":true
+                    },
+                    "future_top":"kept"
+                }),
+                s: Some(8),
+                t: Some("INTERACTION_CREATE".to_owned()),
+            };
+
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            assert_eq!(envelope.id.as_str(), format!("gateway-{interaction_type}"));
+            assert_eq!(
+                envelope.timestamp.unwrap().to_rfc3339(),
+                "2026-08-22T02:00:00+00:00"
+            );
+            let body = match envelope.event {
+                Event::Request(body) if expected_request => body,
+                Event::Notice(body) if !expected_request => body,
+                other => panic!("unexpected interaction event: {other:?}"),
+            };
+            assert_eq!(body["type"], "INTERACTION_CREATE");
+            assert_eq!(
+                body["data"]["id"],
+                format!("interaction-{interaction_type}")
+            );
+            assert_eq!(body["data"]["future_top"], "kept");
+            assert_eq!(body["data"]["data"]["future_data"], true);
+        }
+    }
+
+    #[test]
+    fn maps_c2c_and_guild_interaction_scenes() {
+        for (data, expected_request, id_field, id_value) in [
+            (
+                json!({
+                    "id":"c2c-interaction","type":12,"scene":"c2c",
+                    "timestamp":"2026-08-22T10:00:00Z","user_openid":"user-id"
+                }),
+                true,
+                "user_openid",
+                "user-id",
+            ),
+            (
+                json!({
+                    "id":"guild-interaction","type":13,"scene":"guild",
+                    "timestamp":"2026-08-22T10:00:00Z","guild_id":"guild-id",
+                    "channel_id":"channel-id"
+                }),
+                false,
+                "channel_id",
+                "channel-id",
+            ),
+        ] {
+            let payload = GatewayPayload {
+                id: Some("gateway-interaction".to_owned()),
+                op: OpCode::DISPATCH,
+                d: data,
+                s: Some(9),
+                t: Some("INTERACTION_CREATE".to_owned()),
+            };
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            let body = match envelope.event {
+                Event::Request(body) if expected_request => body,
+                Event::Notice(body) if !expected_request => body,
+                other => panic!("unexpected interaction event: {other:?}"),
+            };
+            assert_eq!(body["data"][id_field], id_value);
+        }
+
+        let payload = GatewayPayload {
+            id: None,
+            op: OpCode::DISPATCH,
+            d: json!({
+                "id":"interaction-fallback","type":12,"scene":"c2c",
+                "timestamp":"2026-08-22T10:00:00Z","user_openid":"user-id"
+            }),
+            s: None,
+            t: Some("INTERACTION_CREATE".to_owned()),
+        };
+        let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.id.as_str(), "interaction-fallback");
+
+        let sparse_payload = GatewayPayload {
+            id: Some("sparse-interaction".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "id":"sparse-interaction","type":13,"scene":"group",
+                "timestamp":"2026-08-22T10:00:00Z"
+            }),
+            s: Some(10),
+            t: Some("INTERACTION_CREATE".to_owned()),
+        };
+        assert!(
+            map_dispatch(&AdapterId::new("qq"), &sparse_payload)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_interaction_events() {
+        let base = GatewayPayload {
+            id: Some("gateway-interaction-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "id":"interaction-id",
+                "type":11,
+                "timestamp":"2026-08-22T10:00:00Z"
+            }),
+            s: Some(8),
+            t: Some("INTERACTION_CREATE".to_owned()),
+        };
+        for (data, expected_decode) in [
+            (json!({"type":11,"timestamp":"2026-08-22T10:00:00Z"}), true),
+            (
+                json!({"id":"interaction-id","timestamp":"2026-08-22T10:00:00Z"}),
+                true,
+            ),
+            (
+                json!({"id":" ","type":11,"timestamp":"2026-08-22T10:00:00Z"}),
+                false,
+            ),
+            (
+                json!({
+                    "id":"interaction-id","type":11,
+                    "timestamp":"2026-08-22T10:00:00Z","group_openid":" "
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "id":"interaction-id","type":11,
+                    "timestamp":"2026-08-22T10:00:00Z","user_openid":"bad id"
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "id":"interaction-id","type":13,
+                    "timestamp":"2026-08-22T10:00:00Z","data":{"type":11}
+                }),
+                false,
+            ),
+            (
+                json!({"id":"interaction-id","type":11,"timestamp":"not-a-timestamp"}),
+                false,
+            ),
+            (json!([]), true),
+        ] {
+            let payload = GatewayPayload {
+                d: data,
+                ..base.clone()
+            };
+            let error = map_dispatch(&AdapterId::new("qq"), &payload).unwrap_err();
+            if expected_decode {
+                assert!(matches!(error, MappingError::Decode { .. }));
+            } else {
+                assert!(matches!(error, MappingError::InvalidInteraction { .. }));
+            }
+        }
     }
 
     #[test]

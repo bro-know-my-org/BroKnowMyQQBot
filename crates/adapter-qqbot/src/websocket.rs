@@ -16,10 +16,10 @@ use qqbot_protocol::{
     ApiError, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
     CreateGroupJoinStrategyRequest, CreatePanelRequest, GatewayPayload, GenerateShareLinkRequest,
     GroupMuteMemberOperation, GuildMemberPageRequest, GuildRoleMemberPageRequest,
-    GuildRoleMemberRequest, GuildRoleMutation, InlineMediaUploadRequest, Intents, MediaFileType,
-    MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient, PageRequest,
-    PanelListRequest, ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest,
-    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
+    GuildRoleMemberRequest, GuildRoleMutation, InlineMediaUploadRequest, Intents,
+    InteractionResponseRequest, MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse,
+    OpCode, OpenApiClient, PageRequest, PanelListRequest, ReactionEmoji, ReactionUsersRequest,
+    RemoveGuildMemberRequest, ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
     UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
     UpdateGroupJoinStrategyWhitelistRequest, UpdatePanelRequest, UpdatePanelTargetsRequest,
 };
@@ -623,6 +623,13 @@ struct ReactionUsersAction {
 }
 
 #[derive(Debug, Deserialize)]
+struct InteractionResponseAction {
+    interaction_id: String,
+    #[serde(flatten)]
+    request: InteractionResponseRequest,
+}
+
+#[derive(Debug, Deserialize)]
 struct GroupOpenIdAction {
     group_openid: String,
 }
@@ -940,6 +947,22 @@ impl QqActionExecutor {
             | "qq.bot.panel.update"
             | "qq.bot.panel.delete"
             | "qq.bot.panel.target.update" => self.execute_panel_action(name, payload).await,
+            "qq.interaction.respond" => {
+                reject_unknown_object_fields(
+                    name,
+                    "payload",
+                    &payload,
+                    &["interaction_id", "code"],
+                )?;
+                let action: InteractionResponseAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.interaction.respond",
+                    "interaction",
+                    self.api
+                        .respond_interaction(&action.interaction_id, &action.request)
+                        .await,
+                )
+            }
             "qq.guild.list" | "qq.guild.get" | "qq.channel.list" | "qq.channel.get"
             | "qq.channel.create" | "qq.channel.update" | "qq.channel.delete" => {
                 self.execute_channel_action(name, payload).await
@@ -1909,6 +1932,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
+        | ApiError::InvalidInteractionRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_)
         | ApiError::InvalidRequest(_)
@@ -2217,6 +2241,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
+        | ApiError::InvalidInteractionRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_) => true,
         ApiError::Authentication(AuthError::HttpStatus { status })

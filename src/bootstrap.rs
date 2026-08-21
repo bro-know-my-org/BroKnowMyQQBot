@@ -295,6 +295,7 @@ fn configured_qq_intents(config: &BotConfig) -> Intents {
             | Intents::GUILD_MEMBERS
             | Intents::GUILD_MESSAGE_REACTIONS
             | Intents::GROUP_MEMBER_EVENT
+            | Intents::INTERACTION
             | Intents::MESSAGE_AUDIT;
     }
     intents
@@ -378,7 +379,7 @@ mod tests {
     use super::{BotConfig, configured_qq_intents};
 
     #[test]
-    fn extended_events_control_group_member_intent() {
+    fn extended_events_control_optional_intents() {
         let enabled: BotConfig = toml::from_str("[qq]\nextended_events = true").unwrap();
         let enabled_intents = configured_qq_intents(&enabled);
         assert_eq!(
@@ -388,6 +389,7 @@ mod tests {
                 | Intents::GUILD_MEMBERS
                 | Intents::GUILD_MESSAGE_REACTIONS
                 | Intents::GROUP_MEMBER_EVENT
+                | Intents::INTERACTION
                 | Intents::MESSAGE_AUDIT
         );
 

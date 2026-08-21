@@ -23,7 +23,7 @@ use bot_core::{
     ShutdownSignal,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey};
-use qqbot_protocol::{GatewayPayload, OpCode, OpenApiClient};
+use qqbot_protocol::{GatewayPayload, InteractionEvent, OpCode, OpenApiClient};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::json;
@@ -453,20 +453,39 @@ fn validation_response(state: &WebhookState, payload: &GatewayPayload) -> Respon
 async fn dispatch_response(
     state: &WebhookState,
     request_generation: u64,
-    payload: GatewayPayload,
+    mut payload: GatewayPayload,
     signed_at: u64,
 ) -> Response {
-    let Some(event_id) = payload
+    let outer_event_id = payload
         .id
         .as_deref()
         .filter(|event_id| !event_id.trim().is_empty() && event_id.len() <= MAX_EVENT_ID_BYTES)
-    else {
+        .map(str::to_owned);
+    let interaction_event_id =
+        if outer_event_id.is_none() && payload.t.as_deref() == Some("INTERACTION_CREATE") {
+            InteractionEvent::deserialize(&payload.d)
+                .ok()
+                .and_then(|interaction| {
+                    (interaction.id.len() <= MAX_EVENT_ID_BYTES && interaction.validate().is_ok())
+                        .then_some(interaction.id)
+                })
+        } else {
+            None
+        };
+    let Some(event_id) = outer_event_id.or(interaction_event_id) else {
         return callback_error(
             StatusCode::BAD_REQUEST,
             "dispatch event ID is missing or invalid",
         );
     };
-    let event_id = event_id.to_owned();
+    if payload
+        .id
+        .as_deref()
+        .is_none_or(|candidate| candidate != event_id)
+        && payload.t.as_deref() == Some("INTERACTION_CREATE")
+    {
+        payload.id = None;
+    }
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(now) => now.as_secs(),
         Err(_) => {
@@ -846,6 +865,56 @@ mod tests {
             assert_eq!(ack, json!({"op": 12, "d": 0}));
         }
         assert_eq!(received.recv().await.unwrap().id.as_str(), "event-id");
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn interaction_without_or_with_invalid_gateway_id_uses_data_id_for_deduplication() {
+        let adapter = adapter();
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+        let (terminal_error, _terminal_failure) = tokio::sync::oneshot::channel();
+        adapter
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = Some(ActiveWebhookRun {
+            generation: 1,
+            events: EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap(),
+            terminal_error: Some(terminal_error),
+        });
+        for (outer_id, interaction_id) in [(None, "missing-id"), (Some(" "), "invalid-id")] {
+            for sequence in [1, 2] {
+                let mut payload = json!({
+                    "op": 0,
+                    "d": {
+                        "id": interaction_id,
+                        "type": 11,
+                        "scene": "group",
+                        "timestamp": "2026-08-22T10:00:00Z",
+                        "group_openid": "group-id",
+                        "group_member_openid": "member-id"
+                    },
+                    "s": sequence,
+                    "t": "INTERACTION_CREATE"
+                });
+                if let Some(outer_id) = outer_id {
+                    payload["id"] = json!(outer_id);
+                }
+                let response = adapter
+                    .router()
+                    .oneshot(signed_request(&payload))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap();
+                let ack: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(ack, json!({"op": 12, "d": 0}));
+            }
+            assert_eq!(received.recv().await.unwrap().id.as_str(), interaction_id);
+        }
         assert!(received.try_recv().is_err());
     }
 
