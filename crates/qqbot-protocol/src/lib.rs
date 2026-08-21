@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod gateway;
 pub mod group;
+pub mod guild;
 pub mod message;
 pub mod openapi;
 
@@ -20,6 +21,12 @@ pub use group::{
     GroupMuteMemberOperation, GroupMuteOperation, GroupMuteRecurringRule, GroupMuteScheduleRule,
     GroupMuteSetting, GroupMutedMember, PageRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
     UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
+};
+pub use guild::{
+    CreateGuildRoleResult, GuildChannelReference, GuildMember, GuildMemberPageRequest,
+    GuildRequestValidationError, GuildRole, GuildRoleMemberPage, GuildRoleMemberPageRequest,
+    GuildRoleMemberRequest, GuildRoleMutation, GuildRoles, GuildUser, OnlineMemberCount,
+    RemoveGuildMemberRequest, UpdateGuildRoleResult,
 };
 pub use message::{
     ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,

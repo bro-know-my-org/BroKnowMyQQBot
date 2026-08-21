@@ -15,9 +15,11 @@ use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
     ApiError, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
     CreateGroupJoinStrategyRequest, GatewayPayload, GroupMuteMemberOperation,
+    GuildMemberPageRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation,
     InlineMediaUploadRequest, Intents, MediaFileType, MediaUploadRequest, MessageRequest,
-    MessageResponse, OpCode, OpenApiClient, PageRequest, ReviewGroupJoinRequest,
-    SetGroupMuteRequest, UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
+    MessageResponse, OpCode, OpenApiClient, PageRequest, RemoveGuildMemberRequest,
+    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateGroupJoinStrategyRequest,
+    UpdateGroupJoinStrategyWhitelistRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -502,6 +504,66 @@ struct UpdateChannelAction {
 }
 
 #[derive(Debug, Deserialize)]
+struct GuildMemberListAction {
+    guild_id: String,
+    #[serde(flatten)]
+    page: GuildMemberPageRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildRoleMemberListAction {
+    guild_id: String,
+    role_id: String,
+    #[serde(flatten)]
+    page: GuildRoleMemberPageRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildMemberAction {
+    guild_id: String,
+    user_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoveGuildMemberAction {
+    guild_id: String,
+    user_id: String,
+    #[serde(flatten)]
+    request: RemoveGuildMemberRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildRoleMutationAction {
+    guild_id: String,
+    #[serde(flatten)]
+    request: GuildRoleMutation,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateGuildRoleAction {
+    guild_id: String,
+    role_id: String,
+    #[serde(flatten)]
+    request: GuildRoleMutation,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildRoleAction {
+    guild_id: String,
+    role_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(clippy::struct_field_names)]
+struct GuildRoleMemberAction {
+    guild_id: String,
+    user_id: String,
+    role_id: String,
+    #[serde(default)]
+    channel_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GroupOpenIdAction {
     group_openid: String,
 }
@@ -792,6 +854,19 @@ impl QqActionExecutor {
             | "qq.channel.create" | "qq.channel.update" | "qq.channel.delete" => {
                 self.execute_channel_action(name, payload).await
             }
+            "qq.channel.online-count"
+            | "qq.guild.member.list"
+            | "qq.guild.member.get"
+            | "qq.guild.member.remove"
+            | "qq.guild.role.member.list"
+            | "qq.guild.role.list"
+            | "qq.guild.role.create"
+            | "qq.guild.role.update"
+            | "qq.guild.role.delete"
+            | "qq.guild.role.member.add"
+            | "qq.guild.role.member.remove" => {
+                self.execute_guild_management_action(name, payload).await
+            }
             "qq.group.mute.get"
             | "qq.group.mute.set"
             | "qq.group.join-request.list"
@@ -968,6 +1043,126 @@ impl QqActionExecutor {
                 )
             }
             _ => unreachable!("channel Action dispatcher only calls known names"),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_guild_management_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.channel.online-count" => {
+                let action: ChannelAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .channel_online_member_count(&action.channel_id)
+                        .await,
+                )
+            }
+            "qq.guild.member.list" => {
+                let action: GuildMemberListAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api.guild_members(&action.guild_id, &action.page).await,
+                )
+            }
+            "qq.guild.role.member.list" => {
+                let action: GuildRoleMemberListAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .guild_role_members(&action.guild_id, &action.role_id, &action.page)
+                        .await,
+                )
+            }
+            "qq.guild.member.get" => {
+                let action: GuildMemberAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .guild_member(&action.guild_id, &action.user_id)
+                        .await,
+                )
+            }
+            "qq.guild.member.remove" => {
+                let action: RemoveGuildMemberAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.guild.member.remove",
+                    "guild",
+                    self.api
+                        .remove_guild_member(&action.guild_id, &action.user_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.guild.role.list" => {
+                let action: GuildAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.guild_roles(&action.guild_id).await)
+            }
+            "qq.guild.role.create" => {
+                let action: GuildRoleMutationAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .create_guild_role(&action.guild_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.guild.role.update" => {
+                let action: UpdateGuildRoleAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .update_guild_role(&action.guild_id, &action.role_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.guild.role.delete" => {
+                let action: GuildRoleAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.guild.role.delete",
+                    "guild",
+                    self.api
+                        .delete_guild_role(&action.guild_id, &action.role_id)
+                        .await,
+                )
+            }
+            "qq.guild.role.member.add" | "qq.guild.role.member.remove" => {
+                let action: GuildRoleMemberAction = decode_platform_payload(name, payload)?;
+                let request = action.channel_id.map_or_else(
+                    GuildRoleMemberRequest::default,
+                    GuildRoleMemberRequest::for_channel,
+                );
+                let (action_type, result) = if name == "qq.guild.role.member.add" {
+                    (
+                        "qq.guild.role.member.add",
+                        self.api
+                            .add_guild_role_member(
+                                &action.guild_id,
+                                &action.user_id,
+                                &action.role_id,
+                                &request,
+                            )
+                            .await,
+                    )
+                } else {
+                    (
+                        "qq.guild.role.member.remove",
+                        self.api
+                            .remove_guild_role_member(
+                                &action.guild_id,
+                                &action.user_id,
+                                &action.role_id,
+                                &request,
+                            )
+                            .await,
+                    )
+                };
+                self.complete_unit_action(action_type, "guild", result)
+            }
+            _ => unreachable!("guild management Action dispatcher only calls known names"),
         }
     }
 
@@ -1348,6 +1543,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::HttpStatus { .. }
         | ApiError::Platform { .. }
         | ApiError::ResponseTooLarge
+        | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidRequest(_)
         | ApiError::InvalidUrl(_) => AdapterError::Action(error.to_string()),
     }
@@ -1648,7 +1844,9 @@ fn is_fatal_close_code(code: u16) -> bool {
 
 fn is_fatal_api_error(error: &ApiError) -> bool {
     match error {
-        ApiError::InvalidUrl(_) | ApiError::InvalidRequest(_) => true,
+        ApiError::InvalidUrl(_)
+        | ApiError::InvalidRequest(_)
+        | ApiError::InvalidGuildRequest(_) => true,
         ApiError::Authentication(AuthError::HttpStatus { status })
         | ApiError::HttpStatus { status, .. } => status.is_client_error() && status.as_u16() != 429,
         ApiError::Authentication(AuthError::Request(_) | AuthError::InvalidResponse(_))

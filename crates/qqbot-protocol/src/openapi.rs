@@ -16,6 +16,11 @@ use crate::{
         GroupMuteSetting, PageRequest, ReviewGroupJoinRequest, SetGroupMuteRequest,
         UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
     },
+    guild::{
+        CreateGuildRoleResult, GuildMember, GuildMemberPageRequest, GuildRequestValidationError,
+        GuildRoleMemberPage, GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation,
+        GuildRoles, OnlineMemberCount, RemoveGuildMemberRequest, UpdateGuildRoleResult,
+    },
     message::{
         ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
         InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
@@ -72,6 +77,8 @@ pub enum ApiError {
     InvalidUrl(String),
     #[error("invalid QQ OpenAPI request: {0}")]
     InvalidRequest(String),
+    #[error("invalid QQ guild request: {0}")]
+    InvalidGuildRequest(#[source] GuildRequestValidationError),
 }
 
 /// Authenticated QQ `OpenAPI` client.
@@ -317,6 +324,130 @@ impl OpenApiClient {
         self.delete(url).await
     }
 
+    pub async fn channel_online_member_count(
+        &self,
+        channel_id: &str,
+    ) -> Result<OnlineMemberCount, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        let url = self.endpoint(&["channels", channel_id, "online_nums"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn guild_members(
+        &self,
+        guild_id: &str,
+        request: &GuildMemberPageRequest,
+    ) -> Result<Vec<GuildMember>, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        request.validate().map_err(ApiError::InvalidGuildRequest)?;
+        let mut url = self.endpoint(&["guilds", guild_id, "members"])?;
+        url.query_pairs_mut()
+            .append_pair("after", &request.after)
+            .append_pair("limit", &request.limit.to_string());
+        self.get_json(url).await
+    }
+
+    pub async fn guild_role_members(
+        &self,
+        guild_id: &str,
+        role_id: &str,
+        request: &GuildRoleMemberPageRequest,
+    ) -> Result<GuildRoleMemberPage, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        validate_path_id("role_id", role_id)?;
+        request.validate().map_err(ApiError::InvalidGuildRequest)?;
+        let mut url = self.endpoint(&["guilds", guild_id, "roles", role_id, "members"])?;
+        url.query_pairs_mut()
+            .append_pair("start_index", &request.start_index)
+            .append_pair("limit", &request.limit.to_string());
+        self.get_json(url).await
+    }
+
+    pub async fn guild_member(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+    ) -> Result<GuildMember, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        validate_path_id("user_id", user_id)?;
+        let url = self.endpoint(&["guilds", guild_id, "members", user_id])?;
+        self.get_json(url).await
+    }
+
+    pub async fn remove_guild_member(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        request: &RemoveGuildMemberRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        validate_path_id("user_id", user_id)?;
+        request.validate().map_err(ApiError::InvalidGuildRequest)?;
+        let url = self.endpoint(&["guilds", guild_id, "members", user_id])?;
+        self.delete_json_unit(url, request).await
+    }
+
+    pub async fn guild_roles(&self, guild_id: &str) -> Result<GuildRoles, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        let url = self.endpoint(&["guilds", guild_id, "roles"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn create_guild_role(
+        &self,
+        guild_id: &str,
+        request: &GuildRoleMutation,
+    ) -> Result<CreateGuildRoleResult, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        request.validate().map_err(ApiError::InvalidGuildRequest)?;
+        let url = self.endpoint(&["guilds", guild_id, "roles"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn update_guild_role(
+        &self,
+        guild_id: &str,
+        role_id: &str,
+        request: &GuildRoleMutation,
+    ) -> Result<UpdateGuildRoleResult, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        validate_path_id("role_id", role_id)?;
+        request.validate().map_err(ApiError::InvalidGuildRequest)?;
+        let url = self.endpoint(&["guilds", guild_id, "roles", role_id])?;
+        self.patch_json(url, request).await
+    }
+
+    pub async fn delete_guild_role(&self, guild_id: &str, role_id: &str) -> Result<(), ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        validate_path_id("role_id", role_id)?;
+        let url = self.endpoint(&["guilds", guild_id, "roles", role_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn add_guild_role_member(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        role_id: &str,
+        request: &GuildRoleMemberRequest,
+    ) -> Result<(), ApiError> {
+        validate_guild_role_member_request(guild_id, user_id, role_id, request)?;
+        let url = self.endpoint(&["guilds", guild_id, "members", user_id, "roles", role_id])?;
+        self.put_json_unit(url, request).await
+    }
+
+    pub async fn remove_guild_role_member(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        role_id: &str,
+        request: &GuildRoleMemberRequest,
+    ) -> Result<(), ApiError> {
+        validate_guild_role_member_request(guild_id, user_id, role_id, request)?;
+        let url = self.endpoint(&["guilds", guild_id, "members", user_id, "roles", role_id])?;
+        self.delete_json_unit(url, request).await
+    }
+
     pub async fn group_mute_setting(
         &self,
         group_openid: &str,
@@ -519,6 +650,31 @@ impl OpenApiClient {
         Self::decode(response).await
     }
 
+    async fn put_json_unit<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let response = self
+            .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token).json(body))
+            .await?;
+        Self::decode_unit(response).await
+    }
+
+    async fn delete_json_unit<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let response = self
+            .send_authorized(|token| {
+                self.client
+                    .delete(url.clone())
+                    .qqbot_token(token)
+                    .json(body)
+            })
+            .await?;
+        Self::decode_unit(response).await
+    }
+
     async fn delete(&self, url: Url) -> Result<(), ApiError> {
         let response = self
             .send_authorized(|token| self.client.delete(url.clone()).qqbot_token(token))
@@ -651,6 +807,20 @@ fn validate_path_id(field: &str, value: &str) -> Result<(), ApiError> {
         )));
     }
     Ok(())
+}
+
+fn validate_guild_role_member_request(
+    guild_id: &str,
+    user_id: &str,
+    role_id: &str,
+    request: &GuildRoleMemberRequest,
+) -> Result<(), ApiError> {
+    validate_path_id("guild_id", guild_id)?;
+    validate_path_id("user_id", user_id)?;
+    validate_path_id("role_id", role_id)?;
+    request
+        .validate(role_id)
+        .map_err(ApiError::InvalidGuildRequest)
 }
 
 trait RequestBuilderExt {
