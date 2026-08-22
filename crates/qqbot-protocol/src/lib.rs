@@ -6,6 +6,7 @@ pub mod auth;
 pub mod gateway;
 pub mod group;
 pub mod guild;
+pub mod guild_control;
 pub mod interaction;
 pub mod menu;
 pub mod message;
@@ -36,6 +37,12 @@ pub use guild::{
     GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation, GuildRoles, GuildUser,
     OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
     UpdateGuildRoleResult,
+};
+pub use guild_control::{
+    GuildApiIdentify, GuildApiPermission, GuildApiPermissionDemand,
+    GuildApiPermissionDemandIdentify, GuildApiPermissionDemandRequest, GuildApiPermissionList,
+    GuildControlValidationError, GuildMembersMuteRequest, GuildMembersMuteResponse,
+    GuildMessageSetting, GuildMuteRequest,
 };
 pub use interaction::{
     InteractionData, InteractionEvent, InteractionResponseRequest, InteractionValidationError,

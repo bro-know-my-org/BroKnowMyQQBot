@@ -15,11 +15,12 @@ use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
     ApiError, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
     CreateGroupJoinStrategyRequest, CreatePanelRequest, GatewayPayload, GenerateShareLinkRequest,
-    GroupMuteMemberOperation, GuildMemberPageRequest, GuildRoleMemberPageRequest,
-    GuildRoleMemberRequest, GuildRoleMutation, InlineMediaUploadRequest, Intents,
-    InteractionResponseRequest, MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse,
-    OpCode, OpenApiClient, PageRequest, PanelListRequest, ReactionEmoji, ReactionUsersRequest,
-    RemoveGuildMemberRequest, ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
+    GroupMuteMemberOperation, GuildApiPermissionDemandRequest, GuildMemberPageRequest,
+    GuildMembersMuteRequest, GuildMuteRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest,
+    GuildRoleMutation, InlineMediaUploadRequest, Intents, InteractionResponseRequest,
+    MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient,
+    PageRequest, PanelListRequest, ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest,
+    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
     UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
     UpdateGroupJoinStrategyWhitelistRequest, UpdatePanelRequest, UpdatePanelTargetsRequest,
 };
@@ -527,6 +528,35 @@ struct GuildMemberAction {
 }
 
 #[derive(Debug, Deserialize)]
+struct GuildMuteAction {
+    guild_id: String,
+    #[serde(flatten)]
+    request: GuildMuteRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildMemberMuteAction {
+    guild_id: String,
+    user_id: String,
+    #[serde(flatten)]
+    request: GuildMuteRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildMembersMuteAction {
+    guild_id: String,
+    #[serde(flatten)]
+    request: GuildMembersMuteRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildApiPermissionDemandAction {
+    guild_id: String,
+    #[serde(flatten)]
+    request: GuildApiPermissionDemandRequest,
+}
+
+#[derive(Debug, Deserialize)]
 struct RemoveGuildMemberAction {
     guild_id: String,
     user_id: String,
@@ -963,6 +993,14 @@ impl QqActionExecutor {
                         .await,
                 )
             }
+            "qq.guild.message-setting.get"
+            | "qq.guild.mute.set"
+            | "qq.guild.member.mute.set"
+            | "qq.guild.members.mute.set"
+            | "qq.guild.api-permission.list"
+            | "qq.guild.api-permission.demand" => {
+                self.execute_guild_control_action(name, payload).await
+            }
             "qq.guild.list" | "qq.guild.get" | "qq.channel.list" | "qq.channel.get"
             | "qq.channel.create" | "qq.channel.update" | "qq.channel.delete" => {
                 self.execute_channel_action(name, payload).await
@@ -1211,6 +1249,103 @@ impl QqActionExecutor {
                 )
             }
             _ => unreachable!("panel Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_guild_control_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.guild.message-setting.get" => {
+                reject_unknown_object_fields(name, "payload", &payload, &["guild_id"])?;
+                let action: GuildAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api.guild_message_setting(&action.guild_id).await,
+                )
+            }
+            "qq.guild.mute.set" => {
+                reject_unknown_object_fields(
+                    name,
+                    "payload",
+                    &payload,
+                    &["guild_id", "mute_end_timestamp", "mute_seconds"],
+                )?;
+                let action: GuildMuteAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.guild.mute.set",
+                    "guild",
+                    self.api
+                        .set_guild_mute(&action.guild_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.guild.member.mute.set" => {
+                reject_unknown_object_fields(
+                    name,
+                    "payload",
+                    &payload,
+                    &["guild_id", "user_id", "mute_end_timestamp", "mute_seconds"],
+                )?;
+                let action: GuildMemberMuteAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.guild.member.mute.set",
+                    "guild",
+                    self.api
+                        .set_guild_member_mute(&action.guild_id, &action.user_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.guild.members.mute.set" => {
+                reject_unknown_object_fields(
+                    name,
+                    "payload",
+                    &payload,
+                    &["guild_id", "mute_end_timestamp", "mute_seconds", "user_ids"],
+                )?;
+                let action: GuildMembersMuteAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .set_guild_members_mute(&action.guild_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.guild.api-permission.list" => {
+                reject_unknown_object_fields(name, "payload", &payload, &["guild_id"])?;
+                let action: GuildAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api.guild_api_permissions(&action.guild_id).await,
+                )
+            }
+            "qq.guild.api-permission.demand" => {
+                reject_unknown_object_fields(
+                    name,
+                    "payload",
+                    &payload,
+                    &["guild_id", "channel_id", "api_identify", "desc"],
+                )?;
+                if let Some(api_identify) = payload.get("api_identify") {
+                    reject_unknown_object_fields(
+                        name,
+                        "payload.api_identify",
+                        api_identify,
+                        &["path", "method"],
+                    )?;
+                }
+                let action: GuildApiPermissionDemandAction =
+                    decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .demand_guild_api_permission(&action.guild_id, &action.request)
+                        .await,
+                )
+            }
+            _ => unreachable!("guild-control Action dispatcher only calls known names"),
         }
     }
 
@@ -1929,6 +2064,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::Platform { .. }
         | ApiError::ResponseTooLarge
         | ApiError::InvalidChannelPermissionRequest(_)
+        | ApiError::InvalidGuildControlRequest(_)
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
@@ -2238,6 +2374,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         ApiError::InvalidUrl(_)
         | ApiError::InvalidRequest(_)
         | ApiError::InvalidChannelPermissionRequest(_)
+        | ApiError::InvalidGuildControlRequest(_)
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)

@@ -171,6 +171,20 @@ impl TokenManager {
         *self.inner.cached.lock().await = None;
     }
 
+    pub(crate) async fn invalidate_if_current(&self, rejected: &AccessToken) -> bool {
+        let _refresh_guard = self.inner.refresh.lock().await;
+        let mut cached = self.inner.cached.lock().await;
+        if cached
+            .as_ref()
+            .is_some_and(|cached| cached.token.expose() == rejected.expose())
+        {
+            *cached = None;
+            true
+        } else {
+            false
+        }
+    }
+
     async fn cached_token(&self, apply_refresh_window: bool) -> Option<AccessToken> {
         let cached = self.inner.cached.lock().await;
         let cached = cached.as_ref()?;

@@ -23,6 +23,11 @@ use crate::{
         GuildRoles, OnlineMemberCount, RemoveGuildMemberRequest, UpdateChannelPermissionsRequest,
         UpdateGuildRoleResult,
     },
+    guild_control::{
+        GuildApiPermissionDemand, GuildApiPermissionDemandRequest, GuildApiPermissionList,
+        GuildControlValidationError, GuildMembersMuteRequest, GuildMembersMuteResponse,
+        GuildMessageSetting, GuildMuteRequest,
+    },
     interaction::{InteractionResponseRequest, InteractionValidationError},
     menu::{
         BotMenuResponse, BotMenuVersion, GenerateShareLinkRequest, MenuValidationError, ShareLink,
@@ -92,6 +97,8 @@ pub enum ApiError {
     InvalidRequest(String),
     #[error("invalid QQ guild request: {0}")]
     InvalidGuildRequest(#[source] GuildRequestValidationError),
+    #[error("invalid QQ guild control request: {0}")]
+    InvalidGuildControlRequest(#[source] GuildControlValidationError),
     #[error("invalid QQ channel permission request: {0}")]
     InvalidChannelPermissionRequest(#[source] ChannelPermissionValidationError),
     #[error("invalid QQ reaction request: {0}")]
@@ -455,6 +462,78 @@ impl OpenApiClient {
     pub async fn delete_channel(&self, channel_id: &str) -> Result<(), ApiError> {
         let url = self.endpoint(&["channels", channel_id])?;
         self.delete(url).await
+    }
+
+    pub async fn guild_message_setting(
+        &self,
+        guild_id: &str,
+    ) -> Result<GuildMessageSetting, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        let url = self.endpoint(&["guilds", guild_id, "message", "setting"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn set_guild_mute(
+        &self,
+        guild_id: &str,
+        request: &GuildMuteRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidGuildControlRequest)?;
+        let url = self.endpoint(&["guilds", guild_id, "mute"])?;
+        self.patch_json_unit(url, request).await
+    }
+
+    pub async fn set_guild_member_mute(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        request: &GuildMuteRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        validate_path_id("user_id", user_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidGuildControlRequest)?;
+        let url = self.endpoint(&["guilds", guild_id, "members", user_id, "mute"])?;
+        self.patch_json_unit(url, request).await
+    }
+
+    pub async fn set_guild_members_mute(
+        &self,
+        guild_id: &str,
+        request: &GuildMembersMuteRequest,
+    ) -> Result<GuildMembersMuteResponse, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidGuildControlRequest)?;
+        let url = self.endpoint(&["guilds", guild_id, "mute"])?;
+        self.patch_json(url, request).await
+    }
+
+    pub async fn guild_api_permissions(
+        &self,
+        guild_id: &str,
+    ) -> Result<GuildApiPermissionList, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        let url = self.endpoint(&["guilds", guild_id, "api_permission"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn demand_guild_api_permission(
+        &self,
+        guild_id: &str,
+        request: &GuildApiPermissionDemandRequest,
+    ) -> Result<GuildApiPermissionDemand, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidGuildControlRequest)?;
+        let url = self.endpoint(&["guilds", guild_id, "api_permission", "demand"])?;
+        self.post_json_once(url, request).await
     }
 
     pub async fn channel_online_member_count(
@@ -880,6 +959,28 @@ impl OpenApiClient {
         Self::decode(response).await
     }
 
+    async fn post_json_once<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let token = self.tokens.access_token().await?;
+        let response = self
+            .single_send_client
+            .post(url)
+            .qqbot_token(token.expose())
+            .json(body)
+            .send()
+            .await
+            .map_err(ApiError::Request)?;
+        let unauthorized = response.status() == StatusCode::UNAUTHORIZED;
+        let result = Self::decode(response).await;
+        if unauthorized && self.tokens.refresh_if_current(&token).await.is_err() {
+            self.tokens.invalidate_if_current(&token).await;
+        }
+        result
+    }
+
     async fn post_json_unit<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
     where
         B: Serialize + ?Sized,
@@ -908,6 +1009,16 @@ impl OpenApiClient {
         Self::decode(response).await
     }
 
+    async fn patch_json_unit<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let response = self
+            .send_authorized(|token| self.client.patch(url.clone()).qqbot_token(token).json(body))
+            .await?;
+        Self::decode_unit(response).await
+    }
+
     async fn put_json_unit<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
     where
         B: Serialize + ?Sized,
@@ -933,8 +1044,8 @@ impl OpenApiClient {
             .map_err(ApiError::Request)?;
         let unauthorized = response.status() == StatusCode::UNAUTHORIZED;
         let result = Self::decode_unit(response).await;
-        if unauthorized {
-            let _ = self.tokens.refresh_if_current(&token).await;
+        if unauthorized && self.tokens.refresh_if_current(&token).await.is_err() {
+            self.tokens.invalidate_if_current(&token).await;
         }
         result
     }
