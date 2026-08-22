@@ -14,15 +14,17 @@ use bot_core::{
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
     ApiError, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
-    CreateGroupJoinStrategyRequest, CreatePanelRequest, GatewayPayload, GenerateShareLinkRequest,
-    GroupMuteMemberOperation, GuildApiPermissionDemandRequest, GuildMemberPageRequest,
-    GuildMembersMuteRequest, GuildMuteRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest,
-    GuildRoleMutation, InlineMediaUploadRequest, Intents, InteractionResponseRequest,
+    CreateGroupJoinStrategyRequest, CreateGuildAnnouncementRequest, CreatePanelRequest,
+    CreateScheduleRequest, GatewayPayload, GenerateShareLinkRequest, GroupMuteMemberOperation,
+    GuildApiPermissionDemandRequest, GuildMemberPageRequest, GuildMembersMuteRequest,
+    GuildMuteRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation,
+    InlineMediaUploadRequest, Intents, InteractionResponseRequest, ListSchedulesQuery,
     MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient,
     PageRequest, PanelListRequest, ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest,
     ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
     UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
     UpdateGroupJoinStrategyWhitelistRequest, UpdatePanelRequest, UpdatePanelTargetsRequest,
+    UpdateScheduleRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -723,6 +725,53 @@ struct UpdatePanelTargetsAction {
     request: UpdatePanelTargetsRequest,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateGuildAnnouncementAction {
+    guild_id: String,
+    #[serde(flatten)]
+    request: CreateGuildAnnouncementRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GuildAnnouncementAction {
+    guild_id: String,
+    message_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelMessageAction {
+    channel_id: String,
+    message_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListChannelSchedulesAction {
+    channel_id: String,
+    #[serde(flatten)]
+    query: ListSchedulesQuery,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelScheduleAction {
+    channel_id: String,
+    schedule_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateChannelScheduleAction {
+    channel_id: String,
+    #[serde(flatten)]
+    request: CreateScheduleRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateChannelScheduleAction {
+    channel_id: String,
+    schedule_id: String,
+    #[serde(flatten)]
+    request: UpdateScheduleRequest,
+}
+
 impl QqActionExecutor {
     pub(crate) fn new(
         adapter_id: AdapterId,
@@ -977,6 +1026,9 @@ impl QqActionExecutor {
             | "qq.bot.panel.update"
             | "qq.bot.panel.delete"
             | "qq.bot.panel.target.update" => self.execute_panel_action(name, payload).await,
+            _ if is_channel_content_action(name) => {
+                self.execute_channel_content_action(name, payload).await
+            }
             "qq.interaction.respond" => {
                 reject_unknown_object_fields(
                     name,
@@ -1346,6 +1398,159 @@ impl QqActionExecutor {
                 )
             }
             _ => unreachable!("guild-control Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_channel_content_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        reject_channel_content_action_fields(name, &payload)?;
+        if name.starts_with("qq.guild.announce.") {
+            return self.execute_announcement_action(name, payload).await;
+        }
+        if name.starts_with("qq.channel.pin.") {
+            return self.execute_pin_action(name, payload).await;
+        }
+        self.execute_schedule_action(name, payload).await
+    }
+
+    async fn execute_announcement_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.guild.announce.create" => {
+                let action: CreateGuildAnnouncementAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .create_guild_announcement(&action.guild_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.guild.announce.delete" => {
+                let action: GuildAnnouncementAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.guild.announce.delete",
+                    "guild",
+                    self.api
+                        .delete_guild_announcement(&action.guild_id, &action.message_id)
+                        .await,
+                )
+            }
+            "qq.guild.announce.clear" => {
+                let action: GuildAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.guild.announce.clear",
+                    "guild",
+                    self.api.clear_guild_announcement(&action.guild_id).await,
+                )
+            }
+            _ => unreachable!("announcement Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_pin_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.channel.pin.add" => {
+                let action: ChannelMessageAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .add_channel_pin(&action.channel_id, &action.message_id)
+                        .await,
+                )
+            }
+            "qq.channel.pin.delete" => {
+                let action: ChannelMessageAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.channel.pin.delete",
+                    "channel",
+                    self.api
+                        .delete_channel_pin(&action.channel_id, &action.message_id)
+                        .await,
+                )
+            }
+            "qq.channel.pin.clear" => {
+                let action: ChannelAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.channel.pin.clear",
+                    "channel",
+                    self.api.clear_channel_pins(&action.channel_id).await,
+                )
+            }
+            "qq.channel.pin.list" => {
+                let action: ChannelAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.channel_pins(&action.channel_id).await)
+            }
+            _ => unreachable!("pin Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_schedule_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        match name {
+            "qq.channel.schedule.list" => {
+                let action: ListChannelSchedulesAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .channel_schedules(&action.channel_id, &action.query)
+                        .await,
+                )
+            }
+            "qq.channel.schedule.get" => {
+                let action: ChannelScheduleAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .channel_schedule(&action.channel_id, &action.schedule_id)
+                        .await,
+                )
+            }
+            "qq.channel.schedule.create" => {
+                let action: CreateChannelScheduleAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .create_channel_schedule(&action.channel_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.channel.schedule.update" => {
+                let action: UpdateChannelScheduleAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .update_channel_schedule(
+                            &action.channel_id,
+                            &action.schedule_id,
+                            &action.request,
+                        )
+                        .await,
+                )
+            }
+            "qq.channel.schedule.delete" => {
+                let action: ChannelScheduleAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.channel.schedule.delete",
+                    "channel",
+                    self.api
+                        .delete_channel_schedule(&action.channel_id, &action.schedule_id)
+                        .await,
+                )
+            }
+            _ => unreachable!("schedule Action dispatcher only calls known names"),
         }
     }
 
@@ -1905,6 +2110,74 @@ fn require_object(name: &str, field: &str, value: &Value) -> Result<(), AdapterE
     })
 }
 
+fn is_channel_content_action(name: &str) -> bool {
+    matches!(
+        name,
+        "qq.guild.announce.create"
+            | "qq.guild.announce.delete"
+            | "qq.guild.announce.clear"
+            | "qq.channel.pin.add"
+            | "qq.channel.pin.delete"
+            | "qq.channel.pin.clear"
+            | "qq.channel.pin.list"
+            | "qq.channel.schedule.list"
+            | "qq.channel.schedule.get"
+            | "qq.channel.schedule.create"
+            | "qq.channel.schedule.update"
+            | "qq.channel.schedule.delete"
+    )
+}
+
+fn reject_channel_content_action_fields(name: &str, payload: &Value) -> Result<(), AdapterError> {
+    let allowed = match name {
+        "qq.guild.announce.create" => &[
+            "guild_id",
+            "message_id",
+            "channel_id",
+            "announces_type",
+            "recommend_channels",
+        ][..],
+        "qq.guild.announce.delete" => &["guild_id", "message_id"],
+        "qq.guild.announce.clear" => &["guild_id"],
+        "qq.channel.pin.add" | "qq.channel.pin.delete" => &["channel_id", "message_id"],
+        "qq.channel.pin.clear" | "qq.channel.pin.list" => &["channel_id"],
+        "qq.channel.schedule.list" => &["channel_id", "since"],
+        "qq.channel.schedule.get" | "qq.channel.schedule.delete" => &["channel_id", "schedule_id"],
+        "qq.channel.schedule.create" => &["channel_id", "schedule"],
+        "qq.channel.schedule.update" => &["channel_id", "schedule_id", "schedule"],
+        _ => unreachable!("channel-content Action field checker only calls known names"),
+    };
+    reject_unknown_object_fields(name, "payload", payload, allowed)?;
+    if name == "qq.guild.announce.create" {
+        if let Some(channels) = payload.get("recommend_channels").and_then(Value::as_array) {
+            for (index, channel) in channels.iter().enumerate() {
+                reject_unknown_object_fields(
+                    name,
+                    &format!("recommend_channels[{index}]"),
+                    channel,
+                    &["channel_id", "introduce"],
+                )?;
+            }
+        }
+    }
+    if let Some(schedule) = payload.get("schedule") {
+        reject_unknown_object_fields(
+            name,
+            "schedule",
+            schedule,
+            &[
+                "name",
+                "description",
+                "start_timestamp",
+                "end_timestamp",
+                "jump_channel_id",
+                "remind_type",
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn reject_unknown_action_fields(name: &str, payload: &Value) -> Result<(), AdapterError> {
     match name {
         "qq.bot.share-link.create" => {
@@ -2068,6 +2341,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
+        | ApiError::InvalidChannelContentRequest(_)
         | ApiError::InvalidInteractionRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_)
@@ -2378,6 +2652,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
+        | ApiError::InvalidChannelContentRequest(_)
         | ApiError::InvalidInteractionRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_) => true,

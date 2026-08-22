@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod channel_content;
 pub mod gateway;
 pub mod group;
 pub mod guild;
@@ -17,6 +18,12 @@ pub mod profile;
 pub mod reaction;
 
 pub use auth::{AccessToken, AuthError, TokenManager};
+pub use channel_content::{
+    AnnouncementType, ChannelContentValidationError, CreateGuildAnnouncementRequest,
+    CreateSchedule, CreateScheduleRequest, EpochMillis, GuildAnnouncement, ListSchedulesQuery,
+    PinsMessage, RecommendChannel, Schedule, ScheduleRemindType, UpdateSchedule,
+    UpdateScheduleRequest,
+};
 pub use gateway::{Gateway, GatewayBot, GatewayPayload, Intents, OpCode, SessionStartLimit};
 pub use group::{
     CreateGroupJoinStrategyRequest, GroupJoinApprovalOperation, GroupJoinAutoApproved,

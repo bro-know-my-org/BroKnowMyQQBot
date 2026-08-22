@@ -9,6 +9,10 @@ use url::Url;
 
 use crate::{
     auth::{AuthError, TokenManager},
+    channel_content::{
+        ChannelContentValidationError, CreateGuildAnnouncementRequest, CreateScheduleRequest,
+        GuildAnnouncement, ListSchedulesQuery, PinsMessage, Schedule, UpdateScheduleRequest,
+    },
     gateway::{Gateway, GatewayBot},
     group::{
         CreateGroupJoinStrategyRequest, GroupJoinRequestPage, GroupJoinStrategyCreated,
@@ -111,6 +115,8 @@ pub enum ApiError {
     InvalidShareLinkRequest(#[source] ShareLinkValidationError),
     #[error("invalid QQ command-panel request: {0}")]
     InvalidPanelRequest(#[source] PanelValidationError),
+    #[error("invalid QQ channel-content request: {0}")]
+    InvalidChannelContentRequest(#[source] ChannelContentValidationError),
 }
 
 /// Authenticated QQ `OpenAPI` client.
@@ -270,6 +276,134 @@ impl OpenApiClient {
         request.validate().map_err(ApiError::InvalidPanelRequest)?;
         let url = self.endpoint(&["v2", "panels", panel_id, "target"])?;
         self.put_json_unit(url, request).await
+    }
+
+    pub async fn create_guild_announcement(
+        &self,
+        guild_id: &str,
+        request: &CreateGuildAnnouncementRequest,
+    ) -> Result<GuildAnnouncement, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidChannelContentRequest)?;
+        let url = self.endpoint(&["guilds", guild_id, "announces"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn delete_guild_announcement(
+        &self,
+        guild_id: &str,
+        message_id: &str,
+    ) -> Result<(), ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        validate_non_control_path_id("message_id", message_id)?;
+        let url = self.endpoint(&["guilds", guild_id, "announces", message_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn clear_guild_announcement(&self, guild_id: &str) -> Result<(), ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        let url = self.endpoint(&["guilds", guild_id, "announces", "all"])?;
+        self.delete(url).await
+    }
+
+    pub async fn add_channel_pin(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<PinsMessage, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_non_control_path_id("message_id", message_id)?;
+        let url = self.endpoint(&["channels", channel_id, "pins", message_id])?;
+        self.put_json_response(url).await
+    }
+
+    pub async fn delete_channel_pin(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_non_control_path_id("message_id", message_id)?;
+        let url = self.endpoint(&["channels", channel_id, "pins", message_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn clear_channel_pins(&self, channel_id: &str) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        let url = self.endpoint(&["channels", channel_id, "pins", "all"])?;
+        self.delete(url).await
+    }
+
+    pub async fn channel_pins(&self, channel_id: &str) -> Result<PinsMessage, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        let url = self.endpoint(&["channels", channel_id, "pins"])?;
+        self.get_json(url).await
+    }
+
+    pub async fn channel_schedules(
+        &self,
+        channel_id: &str,
+        query: &ListSchedulesQuery,
+    ) -> Result<Vec<Schedule>, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        let mut url = self.endpoint(&["channels", channel_id, "schedules"])?;
+        if let Some(since) = query.since {
+            url.query_pairs_mut()
+                .append_pair("since", &since.to_string());
+        }
+        self.get_json(url).await
+    }
+
+    pub async fn channel_schedule(
+        &self,
+        channel_id: &str,
+        schedule_id: &str,
+    ) -> Result<Schedule, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("schedule_id", schedule_id)?;
+        let url = self.endpoint(&["channels", channel_id, "schedules", schedule_id])?;
+        self.get_json(url).await
+    }
+
+    pub async fn create_channel_schedule(
+        &self,
+        channel_id: &str,
+        request: &CreateScheduleRequest,
+    ) -> Result<Schedule, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidChannelContentRequest)?;
+        let url = self.endpoint(&["channels", channel_id, "schedules"])?;
+        self.post_json(url, request).await
+    }
+
+    pub async fn update_channel_schedule(
+        &self,
+        channel_id: &str,
+        schedule_id: &str,
+        request: &UpdateScheduleRequest,
+    ) -> Result<Schedule, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("schedule_id", schedule_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidChannelContentRequest)?;
+        let url = self.endpoint(&["channels", channel_id, "schedules", schedule_id])?;
+        self.patch_json(url, request).await
+    }
+
+    pub async fn delete_channel_schedule(
+        &self,
+        channel_id: &str,
+        schedule_id: &str,
+    ) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("schedule_id", schedule_id)?;
+        let url = self.endpoint(&["channels", channel_id, "schedules", schedule_id])?;
+        self.delete(url).await
     }
 
     pub async fn send_c2c_message(
@@ -1061,6 +1195,16 @@ impl OpenApiClient {
         Self::decode(response).await
     }
 
+    async fn put_json_response<T>(&self, url: Url) -> Result<T, ApiError>
+    where
+        T: DeserializeOwned,
+    {
+        let response = self
+            .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token))
+            .await?;
+        Self::decode(response).await
+    }
+
     async fn put(&self, url: Url) -> Result<(), ApiError> {
         let response = self
             .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token))
@@ -1212,6 +1356,16 @@ fn validate_path_id(field: &str, value: &str) -> Result<(), ApiError> {
     if value.trim().is_empty() {
         return Err(ApiError::InvalidRequest(format!(
             "QQ OpenAPI path field `{field}` must not be empty"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_non_control_path_id(field: &str, value: &str) -> Result<(), ApiError> {
+    validate_path_id(field, value)?;
+    if value == "all" {
+        return Err(ApiError::InvalidRequest(format!(
+            "QQ OpenAPI path field `{field}` must not use the reserved value `all`"
         )));
     }
     Ok(())
