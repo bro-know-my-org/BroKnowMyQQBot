@@ -173,6 +173,7 @@ async fn creates_sends_and_recalls_guild_direct_messages() {
                 guild_id: "direct/guild".to_owned(),
             },
             message_id: "direct-message".to_owned(),
+            hide_tip: false,
         })
         .await
         .unwrap();

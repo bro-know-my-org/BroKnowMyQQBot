@@ -10,6 +10,7 @@ pub mod gateway;
 pub mod group;
 pub mod guild;
 pub mod guild_control;
+pub mod guild_resource;
 pub mod interaction;
 pub mod menu;
 pub mod message;
@@ -64,6 +65,10 @@ pub use guild_control::{
     GuildApiPermissionDemandIdentify, GuildApiPermissionDemandRequest, GuildApiPermissionList,
     GuildControlValidationError, GuildMembersMuteRequest, GuildMembersMuteResponse,
     GuildMessageSetting, GuildMuteRequest,
+};
+pub use guild_resource::{
+    Channel, ChannelPrivateType, ChannelSubType, ChannelType, CreateChannelRequest, Guild,
+    GuildListQuery, GuildResourceValidationError, SpeakPermission, UpdateChannelRequest,
 };
 pub use interaction::{
     InteractionData, InteractionEvent, InteractionResponseRequest, InteractionValidationError,

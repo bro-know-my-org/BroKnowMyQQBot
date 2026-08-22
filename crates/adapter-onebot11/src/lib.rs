@@ -601,7 +601,11 @@ impl OneBot11Adapter {
                     }
                 }
             }
-            Action::Recall { target, message_id } => match target {
+            Action::Recall {
+                target,
+                message_id,
+                hide_tip: _,
+            } => match target {
                 MessageTarget::Group { .. } | MessageTarget::Private { .. } => Ok((
                     "delete_msg".to_owned(),
                     json!({"message_id": id_param(&message_id)}),
@@ -1998,6 +2002,7 @@ mod tests {
                 group_id: "300".to_owned(),
             },
             message_id: "0007".to_owned(),
+            hide_tip: false,
         })
         .unwrap();
         assert_eq!(action, "delete_msg");
@@ -2008,6 +2013,7 @@ mod tests {
                 guild_id: "direct-guild".to_owned(),
             },
             message_id: "0008".to_owned(),
+            hide_tip: false,
         })
         .unwrap_err();
         assert!(matches!(error, AdapterError::Action(message) if message.contains("guild")));

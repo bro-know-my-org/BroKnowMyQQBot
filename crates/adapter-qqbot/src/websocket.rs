@@ -14,18 +14,19 @@ use bot_core::{
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
     ApiError, AudioControlRequest, AuthError, C2cStreamMessageRequest, ChannelMessageRequest,
-    CreateDirectMessageRequest, CreateForumThreadRequest, CreateGroupJoinStrategyRequest,
-    CreateGuildAnnouncementRequest, CreatePanelRequest, CreateScheduleRequest, GatewayPayload,
-    GenerateShareLinkRequest, GroupMuteMemberOperation, GuildApiPermissionDemandRequest,
-    GuildMemberPageRequest, GuildMembersMuteRequest, GuildMuteRequest, GuildRoleMemberPageRequest,
-    GuildRoleMemberRequest, GuildRoleMutation, InlineMediaUploadRequest, Intents,
-    InteractionResponseRequest, ListSchedulesQuery, MediaFileType, MediaUploadFinalizeRequest,
-    MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient, PageRequest,
-    PanelListRequest, ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest,
-    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
-    UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
-    UpdateGroupJoinStrategyWhitelistRequest, UpdatePanelRequest, UpdatePanelTargetsRequest,
-    UpdateScheduleRequest, UploadPartFinishRequest, UploadPrepareRequest,
+    CreateChannelRequest, CreateDirectMessageRequest, CreateForumThreadRequest,
+    CreateGroupJoinStrategyRequest, CreateGuildAnnouncementRequest, CreatePanelRequest,
+    CreateScheduleRequest, GatewayPayload, GenerateShareLinkRequest, GroupMuteMemberOperation,
+    GuildApiPermissionDemandRequest, GuildListQuery, GuildMemberPageRequest,
+    GuildMembersMuteRequest, GuildMuteRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest,
+    GuildRoleMutation, InlineMediaUploadRequest, Intents, InteractionResponseRequest,
+    ListSchedulesQuery, MediaFileType, MediaUploadFinalizeRequest, MediaUploadRequest,
+    MessageRequest, MessageResponse, OpCode, OpenApiClient, PageRequest, PanelListRequest,
+    ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest, ReviewGroupJoinRequest,
+    SetGroupMuteRequest, UpdateBotMenuRequest, UpdateChannelPermissionsRequest,
+    UpdateChannelRequest, UpdateGroupJoinStrategyRequest, UpdateGroupJoinStrategyWhitelistRequest,
+    UpdatePanelRequest, UpdatePanelTargetsRequest, UpdateScheduleRequest, UploadPartFinishRequest,
+    UploadPrepareRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -540,13 +541,13 @@ struct ChannelAction {
 #[derive(Debug, Deserialize)]
 struct CreateChannelAction {
     guild_id: String,
-    body: Value,
+    body: CreateChannelRequest,
 }
 
 #[derive(Debug, Deserialize)]
 struct UpdateChannelAction {
     channel_id: String,
-    body: Value,
+    body: UpdateChannelRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -950,7 +951,11 @@ impl QqActionExecutor {
                 self.execute_inline_media(send.target, None, send.attachment, send.caption)
                     .await
             }
-            Action::Recall { target, message_id } => {
+            Action::Recall {
+                target,
+                message_id,
+                hide_tip,
+            } => {
                 let result = match &target {
                     MessageTarget::Group { group_id } => {
                         self.api.recall_group_message(group_id, &message_id).await
@@ -960,12 +965,12 @@ impl QqActionExecutor {
                     }
                     MessageTarget::Channel { channel_id } => {
                         self.api
-                            .recall_channel_message(channel_id, &message_id)
+                            .recall_channel_message(channel_id, &message_id, hide_tip)
                             .await
                     }
                     MessageTarget::GuildDirect { guild_id } => {
                         self.api
-                            .recall_direct_message(guild_id, &message_id, false)
+                            .recall_direct_message(guild_id, &message_id, hide_tip)
                             .await
                     }
                 };
@@ -1805,36 +1810,41 @@ impl QqActionExecutor {
         payload: Value,
     ) -> Result<ActionResult, AdapterError> {
         match name {
-            "qq.guild.list" => self.complete_value_action(name, self.api.guilds().await),
+            "qq.guild.list" => {
+                let query = if payload.is_null() {
+                    GuildListQuery::default()
+                } else {
+                    decode_platform_payload(name, payload)?
+                };
+                self.complete_typed_action(name, self.api.guilds(&query).await)
+            }
             "qq.guild.get" => {
                 let action: GuildAction = decode_platform_payload(name, payload)?;
-                self.complete_value_action(name, self.api.guild(&action.guild_id).await)
+                self.complete_typed_action(name, self.api.guild(&action.guild_id).await)
             }
             "qq.channel.list" => {
                 let action: GuildAction = decode_platform_payload(name, payload)?;
-                self.complete_value_action(name, self.api.guild_channels(&action.guild_id).await)
+                self.complete_typed_action(name, self.api.guild_channels(&action.guild_id).await)
             }
             "qq.channel.get" => {
                 let action: ChannelAction = decode_platform_payload(name, payload)?;
-                self.complete_value_action(name, self.api.channel(&action.channel_id).await)
+                self.complete_typed_action(name, self.api.channel(&action.channel_id).await)
             }
             "qq.channel.create" => {
                 let action: CreateChannelAction = decode_platform_payload(name, payload)?;
-                require_object(name, "body", &action.body)?;
-                self.complete_value_action(
+                self.complete_typed_action(
                     name,
                     self.api
-                        .create_channel_raw(&action.guild_id, &action.body)
+                        .create_channel(&action.guild_id, &action.body)
                         .await,
                 )
             }
             "qq.channel.update" => {
                 let action: UpdateChannelAction = decode_platform_payload(name, payload)?;
-                require_object(name, "body", &action.body)?;
-                self.complete_value_action(
+                self.complete_typed_action(
                     name,
                     self.api
-                        .update_channel_raw(&action.channel_id, &action.body)
+                        .update_channel(&action.channel_id, &action.body)
                         .await,
                 )
             }
@@ -2218,26 +2228,6 @@ impl QqActionExecutor {
             }
             Err(error) => {
                 warn!(adapter_id = %self.adapter_id, action_type, message_scope, error = %error, "QQ platform action failed");
-                Err(map_action_error(&error))
-            }
-        }
-    }
-
-    fn complete_value_action(
-        &self,
-        action_type: &str,
-        result: Result<Value, ApiError>,
-    ) -> Result<ActionResult, AdapterError> {
-        match result {
-            Ok(raw) => {
-                info!(adapter_id = %self.adapter_id, action_type, "QQ platform action succeeded");
-                Ok(ActionResult {
-                    message_id: None,
-                    raw,
-                })
-            }
-            Err(error) => {
-                warn!(adapter_id = %self.adapter_id, action_type, error = %error, "QQ platform action failed");
                 Err(map_action_error(&error))
             }
         }
@@ -2683,6 +2673,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::UploadTimeout
         | ApiError::Decode(_)
         | ApiError::ResponseTooLarge
+        | ApiError::InvalidGuildResourceResponse(_)
         | ApiError::InvalidForumResponse(_)
         | ApiError::InvalidStreamUploadResponse(_) => {
             AdapterError::ActionUnknown(error.to_string())
@@ -2693,6 +2684,7 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildControlRequest(_)
         | ApiError::InvalidGuildRequest(_)
+        | ApiError::InvalidGuildResourceRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
         | ApiError::InvalidChannelContentRequest(_)
@@ -3009,6 +3001,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildControlRequest(_)
         | ApiError::InvalidGuildRequest(_)
+        | ApiError::InvalidGuildResourceRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
         | ApiError::InvalidChannelContentRequest(_)
@@ -3029,6 +3022,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::Platform { .. }
         | ApiError::ResponseTooLarge
         | ApiError::Decode(_)
+        | ApiError::InvalidGuildResourceResponse(_)
         | ApiError::InvalidForumResponse(_)
         | ApiError::InvalidStreamUploadResponse(_) => false,
     }

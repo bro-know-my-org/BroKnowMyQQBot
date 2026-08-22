@@ -47,6 +47,10 @@ use crate::{
         GuildControlValidationError, GuildMembersMuteRequest, GuildMembersMuteResponse,
         GuildMessageSetting, GuildMuteRequest,
     },
+    guild_resource::{
+        Channel, CreateChannelRequest, Guild, GuildListQuery, GuildResourceValidationError,
+        UpdateChannelRequest,
+    },
     interaction::{InteractionResponseRequest, InteractionValidationError},
     menu::{
         BotMenuResponse, BotMenuVersion, GenerateShareLinkRequest, MenuValidationError, ShareLink,
@@ -148,6 +152,10 @@ pub enum ApiError {
     InvalidMediaUploadRequest(#[source] MediaUploadValidationError),
     #[error("invalid QQ guild request: {0}")]
     InvalidGuildRequest(#[source] GuildRequestValidationError),
+    #[error("invalid QQ guild/channel resource request: {0}")]
+    InvalidGuildResourceRequest(#[source] GuildResourceValidationError),
+    #[error("invalid QQ guild/channel resource response: {0}")]
+    InvalidGuildResourceResponse(#[source] GuildResourceValidationError),
     #[error("invalid QQ guild control request: {0}")]
     InvalidGuildControlRequest(#[source] GuildControlValidationError),
     #[error("invalid QQ channel permission request: {0}")]
@@ -1054,8 +1062,10 @@ impl OpenApiClient {
         user_openid: &str,
         message_id: &str,
     ) -> Result<(), ApiError> {
+        validate_path_id("user_openid", user_openid)?;
+        validate_path_id("message_id", message_id)?;
         let url = self.endpoint(&["v2", "users", user_openid, "messages", message_id])?;
-        self.delete(url).await
+        self.delete_once(url).await
     }
 
     pub async fn recall_group_message(
@@ -1063,17 +1073,24 @@ impl OpenApiClient {
         group_openid: &str,
         message_id: &str,
     ) -> Result<(), ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        validate_path_id("message_id", message_id)?;
         let url = self.endpoint(&["v2", "groups", group_openid, "messages", message_id])?;
-        self.delete(url).await
+        self.delete_once(url).await
     }
 
     pub async fn recall_channel_message(
         &self,
         channel_id: &str,
         message_id: &str,
+        hide_tip: bool,
     ) -> Result<(), ApiError> {
-        let url = self.endpoint(&["channels", channel_id, "messages", message_id])?;
-        self.delete(url).await
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("message_id", message_id)?;
+        let mut url = self.endpoint(&["channels", channel_id, "messages", message_id])?;
+        url.query_pairs_mut()
+            .append_pair("hidetip", if hide_tip { "true" } else { "false" });
+        self.delete_once(url).await
     }
 
     pub async fn recall_direct_message(
@@ -1087,56 +1104,105 @@ impl OpenApiClient {
         let mut url = self.endpoint(&["dms", guild_id, "messages", message_id])?;
         url.query_pairs_mut()
             .append_pair("hidetip", if hide_tip { "true" } else { "false" });
-        self.delete(url).await
+        self.delete_once(url).await
     }
 
-    pub async fn guilds(&self) -> Result<serde_json::Value, ApiError> {
-        let url = self.endpoint(&["users", "@me", "guilds"])?;
-        self.get_json(url).await
+    pub async fn guilds(&self, query: &GuildListQuery) -> Result<Vec<Guild>, ApiError> {
+        query
+            .validate()
+            .map_err(ApiError::InvalidGuildResourceRequest)?;
+        let mut url = self.endpoint(&["users", "@me", "guilds"])?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            if let Some(before) = query.before.as_deref() {
+                pairs.append_pair("before", before);
+            }
+            if let Some(after) = query.after.as_deref() {
+                pairs.append_pair("after", after);
+            }
+            if let Some(limit) = query.limit {
+                pairs.append_pair("limit", &limit.to_string());
+            }
+        }
+        let guilds: Vec<Guild> = self.get_json(url).await?;
+        for guild in &guilds {
+            guild
+                .validate()
+                .map_err(ApiError::InvalidGuildResourceResponse)?;
+        }
+        Ok(guilds)
     }
 
-    pub async fn guild(&self, guild_id: &str) -> Result<serde_json::Value, ApiError> {
+    pub async fn guild(&self, guild_id: &str) -> Result<Guild, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
         let url = self.endpoint(&["guilds", guild_id])?;
-        self.get_json(url).await
+        let guild: Guild = self.get_json(url).await?;
+        guild
+            .validate()
+            .map_err(ApiError::InvalidGuildResourceResponse)?;
+        Ok(guild)
     }
 
-    pub async fn guild_channels(&self, guild_id: &str) -> Result<serde_json::Value, ApiError> {
+    pub async fn guild_channels(&self, guild_id: &str) -> Result<Vec<Channel>, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
         let url = self.endpoint(&["guilds", guild_id, "channels"])?;
-        self.get_json(url).await
+        let channels: Vec<Channel> = self.get_json(url).await?;
+        for channel in &channels {
+            channel
+                .validate()
+                .map_err(ApiError::InvalidGuildResourceResponse)?;
+        }
+        Ok(channels)
     }
 
-    pub async fn channel(&self, channel_id: &str) -> Result<serde_json::Value, ApiError> {
+    pub async fn channel(&self, channel_id: &str) -> Result<Channel, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
         let url = self.endpoint(&["channels", channel_id])?;
-        self.get_json(url).await
+        let channel: Channel = self.get_json(url).await?;
+        channel
+            .validate()
+            .map_err(ApiError::InvalidGuildResourceResponse)?;
+        Ok(channel)
     }
 
-    /// Sends a raw QQ channel-create document for fields not yet modeled by this crate.
-    pub async fn create_channel_raw(
+    pub async fn create_channel(
         &self,
         guild_id: &str,
-        request: &serde_json::Value,
-    ) -> Result<serde_json::Value, ApiError> {
-        validate_channel_document(request, true)
-            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        request: &CreateChannelRequest,
+    ) -> Result<Channel, ApiError> {
+        validate_path_id("guild_id", guild_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidGuildResourceRequest)?;
         let url = self.endpoint(&["guilds", guild_id, "channels"])?;
-        self.post_json(url, request).await
+        let channel: Channel = self.post_json_once(url, request).await?;
+        channel
+            .validate()
+            .map_err(ApiError::InvalidGuildResourceResponse)?;
+        Ok(channel)
     }
 
-    /// Sends a raw QQ channel-update document for fields not yet modeled by this crate.
-    pub async fn update_channel_raw(
+    pub async fn update_channel(
         &self,
         channel_id: &str,
-        request: &serde_json::Value,
-    ) -> Result<serde_json::Value, ApiError> {
-        validate_channel_document(request, false)
-            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        request: &UpdateChannelRequest,
+    ) -> Result<Channel, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidGuildResourceRequest)?;
         let url = self.endpoint(&["channels", channel_id])?;
-        self.patch_json(url, request).await
+        let channel: Channel = self.patch_json_once(url, request).await?;
+        channel
+            .validate()
+            .map_err(ApiError::InvalidGuildResourceResponse)?;
+        Ok(channel)
     }
 
     pub async fn delete_channel(&self, channel_id: &str) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
         let url = self.endpoint(&["channels", channel_id])?;
-        self.delete(url).await
+        self.delete_once(url).await
     }
 
     pub async fn guild_message_setting(
@@ -1705,6 +1771,28 @@ impl OpenApiClient {
         Self::decode(response).await
     }
 
+    async fn patch_json_once<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let token = self.tokens.access_token().await?;
+        let response = self
+            .single_send_client
+            .patch(url)
+            .qqbot_token(token.expose())
+            .json(body)
+            .send()
+            .await
+            .map_err(ApiError::Request)?;
+        let unauthorized = response.status() == StatusCode::UNAUTHORIZED;
+        let result = Self::decode(response).await;
+        if unauthorized && self.tokens.refresh_if_current(&token).await.is_err() {
+            self.tokens.invalidate_if_current(&token).await;
+        }
+        result
+    }
+
     async fn patch_json_unit<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
     where
         B: Serialize + ?Sized,
@@ -1816,6 +1904,23 @@ impl OpenApiClient {
             .send_authorized(|token| self.client.delete(url.clone()).qqbot_token(token))
             .await?;
         Self::decode_unit(response).await
+    }
+
+    async fn delete_once(&self, url: Url) -> Result<(), ApiError> {
+        let token = self.tokens.access_token().await?;
+        let response = self
+            .single_send_client
+            .delete(url)
+            .qqbot_token(token.expose())
+            .send()
+            .await
+            .map_err(ApiError::Request)?;
+        let unauthorized = response.status() == StatusCode::UNAUTHORIZED;
+        let result = Self::decode_unit(response).await;
+        if unauthorized && self.tokens.refresh_if_current(&token).await.is_err() {
+            self.tokens.invalidate_if_current(&token).await;
+        }
+        result
     }
 
     async fn decode_unit(response: Response) -> Result<(), ApiError> {
@@ -2048,30 +2153,15 @@ fn is_public_ipv6(address: Ipv6Addr) -> bool {
     segments[0] & 0xe000 == 0x2000 && !is_ietf_special && !is_6to4 && !is_6bone && !is_documentation
 }
 
-fn validate_channel_document(
-    request: &serde_json::Value,
-    require_name: bool,
-) -> Result<(), &'static str> {
-    let object = request
-        .as_object()
-        .ok_or("QQ channel request must be a JSON object")?;
-    if object.is_empty() {
-        return Err("QQ channel request must contain at least one field");
-    }
-    if let Some(name) = request.get("name") {
-        if name.as_str().is_none_or(str::is_empty) {
-            return Err("QQ channel name must be a non-empty string");
-        }
-    } else if require_name {
-        return Err("QQ channel create request must contain a non-empty name");
-    }
-    Ok(())
-}
-
 fn validate_path_id(field: &str, value: &str) -> Result<(), ApiError> {
     if value.trim().is_empty() {
         return Err(ApiError::InvalidRequest(format!(
             "QQ OpenAPI path field `{field}` must not be empty"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::InvalidRequest(format!(
+            "QQ OpenAPI path field `{field}` must not contain control characters"
         )));
     }
     Ok(())
@@ -2154,7 +2244,7 @@ mod tests {
         UpdateGroupJoinStrategyWhitelistRequest, auth::TokenManager,
     };
 
-    use super::{ApiError, OpenApiClient, OpenApiEnvironment};
+    use super::{OpenApiClient, OpenApiEnvironment};
 
     #[derive(Clone)]
     struct StateData {
@@ -2231,41 +2321,74 @@ mod tests {
 
     async fn recall_channel_message(
         Path((channel, message)): Path<(String, String)>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
     ) -> Json<Value> {
         assert_eq!(channel, "channel/id");
         assert_eq!(message, "message/id");
+        assert_eq!(query.get("hidetip").map(String::as_str), Some("true"));
         Json(json!({"ok":true}))
     }
 
-    async fn guilds() -> Json<Value> {
-        Json(json!([{"id":"guild/id"}]))
+    fn guild_value(id: &str) -> Value {
+        json!({
+            "id":id,
+            "name":"guild",
+            "icon":"https://example.com/guild.png",
+            "owner_id":"owner/id",
+            "owner":true,
+            "joined_at":"2026-08-22T10:00:00Z",
+            "member_count":10,
+            "max_members":100,
+            "description":"description"
+        })
+    }
+
+    fn channel_value(id: &str, name: &str) -> Value {
+        json!({
+            "id":id,
+            "guild_id":"guild/id",
+            "name":name,
+            "type":0,
+            "sub_type":0,
+            "position":1,
+            "parent_id":"0",
+            "owner_id":"owner/id",
+            "private_type":0,
+            "speak_permission":1
+        })
+    }
+
+    async fn guilds(Query(query): Query<std::collections::HashMap<String, String>>) -> Json<Value> {
+        assert_eq!(query.get("after").map(String::as_str), Some("cursor/id"));
+        assert_eq!(query.get("limit").map(String::as_str), Some("25"));
+        Json(json!([guild_value("guild/id")]))
     }
 
     async fn guild(Path(guild): Path<String>) -> Json<Value> {
         assert_eq!(guild, "guild/id");
-        Json(json!({"id":guild}))
+        Json(guild_value(&guild))
     }
 
     async fn guild_channels(Path(guild): Path<String>) -> Json<Value> {
         assert_eq!(guild, "guild/id");
-        Json(json!([{"id":"channel/id"}]))
+        Json(json!([channel_value("channel/id", "general")]))
     }
 
     async fn create_channel(Path(guild): Path<String>, Json(body): Json<Value>) -> Json<Value> {
         assert_eq!(guild, "guild/id");
         assert_eq!(body["name"], "alerts");
-        Json(json!({"id":"channel/id","name":body["name"]}))
+        Json(channel_value("channel/id", body["name"].as_str().unwrap()))
     }
 
     async fn channel(Path(channel): Path<String>) -> Json<Value> {
         assert_eq!(channel, "channel/id");
-        Json(json!({"id":channel}))
+        Json(channel_value(&channel, "general"))
     }
 
     async fn update_channel(Path(channel): Path<String>, Json(body): Json<Value>) -> Json<Value> {
         assert_eq!(channel, "channel/id");
         assert_eq!(body["name"], "renamed");
-        Json(json!({"id":channel,"name":body["name"]}))
+        Json(channel_value(&channel, body["name"].as_str().unwrap()))
     }
 
     async fn delete_channel(Path(channel): Path<String>) -> StatusCode {
@@ -2555,48 +2678,9 @@ mod tests {
             .await
             .unwrap();
         client
-            .recall_channel_message("channel/id", "message/id")
+            .recall_channel_message("channel/id", "message/id", true)
             .await
             .unwrap();
-        assert_eq!(client.guilds().await.unwrap()[0]["id"], "guild/id");
-        assert_eq!(client.guild("guild/id").await.unwrap()["id"], "guild/id");
-        assert_eq!(
-            client.guild_channels("guild/id").await.unwrap()[0]["id"],
-            "channel/id"
-        );
-        assert_eq!(
-            client
-                .create_channel_raw("guild/id", &json!({"name":"alerts"}))
-                .await
-                .unwrap()["name"],
-            "alerts"
-        );
-        assert_eq!(
-            client.channel("channel/id").await.unwrap()["id"],
-            "channel/id"
-        );
-        assert_eq!(
-            client
-                .update_channel_raw("channel/id", &json!({"name":"renamed"}))
-                .await
-                .unwrap()["name"],
-            "renamed"
-        );
-        client.delete_channel("channel/id").await.unwrap();
-        assert!(matches!(
-            client.create_channel_raw("guild/id", &json!({})).await,
-            Err(ApiError::InvalidRequest(_))
-        ));
-        assert!(matches!(
-            client.update_channel_raw("channel/id", &json!([])).await,
-            Err(ApiError::InvalidRequest(_))
-        ));
-        assert!(matches!(
-            client
-                .update_channel_raw("channel/id", &json!({"name":42}))
-                .await,
-            Err(ApiError::InvalidRequest(_))
-        ));
         assert_eq!(token_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

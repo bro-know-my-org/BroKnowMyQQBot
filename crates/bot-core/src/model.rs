@@ -323,6 +323,8 @@ pub enum Action {
     Recall {
         target: MessageTarget,
         message_id: String,
+        #[serde(default)]
+        hide_tip: bool,
     },
     Platform {
         name: String,
@@ -340,12 +342,33 @@ pub struct ActionResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterId, MediaAttachment, MessageScope, MessageTarget};
+    use serde_json::json;
+
+    use super::{Action, AdapterId, MediaAttachment, MessageScope, MessageTarget};
 
     #[test]
     fn ids_remain_opaque_strings() {
         let id = AdapterId::new("not-a-number/with-symbols");
         assert_eq!(id.as_str(), "not-a-number/with-symbols");
+    }
+
+    #[test]
+    fn legacy_recall_actions_default_to_visible_platform_tips() {
+        let action: Action = serde_json::from_value(json!({
+            "type":"recall",
+            "data":{
+                "target":{"scope":"channel","channel_id":"channel/id"},
+                "message_id":"message/id"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            action,
+            Action::Recall {
+                hide_tip: false,
+                ..
+            }
+        ));
     }
 
     #[test]
