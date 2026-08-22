@@ -1178,7 +1178,7 @@ mod tests {
                 d: json!({
                     "guild_id":"guild-id",
                     "joined_at":"2021-10-21T11:20:18+08:00",
-                    "nick":"",
+                    "nick":null,
                     "op_user_id":"operator-id",
                     "roles":[],
                     "user":{
@@ -1201,7 +1201,7 @@ mod tests {
                 panic!("expected guild member notice");
             };
             assert_eq!(notice["type"], event_type);
-            assert_eq!(notice["data"]["nick"], "");
+            assert!(notice["data"]["nick"].is_null());
             assert_eq!(notice["data"]["roles"], json!([]));
             assert_eq!(notice["data"]["mute"], false);
             assert_eq!(notice["data"]["__none"], 1);

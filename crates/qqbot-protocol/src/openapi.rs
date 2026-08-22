@@ -2275,6 +2275,32 @@ mod tests {
         (StatusCode::OK, Json(json!({"url":"ws://gateway.example"})))
     }
 
+    async fn gateway_bot(headers: HeaderMap) -> (StatusCode, Json<Value>) {
+        if headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            != Some("QQBot token-0")
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"code":11244,"message":"unauthorized"})),
+            );
+        }
+        (
+            StatusCode::OK,
+            Json(json!({
+                "url":"ws://gateway.example",
+                "shards":2,
+                "session_start_limit":{
+                    "total":1000,
+                    "remaining":999,
+                    "reset_after":14_400_000,
+                    "max_concurrency":1
+                }
+            })),
+        )
+    }
+
     async fn group_message(
         Path(group): Path<String>,
         headers: HeaderMap,
@@ -2541,6 +2567,7 @@ mod tests {
         let app = Router::new()
             .route("/app/getAppAccessToken", post(token))
             .route("/gateway", get(gateway))
+            .route("/gateway/bot", get(gateway_bot))
             .route("/v2/groups/{group}/messages", post(group_message))
             .route("/v2/groups/{group}/files", post(group_media))
             .route("/v2/users/{user}/files", post(c2c_media))
@@ -2638,6 +2665,10 @@ mod tests {
         let (client, token_calls) = client().await;
         let gateway = client.gateway().await.unwrap();
         assert_eq!(gateway.url, "ws://gateway.example");
+        let gateway_bot = client.gateway_bot().await.unwrap();
+        assert_eq!(gateway_bot.url, "ws://gateway.example");
+        assert_eq!(gateway_bot.shards, 2);
+        assert_eq!(gateway_bot.session_start_limit.remaining, 999);
 
         let response = client
             .send_group_message(

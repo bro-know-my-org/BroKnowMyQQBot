@@ -203,7 +203,8 @@ impl ChannelEvent {
 pub struct GuildMemberEvent {
     pub guild_id: String,
     pub joined_at: String,
-    pub nick: String,
+    /// Guild nickname. QQ may return JSON `null` for members without one.
+    pub nick: Option<String>,
     pub op_user_id: String,
     pub roles: Vec<String>,
     pub user: GuildUser,

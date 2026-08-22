@@ -1137,6 +1137,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_group_join_request_through_webhook() {
+        let adapter = adapter();
+        let (events, mut received) = tokio::sync::mpsc::channel(1);
+        let (terminal_error, _terminal_failure) = tokio::sync::oneshot::channel();
+        adapter
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = Some(ActiveWebhookRun {
+            generation: 1,
+            events: EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap(),
+            terminal_error: Some(terminal_error),
+        });
+
+        let payload = json!({
+            "id":"join-request-event-id",
+            "op":0,
+            "d":{
+                "group_openid":"group-openid",
+                "join_request_id":"join-request-id",
+                "member_openid":"user-openid",
+                "apply_at":"2026-08-22T10:00:15+08:00",
+                "apply_source":"self_apply"
+            },
+            "s":1,
+            "t":"GROUP_JOIN_REQUEST"
+        });
+        let response = adapter
+            .router()
+            .oneshot(signed_request(&payload))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"op":12,"d":0})
+        );
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
+            .await
+            .expect("group join request should reach the runtime queue")
+            .expect("QQ event queue should remain open");
+        assert_eq!(event.id.as_str(), "join-request-event-id");
+        let Event::Request(request) = event.event else {
+            panic!("expected group join request");
+        };
+        assert_eq!(request["type"], "GROUP_JOIN_REQUEST");
+        assert_eq!(request["data"]["join_request_id"], "join-request-id");
+    }
+
+    #[tokio::test]
     async fn accepts_social_status_notices_through_webhook() {
         let adapter = adapter();
         let (events, mut received) = tokio::sync::mpsc::channel(8);
