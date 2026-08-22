@@ -1,7 +1,7 @@
 //! QQ message event and send-message types used by the first end-to-end path.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeMap};
 
 const MAX_INLINE_MEDIA_BYTES: usize = 8 * 1024 * 1024;
 
@@ -389,6 +389,20 @@ impl TryFrom<u8> for MediaFileType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MediaUploadValidationError {
+    #[error("QQ media upload contains an unsupported file type")]
+    UnsupportedFileType,
+    #[error("QQ media upload URL must be an absolute URL: {0}")]
+    InvalidUrl(#[source] url::ParseError),
+    #[error("QQ media upload URL must use HTTP or HTTPS and include a host")]
+    InvalidUrlScheme,
+    #[error("QQ media upload URL must not contain user-info credentials")]
+    InvalidUrlCredentials,
+    #[error("QQ media upload URL must not contain a fragment")]
+    InvalidUrlFragment,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaUploadRequest {
     pub file_type: MediaFileType,
@@ -406,17 +420,38 @@ impl MediaUploadRequest {
         }
     }
 
-    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+    pub fn validate(&self) -> Result<(), MediaUploadValidationError> {
         if !self.file_type.is_supported() {
-            return Err("QQ media upload contains an unsupported file type");
+            return Err(MediaUploadValidationError::UnsupportedFileType);
         }
-        let url = url::Url::parse(&self.url)
-            .map_err(|_| "QQ media upload URL must be an absolute URL")?;
+        let url = url::Url::parse(&self.url).map_err(MediaUploadValidationError::InvalidUrl)?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-            return Err("QQ media upload URL must use HTTP or HTTPS and include a host");
+            return Err(MediaUploadValidationError::InvalidUrlScheme);
+        }
+        if parsed_url_has_userinfo(&self.url, &url) {
+            return Err(MediaUploadValidationError::InvalidUrlCredentials);
+        }
+        if url.fragment().is_some() {
+            return Err(MediaUploadValidationError::InvalidUrlFragment);
         }
         Ok(())
     }
+}
+
+fn parsed_url_has_userinfo(value: &str, parsed: &url::Url) -> bool {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return true;
+    }
+    let normalized = value
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+        .map(|character| if character == '\\' { '/' } else { character })
+        .collect::<String>();
+    normalized
+        .split_once(':')
+        .map(|(_, remainder)| remainder.trim_start_matches('/'))
+        .and_then(|remainder| remainder.split(['/', '?', '#']).next())
+        .is_some_and(|authority| authority.contains('@'))
 }
 
 /// A QQ inline image upload whose wire payload is base64-encoded.
@@ -462,7 +497,7 @@ fn has_supported_image_signature(data: &[u8]) -> bool {
         || data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP")
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Deserialize, PartialEq)]
 pub struct MediaUploadResponse {
     pub file_uuid: String,
     pub file_info: String,
@@ -470,6 +505,58 @@ pub struct MediaUploadResponse {
     pub ttl: Option<u64>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Serialize for MediaUploadResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let extra_len = self
+            .extra
+            .keys()
+            .filter(|key| !matches!(key.as_str(), "file_uuid" | "file_info" | "ttl"))
+            .count();
+        let mut map =
+            serializer.serialize_map(Some(2 + usize::from(self.ttl.is_some()) + extra_len))?;
+        map.serialize_entry("file_uuid", &self.file_uuid)?;
+        map.serialize_entry("file_info", &self.file_info)?;
+        if let Some(ttl) = self.ttl {
+            map.serialize_entry("ttl", &ttl)?;
+        }
+        for (key, value) in &self.extra {
+            if !matches!(key.as_str(), "file_uuid" | "file_info" | "ttl") {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl MediaUploadResponse {
+    pub fn message_id(&self) -> Option<&str> {
+        self.extra.get("id").and_then(serde_json::Value::as_str)
+    }
+
+    pub fn raw_url(&self) -> Option<&str> {
+        self.extra
+            .get("raw_url")
+            .and_then(serde_json::Value::as_str)
+    }
+}
+
+impl std::fmt::Debug for MediaUploadResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MediaUploadResponse")
+            .field("file_uuid", &"[REDACTED]")
+            .field("file_info", &"[REDACTED]")
+            .field("ttl", &self.ttl)
+            .field("id", &self.message_id())
+            .field("raw_url", &self.raw_url().map(|_| "[REDACTED]"))
+            .field("extra", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Common fields returned after sending a message.

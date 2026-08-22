@@ -1,11 +1,21 @@
 //! Minimal QQ `OpenAPI` client required by the WebSocket message loop.
 
-use std::{fmt, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
-use url::Url;
+use tokio::{net::lookup_host, sync::Mutex};
+use url::{Host, Url};
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     audio::{AudioControlRequest, AudioValidationError},
@@ -44,8 +54,8 @@ use crate::{
     },
     message::{
         ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
-        InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse, MessageRequest,
-        MessageResponse,
+        InlineMediaUploadRequest, MediaUploadRequest, MediaUploadResponse,
+        MediaUploadValidationError, MessageRequest, MessageResponse,
     },
     panel::{
         CreatePanelRequest, CreatePanelResponse, PanelDetail, PanelListRequest, PanelPage,
@@ -53,11 +63,33 @@ use crate::{
     },
     profile::{BotProfile, GroupBotState, GroupInfo},
     reaction::{ReactionEmoji, ReactionUsersPage, ReactionUsersRequest, ReactionValidationError},
+    stream_upload::{
+        C2cStreamMessageRequest, C2cStreamMessageResponse, MediaUploadFinalizeRequest,
+        StreamUploadValidationError, UploadPart, UploadPartFinishRequest, UploadPrepareRequest,
+        UploadPrepareResponse,
+    },
 };
 
 const PRODUCTION_BASE_URL: &str = "https://api.bot.qq.com/";
 const SANDBOX_BASE_URL: &str = "https://api.bot.qq.com/";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_UPLOAD_CLIENT_CACHE_ENTRIES: usize = 16;
+const UPLOAD_CLIENT_CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, PartialEq, Eq)]
+struct UploadClientKey {
+    host: String,
+    port: u16,
+}
+
+#[derive(Clone)]
+struct UploadClientCacheEntry {
+    key: UploadClientKey,
+    client: Client,
+    expires_at: tokio::time::Instant,
+}
+
+type UploadInitializerMap = HashMap<(String, u16), Weak<Mutex<()>>>;
 
 /// QQ `OpenAPI` environment selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +114,14 @@ pub enum ApiError {
     Authentication(#[from] AuthError),
     #[error("QQ OpenAPI request failed")]
     Request(#[source] reqwest::Error),
+    #[error("QQ upload DNS resolution failed")]
+    Dns(#[source] std::io::Error),
+    #[error("QQ upload DNS resolution timed out")]
+    DnsTimeout,
+    #[error("QQ upload DNS resolution returned no addresses")]
+    DnsNoAddresses,
+    #[error("QQ upload request timed out")]
+    UploadTimeout,
     #[error("QQ OpenAPI returned HTTP {status}; code={code:?}, message={message:?}")]
     HttpStatus {
         status: StatusCode,
@@ -104,6 +144,8 @@ pub enum ApiError {
     InvalidUrl(String),
     #[error("invalid QQ OpenAPI request: {0}")]
     InvalidRequest(String),
+    #[error("invalid QQ media upload request: {0}")]
+    InvalidMediaUploadRequest(#[source] MediaUploadValidationError),
     #[error("invalid QQ guild request: {0}")]
     InvalidGuildRequest(#[source] GuildRequestValidationError),
     #[error("invalid QQ guild control request: {0}")]
@@ -128,6 +170,10 @@ pub enum ApiError {
     InvalidForumRequest(#[source] ForumValidationError),
     #[error("invalid QQ forum response: {0}")]
     InvalidForumResponse(#[source] ForumValidationError),
+    #[error("invalid QQ streaming/upload request: {0}")]
+    InvalidStreamUploadRequest(#[source] StreamUploadValidationError),
+    #[error("invalid QQ streaming/upload response: {0}")]
+    InvalidStreamUploadResponse(#[source] StreamUploadValidationError),
 }
 
 /// Authenticated QQ `OpenAPI` client.
@@ -137,6 +183,14 @@ pub struct OpenApiClient {
     single_send_client: Client,
     base_url: Url,
     tokens: TokenManager,
+    upload_clients: Arc<Mutex<VecDeque<UploadClientCacheEntry>>>,
+    upload_initializers: Arc<Mutex<UploadInitializerMap>>,
+    #[cfg(test)]
+    upload_test_addresses: Option<Vec<SocketAddr>>,
+    #[cfg(test)]
+    upload_test_allow_non_public: bool,
+    #[cfg(test)]
+    upload_test_resolution_count: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for OpenApiClient {
@@ -172,6 +226,14 @@ impl OpenApiClient {
             single_send_client,
             base_url,
             tokens,
+            upload_clients: Arc::new(Mutex::new(VecDeque::new())),
+            upload_initializers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            upload_test_addresses: None,
+            #[cfg(test)]
+            upload_test_allow_non_public: false,
+            #[cfg(test)]
+            upload_test_resolution_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -503,6 +565,23 @@ impl OpenApiClient {
         self.post_json(url, request).await
     }
 
+    pub async fn send_c2c_stream_message(
+        &self,
+        user_openid: &str,
+        request: &C2cStreamMessageRequest,
+    ) -> Result<C2cStreamMessageResponse, ApiError> {
+        validate_path_id("user_openid", user_openid)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidStreamUploadRequest)?;
+        let url = self.endpoint(&["v2", "users", user_openid, "stream_messages"])?;
+        let response: C2cStreamMessageResponse = self.post_json_once(url, request).await?;
+        response
+            .validate()
+            .map_err(ApiError::InvalidStreamUploadResponse)?;
+        Ok(response)
+    }
+
     pub async fn send_group_message(
         &self,
         group_openid: &str,
@@ -556,11 +635,20 @@ impl OpenApiClient {
         user_openid: &str,
         request: &MediaUploadRequest,
     ) -> Result<MediaUploadResponse, ApiError> {
+        validate_path_id("user_openid", user_openid)?;
         request
             .validate()
-            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+            .map_err(ApiError::InvalidMediaUploadRequest)?;
         let url = self.endpoint(&["v2", "users", user_openid, "files"])?;
-        self.post_json(url, request).await
+        let response: MediaUploadResponse = if request.srv_send_msg {
+            self.post_json_once(url, request).await?
+        } else {
+            self.post_json(url, request).await?
+        };
+        if request.srv_send_msg {
+            validate_finalize_response(&response).map_err(ApiError::InvalidStreamUploadResponse)?;
+        }
+        Ok(response)
     }
 
     pub async fn upload_group_media(
@@ -568,11 +656,54 @@ impl OpenApiClient {
         group_openid: &str,
         request: &MediaUploadRequest,
     ) -> Result<MediaUploadResponse, ApiError> {
+        validate_path_id("group_openid", group_openid)?;
         request
             .validate()
-            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+            .map_err(ApiError::InvalidMediaUploadRequest)?;
         let url = self.endpoint(&["v2", "groups", group_openid, "files"])?;
-        self.post_json(url, request).await
+        let response: MediaUploadResponse = if request.srv_send_msg {
+            self.post_json_once(url, request).await?
+        } else {
+            self.post_json(url, request).await?
+        };
+        if request.srv_send_msg {
+            validate_finalize_response(&response).map_err(ApiError::InvalidStreamUploadResponse)?;
+        }
+        Ok(response)
+    }
+
+    pub async fn finalize_c2c_upload(
+        &self,
+        user_openid: &str,
+        request: &MediaUploadFinalizeRequest,
+    ) -> Result<MediaUploadResponse, ApiError> {
+        validate_path_id("user_openid", user_openid)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidStreamUploadRequest)?;
+        let url = self.endpoint(&["v2", "users", user_openid, "files"])?;
+        let response: MediaUploadResponse = self.post_json_once(url, request).await?;
+        if request.srv_send_msg {
+            validate_finalize_response(&response).map_err(ApiError::InvalidStreamUploadResponse)?;
+        }
+        Ok(response)
+    }
+
+    pub async fn finalize_group_upload(
+        &self,
+        group_openid: &str,
+        request: &MediaUploadFinalizeRequest,
+    ) -> Result<MediaUploadResponse, ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidStreamUploadRequest)?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "files"])?;
+        let response: MediaUploadResponse = self.post_json_once(url, request).await?;
+        if request.srv_send_msg {
+            validate_finalize_response(&response).map_err(ApiError::InvalidStreamUploadResponse)?;
+        }
+        Ok(response)
     }
 
     pub async fn upload_c2c_inline_media(
@@ -591,6 +722,331 @@ impl OpenApiClient {
     ) -> Result<MediaUploadResponse, ApiError> {
         let url = self.endpoint(&["v2", "groups", group_openid, "files"])?;
         self.post_json(url, request).await
+    }
+
+    pub async fn prepare_c2c_upload(
+        &self,
+        user_openid: &str,
+        request: &UploadPrepareRequest,
+    ) -> Result<UploadPrepareResponse, ApiError> {
+        validate_path_id("user_openid", user_openid)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidStreamUploadRequest)?;
+        let url = self.endpoint(&["v2", "users", user_openid, "upload_prepare"])?;
+        let response: UploadPrepareResponse = self.post_json_once(url, request).await?;
+        response
+            .validate_for_request(request)
+            .map_err(ApiError::InvalidStreamUploadResponse)?;
+        Ok(response)
+    }
+
+    pub async fn prepare_group_upload(
+        &self,
+        group_openid: &str,
+        request: &UploadPrepareRequest,
+    ) -> Result<UploadPrepareResponse, ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidStreamUploadRequest)?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "upload_prepare"])?;
+        let response: UploadPrepareResponse = self.post_json_once(url, request).await?;
+        response
+            .validate_for_request(request)
+            .map_err(ApiError::InvalidStreamUploadResponse)?;
+        Ok(response)
+    }
+
+    pub async fn upload_prepared_part(
+        &self,
+        part: &UploadPart,
+        bytes: Vec<u8>,
+        upload_timeout: Duration,
+    ) -> Result<(), ApiError> {
+        part.validate()
+            .map_err(ApiError::InvalidStreamUploadRequest)?;
+        let actual_size = u64::try_from(bytes.len())
+            .map_err(|_| ApiError::InvalidRequest("upload part is too large".to_owned()))?;
+        if actual_size != part.block_size.value() {
+            return Err(ApiError::InvalidStreamUploadRequest(
+                StreamUploadValidationError::PartSizeMismatch {
+                    expected: part.block_size.value(),
+                    actual: actual_size,
+                },
+            ));
+        }
+        if upload_timeout.is_zero() {
+            return Err(ApiError::InvalidStreamUploadRequest(
+                StreamUploadValidationError::ZeroUploadTimeout,
+            ));
+        }
+        let url = Url::parse(&part.presigned_url)
+            .map_err(|error| ApiError::InvalidUrl(error.to_string()))?;
+        let deadline = tokio::time::Instant::now()
+            .checked_add(upload_timeout)
+            .ok_or(ApiError::InvalidStreamUploadRequest(
+                StreamUploadValidationError::InvalidUploadTimeout,
+            ))?;
+        let destination_port =
+            url.port_or_known_default()
+                .ok_or(ApiError::InvalidStreamUploadRequest(
+                    StreamUploadValidationError::InvalidPresignedDestination,
+                ))?;
+        let host = normalized_upload_host(&url)?;
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ApiError::UploadTimeout)?;
+        let cached_client = tokio::time::timeout(
+            remaining,
+            self.cached_upload_client(&host, destination_port),
+        )
+        .await
+        .map_err(|_| ApiError::UploadTimeout)?;
+        let client = if let Some(client) = cached_client {
+            client
+        } else {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(ApiError::UploadTimeout)?;
+            let initializer =
+                tokio::time::timeout(remaining, self.upload_initializer(&host, destination_port))
+                    .await
+                    .map_err(|_| ApiError::UploadTimeout)?;
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(ApiError::UploadTimeout)?;
+            let _guard = tokio::time::timeout(remaining, initializer.lock())
+                .await
+                .map_err(|_| ApiError::UploadTimeout)?;
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(ApiError::UploadTimeout)?;
+            if let Some(client) = tokio::time::timeout(
+                remaining,
+                self.cached_upload_client(&host, destination_port),
+            )
+            .await
+            .map_err(|_| ApiError::UploadTimeout)?
+            {
+                client
+            } else {
+                let (_, addresses) = self
+                    .resolve_upload_destination(&url, destination_port, deadline)
+                    .await?;
+                let remaining = deadline
+                    .checked_duration_since(tokio::time::Instant::now())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(ApiError::UploadTimeout)?;
+                tokio::time::timeout(
+                    remaining,
+                    self.upload_client_for(&host, destination_port, &addresses, deadline),
+                )
+                .await
+                .map_err(|_| ApiError::UploadTimeout)??
+            }
+        };
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ApiError::UploadTimeout)?;
+        tokio::time::timeout(remaining, Self::put_presigned_bytes(&client, url, bytes))
+            .await
+            .map_err(|_| ApiError::UploadTimeout)?
+    }
+
+    async fn upload_client_for(
+        &self,
+        host: &str,
+        port: u16,
+        addresses: &[SocketAddr],
+        deadline: tokio::time::Instant,
+    ) -> Result<Client, ApiError> {
+        let key = UploadClientKey {
+            host: host.to_owned(),
+            port,
+        };
+        let now = tokio::time::Instant::now();
+        let mut cache = self.upload_clients.lock().await;
+        cache.retain(|entry| entry.expires_at > now);
+        if let Some(client) = cache
+            .iter()
+            .find(|entry| entry.key.host == host && entry.key.port == port)
+            .map(|entry| entry.client.clone())
+        {
+            ensure_upload_deadline(deadline)?;
+            return Ok(client);
+        }
+        drop(cache);
+        let client_builder = Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .resolve_to_addrs(host, addresses);
+        #[cfg(test)]
+        let client_builder = if self.upload_test_addresses.is_some() {
+            client_builder.danger_accept_invalid_certs(true)
+        } else {
+            client_builder
+        };
+        let client = client_builder.build().map_err(ApiError::Request)?;
+        ensure_upload_deadline(deadline)?;
+        let mut cache = self.upload_clients.lock().await;
+        let now = tokio::time::Instant::now();
+        cache.retain(|entry| entry.expires_at > now);
+        if let Some(existing) = cache
+            .iter()
+            .find(|entry| entry.key.host == host && entry.key.port == port)
+            .map(|entry| entry.client.clone())
+        {
+            ensure_upload_deadline(deadline)?;
+            return Ok(existing);
+        }
+        if cache.len() >= MAX_UPLOAD_CLIENT_CACHE_ENTRIES {
+            cache.pop_front();
+        }
+        ensure_upload_deadline(deadline)?;
+        cache.push_back(UploadClientCacheEntry {
+            key,
+            client: client.clone(),
+            expires_at: tokio::time::Instant::now() + UPLOAD_CLIENT_CACHE_TTL,
+        });
+        Ok(client)
+    }
+
+    async fn cached_upload_client(&self, host: &str, port: u16) -> Option<Client> {
+        let now = tokio::time::Instant::now();
+        let mut cache = self.upload_clients.lock().await;
+        cache.retain(|entry| entry.expires_at > now);
+        cache
+            .iter()
+            .find(|entry| entry.key.host == host && entry.key.port == port)
+            .map(|entry| entry.client.clone())
+    }
+
+    async fn upload_initializer(&self, host: &str, port: u16) -> Arc<Mutex<()>> {
+        let mut initializers = self.upload_initializers.lock().await;
+        initializers.retain(|_, initializer| initializer.strong_count() > 0);
+        let key = (host.to_owned(), port);
+        if let Some(initializer) = initializers.get(&key).and_then(Weak::upgrade) {
+            return initializer;
+        }
+        let initializer = Arc::new(Mutex::new(()));
+        initializers.insert(key, Arc::downgrade(&initializer));
+        initializer
+    }
+
+    async fn resolve_upload_addresses(
+        &self,
+        host: &str,
+        port: u16,
+        deadline: tokio::time::Instant,
+    ) -> Result<Vec<SocketAddr>, ApiError> {
+        #[cfg(test)]
+        if let Some(addresses) = &self.upload_test_addresses {
+            self.upload_test_resolution_count
+                .fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            return if self.upload_test_allow_non_public {
+                Ok(addresses.clone())
+            } else {
+                validate_public_upload_addresses(addresses.clone())
+                    .map_err(ApiError::InvalidStreamUploadRequest)
+            };
+        }
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(ApiError::DnsTimeout)?;
+        tokio::time::timeout(remaining, resolve_public_upload_addresses(host, port))
+            .await
+            .map_err(|_| ApiError::DnsTimeout)?
+    }
+
+    async fn resolve_upload_destination(
+        &self,
+        url: &Url,
+        port: u16,
+        deadline: tokio::time::Instant,
+    ) -> Result<(String, Vec<SocketAddr>), ApiError> {
+        match url.host().ok_or(ApiError::InvalidStreamUploadRequest(
+            StreamUploadValidationError::InvalidPresignedDestination,
+        ))? {
+            Host::Domain(host) => {
+                let addresses = self.resolve_upload_addresses(host, port, deadline).await?;
+                Ok((host.to_owned(), addresses))
+            }
+            Host::Ipv4(address) => {
+                let addresses = validate_public_upload_addresses(vec![SocketAddr::new(
+                    IpAddr::V4(address),
+                    port,
+                )])
+                .map_err(ApiError::InvalidStreamUploadRequest)?;
+                Ok((address.to_string(), addresses))
+            }
+            Host::Ipv6(address) => {
+                let addresses = validate_public_upload_addresses(vec![SocketAddr::new(
+                    IpAddr::V6(address),
+                    port,
+                )])
+                .map_err(ApiError::InvalidStreamUploadRequest)?;
+                Ok((address.to_string(), addresses))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn with_upload_test_addresses(mut self, mut addresses: Vec<SocketAddr>) -> Self {
+        addresses.sort_unstable();
+        addresses.dedup();
+        self.upload_test_addresses = Some(addresses);
+        self.upload_test_allow_non_public = true;
+        self
+    }
+
+    async fn put_presigned_bytes(
+        client: &Client,
+        url: Url,
+        bytes: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        let response = client
+            .put(url)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| ApiError::Request(error.without_url()))?;
+        Self::decode_presigned_unit(response).await
+    }
+
+    pub async fn finish_c2c_upload_part(
+        &self,
+        user_openid: &str,
+        request: &UploadPartFinishRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("user_openid", user_openid)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidStreamUploadRequest)?;
+        let url = self.endpoint(&["v2", "users", user_openid, "upload_part_finish"])?;
+        self.post_json_unit_once(url, request).await
+    }
+
+    pub async fn finish_group_upload_part(
+        &self,
+        group_openid: &str,
+        request: &UploadPartFinishRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("group_openid", group_openid)?;
+        request
+            .validate()
+            .map_err(ApiError::InvalidStreamUploadRequest)?;
+        let url = self.endpoint(&["v2", "groups", group_openid, "upload_part_finish"])?;
+        self.post_json_unit_once(url, request).await
     }
 
     pub async fn recall_c2c_message(
@@ -1200,6 +1656,27 @@ impl OpenApiClient {
         result
     }
 
+    async fn post_json_unit_once<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
+    where
+        B: Serialize + ?Sized,
+    {
+        let token = self.tokens.access_token().await?;
+        let response = self
+            .single_send_client
+            .post(url)
+            .qqbot_token(token.expose())
+            .json(body)
+            .send()
+            .await
+            .map_err(ApiError::Request)?;
+        let unauthorized = response.status() == StatusCode::UNAUTHORIZED;
+        let result = Self::decode_unit(response).await;
+        if unauthorized && self.tokens.refresh_if_current(&token).await.is_err() {
+            self.tokens.invalidate_if_current(&token).await;
+        }
+        result
+    }
+
     async fn post_json_unit<B>(&self, url: Url, body: &B) -> Result<(), ApiError>
     where
         B: Serialize + ?Sized,
@@ -1379,6 +1856,44 @@ impl OpenApiClient {
         serde_json::from_slice(&bytes).map_err(ApiError::Decode)
     }
 
+    async fn decode_presigned_unit(mut response: Response) -> Result<(), ApiError> {
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(ApiError::ResponseTooLarge);
+        }
+        let mut received = 0_usize;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| ApiError::Request(error.without_url()))?
+        {
+            received = received.saturating_add(chunk.len());
+            if received > MAX_RESPONSE_BYTES {
+                return Err(ApiError::ResponseTooLarge);
+            }
+        }
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(ApiError::HttpStatus {
+                status,
+                code: None,
+                message: None,
+                trace_id: None,
+                retry_after,
+            })
+        }
+    }
+
     async fn decode_bytes(mut response: Response) -> Result<Vec<u8>, ApiError> {
         let status = response.status();
         let retry_after = response
@@ -1437,6 +1952,100 @@ impl OpenApiClient {
 
         Ok(bytes)
     }
+}
+
+async fn resolve_public_upload_addresses(
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, ApiError> {
+    let mut addresses = lookup_host((host, port))
+        .await
+        .map_err(ApiError::Dns)?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(ApiError::DnsNoAddresses);
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    validate_public_upload_addresses(addresses).map_err(ApiError::InvalidStreamUploadRequest)
+}
+
+fn normalized_upload_host(url: &Url) -> Result<String, ApiError> {
+    match url.host().ok_or(ApiError::InvalidStreamUploadRequest(
+        StreamUploadValidationError::InvalidPresignedDestination,
+    ))? {
+        Host::Domain(host) => Ok(host.to_owned()),
+        Host::Ipv4(address) => Ok(address.to_string()),
+        Host::Ipv6(address) => Ok(address.to_string()),
+    }
+}
+
+fn ensure_upload_deadline(deadline: tokio::time::Instant) -> Result<(), ApiError> {
+    if deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .is_none_or(|remaining| remaining.is_zero())
+    {
+        return Err(ApiError::UploadTimeout);
+    }
+    Ok(())
+}
+
+fn validate_finalize_response(
+    response: &MediaUploadResponse,
+) -> Result<(), StreamUploadValidationError> {
+    if response
+        .message_id()
+        .is_some_and(|message_id| message_id.trim().is_empty())
+    {
+        return Err(StreamUploadValidationError::EmptyField { field: "id" });
+    }
+    Ok(())
+}
+
+fn validate_public_upload_addresses(
+    addresses: Vec<SocketAddr>,
+) -> Result<Vec<SocketAddr>, StreamUploadValidationError> {
+    if addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err(StreamUploadValidationError::InvalidPresignedDestination);
+    }
+    Ok(addresses)
+}
+
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(address) = address.to_ipv4() {
+        return is_public_ipv4(address);
+    }
+    let segments = address.segments();
+    let is_ietf_special = segments[0] == 0x2001 && (segments[1] <= 0x01ff || segments[1] == 0x0db8);
+    let is_6to4 = segments[0] == 0x2002;
+    let is_6bone = segments[0] == 0x3ffe;
+    let is_documentation = segments[0] == 0x3fff && segments[1] & 0xf000 == 0;
+    segments[0] & 0xe000 == 0x2000 && !is_ietf_special && !is_6to4 && !is_6bone && !is_documentation
 }
 
 fn validate_channel_document(
@@ -2130,5 +2739,655 @@ mod tests {
             .delete_group_join_strategy("strategy/id")
             .await
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod presigned_upload_tests {
+    use std::{
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
+
+    use axum::{
+        Router,
+        body::Bytes,
+        extract::{OriginalUri, State},
+        http::{HeaderMap, StatusCode},
+        response::{IntoResponse, Response},
+        routing::any,
+    };
+    use reqwest::Client;
+    use secrecy::SecretString;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Mutex,
+        task::JoinHandle,
+    };
+    use tokio_rustls::{
+        TlsAcceptor,
+        rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer},
+    };
+    use url::Url;
+
+    use crate::DecimalBytes;
+
+    use super::{
+        ApiError, MediaUploadResponse, OpenApiClient, StreamUploadValidationError, TokenManager,
+        UploadPart, validate_finalize_response, validate_public_upload_addresses,
+    };
+
+    #[derive(Default)]
+    struct UploadState {
+        requests: Mutex<Vec<ObservedUpload>>,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ObservedUpload {
+        path: String,
+        authorization: Option<String>,
+        body: Vec<u8>,
+    }
+
+    struct ServerTask(Option<JoinHandle<()>>);
+
+    #[derive(Clone, Copy)]
+    enum TlsResponseMode {
+        Success,
+        SlowBody,
+        TruncatedBody,
+    }
+
+    impl ServerTask {
+        async fn abort_and_wait(mut self) {
+            let task = self.0.take().expect("server task should be present");
+            task.abort();
+            match task.await {
+                Err(error) if error.is_cancelled() => {}
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Ok(()) => panic!("test server exited unexpectedly"),
+                Err(error) => panic!("test server failed: {error}"),
+            }
+        }
+    }
+
+    impl Drop for ServerTask {
+        fn drop(&mut self) {
+            if let Some(task) = self.0.take() {
+                task.abort();
+            }
+        }
+    }
+
+    async fn upload_endpoint(
+        State(state): State<Arc<UploadState>>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let path = uri.path().to_owned();
+        state.requests.lock().await.push(ObservedUpload {
+            path: path.clone(),
+            authorization: headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
+            body: body.to_vec(),
+        });
+        match path.as_str() {
+            "/ok" => (StatusCode::OK, "<upload-result/>").into_response(),
+            "/json-ok" => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({"code":200,"stored":true})),
+            )
+                .into_response(),
+            "/redirect" => (
+                StatusCode::TEMPORARY_REDIRECT,
+                [("location", "/redirect-target")],
+            )
+                .into_response(),
+            "/server-error" => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            "/slow" => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                StatusCode::OK.into_response()
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn harness() -> (Url, SocketAddr, Arc<UploadState>, ServerTask) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = Url::parse(&format!("http://{address}/")).unwrap();
+        let state = Arc::new(UploadState::default());
+        let app = Router::new()
+            .fallback(any(upload_endpoint))
+            .with_state(Arc::clone(&state));
+        let task = ServerTask(Some(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        })));
+        (origin, address, state, task)
+    }
+
+    async fn tls_harness(mode: TlsResponseMode) -> (SocketAddr, Arc<UploadState>, ServerTask) {
+        let certified = rcgen::generate_simple_self_signed(vec!["upload.test".to_owned()]).unwrap();
+        let private_key = PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()).into();
+        let tls_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], private_key)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(UploadState::default());
+        let server_state = Arc::clone(&state);
+        let task = ServerTask(Some(tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    let mut stream = acceptor.accept(stream).await.unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0_u8; 1024];
+                    let header_end = loop {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        assert_ne!(read, 0, "TLS client closed before sending headers");
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(position) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break position + 4;
+                        }
+                    };
+                    let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    while request.len() < header_end + content_length {
+                        let read = stream.read(&mut buffer).await.unwrap();
+                        assert_ne!(read, 0, "TLS client closed before sending the full body");
+                        request.extend_from_slice(&buffer[..read]);
+                    }
+                    let authorization = headers.lines().find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("authorization: ")
+                            .map(str::to_owned)
+                    });
+                    state.requests.lock().await.push(ObservedUpload {
+                        path: "/upload".to_owned(),
+                        authorization,
+                        body: request[header_end..header_end + content_length].to_vec(),
+                    });
+                    match mode {
+                        TlsResponseMode::Success => {
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                                .await
+                                .unwrap();
+                        }
+                        TlsResponseMode::SlowBody => {
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no")
+                                .await
+                                .unwrap();
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            let _ = stream.write_all(b"k").await;
+                        }
+                        TlsResponseMode::TruncatedBody => {
+                            stream
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\no")
+                                .await
+                                .unwrap();
+                        }
+                    }
+                });
+            }
+        })));
+        (address, state, task)
+    }
+
+    fn public_upload_client(addresses: Vec<SocketAddr>) -> OpenApiClient {
+        let tokens = TokenManager::with_client_and_endpoint(
+            Client::new(),
+            Url::parse("http://127.0.0.1:9/app/getAppAccessToken").unwrap(),
+            "app-id",
+            SecretString::from("secret".to_owned().into_boxed_str()),
+        );
+        OpenApiClient::with_base_url(Url::parse("https://api.bot.qq.com/").unwrap(), tokens)
+            .unwrap()
+            .with_upload_test_addresses(addresses)
+    }
+
+    fn upload_part(address: SocketAddr) -> UploadPart {
+        UploadPart {
+            index: 0,
+            presigned_url: format!(
+                "https://upload.test:{}/upload?signature=capability-secret",
+                address.port()
+            ),
+            block_size: DecimalBytes::new("block_size", "5").unwrap(),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn single_send_client(timeout: Duration) -> Client {
+        Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn presigned_put_sends_exact_bytes_without_qq_authorization() {
+        let (origin, _address, state, task) = harness().await;
+        OpenApiClient::put_presigned_bytes(
+            &single_send_client(Duration::from_secs(1)),
+            origin.join("ok").unwrap(),
+            b"exact-part-bytes".to_vec(),
+        )
+        .await
+        .unwrap();
+        OpenApiClient::put_presigned_bytes(
+            &single_send_client(Duration::from_secs(1)),
+            origin.join("json-ok").unwrap(),
+            b"json-response".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        let requests = state.requests.lock().await;
+        assert_eq!(
+            requests.as_slice(),
+            &[
+                ObservedUpload {
+                    path: "/ok".to_owned(),
+                    authorization: None,
+                    body: b"exact-part-bytes".to_vec(),
+                },
+                ObservedUpload {
+                    path: "/json-ok".to_owned(),
+                    authorization: None,
+                    body: b"json-response".to_vec(),
+                },
+            ]
+        );
+        drop(requests);
+        task.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn presigned_put_does_not_follow_redirects_or_retry_server_errors() {
+        let (origin, _address, state, task) = harness().await;
+        let client = single_send_client(Duration::from_secs(1));
+        for path in ["redirect", "server-error"] {
+            assert!(
+                OpenApiClient::put_presigned_bytes(
+                    &client,
+                    origin.join(path).unwrap(),
+                    b"12345".to_vec(),
+                )
+                .await
+                .is_err()
+            );
+        }
+
+        let requests = state.requests.lock().await;
+        for path in ["/redirect", "/server-error"] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.path == path)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.path != "/redirect-target")
+        );
+        drop(requests);
+        task.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn presigned_put_enforces_caller_timeout() {
+        let (origin, _address, state, task) = harness().await;
+        let error = OpenApiClient::put_presigned_bytes(
+            &single_send_client(Duration::from_millis(20)),
+            origin.join("slow").unwrap(),
+            b"12345".to_vec(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Request(source) if source.is_timeout()));
+        assert_eq!(
+            state
+                .requests
+                .lock()
+                .await
+                .iter()
+                .filter(|request| request.path == "/slow")
+                .count(),
+            1
+        );
+        task.abort_and_wait().await;
+    }
+
+    #[test]
+    fn upload_address_validation_rejects_private_and_mixed_answers() {
+        let private = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443));
+        let public = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 443));
+        for addresses in [vec![private], vec![public, private]] {
+            assert_eq!(
+                validate_public_upload_addresses(addresses).unwrap_err(),
+                StreamUploadValidationError::InvalidPresignedDestination
+            );
+        }
+        assert_eq!(
+            validate_public_upload_addresses(vec![public]).unwrap(),
+            vec![public]
+        );
+
+        for address in [
+            Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0, 0, 0, 1, 0, 0, 0, 1),
+        ] {
+            assert_eq!(
+                validate_public_upload_addresses(vec![SocketAddr::V6(SocketAddrV6::new(
+                    address, 443, 0, 0,
+                ))])
+                .unwrap_err(),
+                StreamUploadValidationError::InvalidPresignedDestination
+            );
+        }
+
+        let documentation = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0x3fff, 0x0fff, 0, 0, 0, 0, 0, 1),
+            443,
+            0,
+            0,
+        ));
+        assert_eq!(
+            validate_public_upload_addresses(vec![documentation]).unwrap_err(),
+            StreamUploadValidationError::InvalidPresignedDestination
+        );
+        let sixbone = SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0x3ffe, 0xffff, 0, 0, 0, 0, 0, 1),
+            443,
+            0,
+            0,
+        ));
+        assert_eq!(
+            validate_public_upload_addresses(vec![sixbone]).unwrap_err(),
+            StreamUploadValidationError::InvalidPresignedDestination
+        );
+        for address in [
+            Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x3fff, 0x1000, 0, 0, 0, 0, 0, 1),
+        ] {
+            let socket = SocketAddr::V6(SocketAddrV6::new(address, 443, 0, 0));
+            assert_eq!(
+                validate_public_upload_addresses(vec![socket]).unwrap(),
+                vec![socket]
+            );
+        }
+
+        let many_public = (1..=17)
+            .map(|port| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), port)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_public_upload_addresses(many_public.clone()).unwrap(),
+            many_public
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_public_ipv6_literal_without_dns() {
+        let api = public_upload_client(Vec::new());
+        let url = Url::parse("https://[2606:4700::1111]/upload").unwrap();
+        let (host, addresses) = api
+            .resolve_upload_destination(
+                &url,
+                443,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(host, "2606:4700::1111");
+        assert_eq!(addresses, vec!["[2606:4700::1111]:443".parse().unwrap()]);
+    }
+
+    #[test]
+    fn finalize_response_allows_missing_but_rejects_empty_message_id() {
+        let response = MediaUploadResponse {
+            file_uuid: "file-uuid".to_owned(),
+            file_info: "file-info".to_owned(),
+            ttl: None,
+            extra: serde_json::Map::new(),
+        };
+        validate_finalize_response(&response).unwrap();
+
+        let mut empty_id = response;
+        empty_id
+            .extra
+            .insert("id".to_owned(), serde_json::Value::String("   ".to_owned()));
+        assert_eq!(
+            validate_finalize_response(&empty_id).unwrap_err(),
+            StreamUploadValidationError::EmptyField { field: "id" }
+        );
+
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "download_secret".to_owned(),
+            serde_json::Value::String("extra-download-capability".to_owned()),
+        );
+        extra.insert(
+            "id".to_owned(),
+            serde_json::Value::String("message-id".to_owned()),
+        );
+        extra.insert(
+            "raw_url".to_owned(),
+            serde_json::Value::String(
+                "https://download.example/file?signature=download-capability".to_owned(),
+            ),
+        );
+        let response = MediaUploadResponse {
+            file_uuid: "file-capability".to_owned(),
+            file_info: "file-info-capability".to_owned(),
+            ttl: Some(60),
+            extra,
+        };
+        let debug = format!("{response:?}");
+        for secret in [
+            "file-capability",
+            "file-info-capability",
+            "download-capability",
+            "extra-download-capability",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn presigned_client_uses_the_pinned_address_set() {
+        let (_origin, address, state, task) = harness().await;
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_secs(1))
+            .resolve_to_addrs("upload.example", &[address])
+            .build()
+            .unwrap();
+        OpenApiClient::put_presigned_bytes(
+            &client,
+            Url::parse("http://upload.example/ok").unwrap(),
+            b"pinned".to_vec(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.requests.lock().await[0].body, b"pinned");
+        task.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn public_upload_path_performs_pinned_https_put_without_qq_authorization() {
+        let (address, state, task) = tls_harness(TlsResponseMode::Success).await;
+        let mut api = public_upload_client(vec!["127.0.0.1:1".parse().unwrap(), address]);
+        api.upload_prepared_part(
+            &upload_part(address),
+            b"12345".to_vec(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        api.upload_test_addresses = None;
+        api.upload_prepared_part(
+            &upload_part(address),
+            b"abcde".to_vec(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.upload_clients.lock().await.len(), 1);
+        assert_eq!(api.upload_test_resolution_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.requests.lock().await.as_slice(),
+            &[
+                ObservedUpload {
+                    path: "/upload".to_owned(),
+                    authorization: None,
+                    body: b"12345".to_vec(),
+                },
+                ObservedUpload {
+                    path: "/upload".to_owned(),
+                    authorization: None,
+                    body: b"abcde".to_vec(),
+                },
+            ]
+        );
+        task.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_share_singleflight_dns_and_client_initialization() {
+        let (address, state, task) = tls_harness(TlsResponseMode::Success).await;
+        let api = public_upload_client(vec![address]);
+        let first_api = api.clone();
+        let second_api = api.clone();
+        let first_part = upload_part(address);
+        let second_part = upload_part(address);
+        let (first, second) = tokio::join!(
+            first_api.upload_prepared_part(&first_part, b"12345".to_vec(), Duration::from_secs(1),),
+            second_api.upload_prepared_part(
+                &second_part,
+                b"abcde".to_vec(),
+                Duration::from_secs(1),
+            )
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(api.upload_test_resolution_count.load(Ordering::SeqCst), 1);
+        assert_eq!(api.upload_clients.lock().await.len(), 1);
+        assert_eq!(state.requests.lock().await.len(), 2);
+        task.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn public_upload_deadline_covers_response_body_consumption() {
+        let (address, state, task) = tls_harness(TlsResponseMode::SlowBody).await;
+        let error = public_upload_client(vec![address])
+            .upload_prepared_part(
+                &upload_part(address),
+                b"12345".to_vec(),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::UploadTimeout));
+        assert_eq!(state.requests.lock().await.len(), 1);
+        assert!(!error.to_string().contains("capability-secret"));
+        task.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn public_upload_transport_errors_redact_presigned_credentials() {
+        let (address, state, task) = tls_harness(TlsResponseMode::TruncatedBody).await;
+        let error = public_upload_client(vec![address])
+            .upload_prepared_part(
+                &upload_part(address),
+                b"12345".to_vec(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Request(_)));
+        assert_eq!(state.requests.lock().await.len(), 1);
+        assert!(!format!("{error:?}").contains("capability-secret"));
+        task.abort_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn upload_cache_isolates_ports_and_revalidates_expired_dns_answers() {
+        let (first_address, _first_state, first_task) = tls_harness(TlsResponseMode::Success).await;
+        let (second_address, _second_state, second_task) =
+            tls_harness(TlsResponseMode::Success).await;
+        let mut api = public_upload_client(vec![first_address]);
+        api.upload_prepared_part(
+            &upload_part(first_address),
+            b"12345".to_vec(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        api.upload_test_addresses = Some(vec![second_address]);
+        api.upload_prepared_part(
+            &upload_part(second_address),
+            b"abcde".to_vec(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(api.upload_clients.lock().await.len(), 2);
+
+        let mut cache = api.upload_clients.lock().await;
+        cache
+            .iter_mut()
+            .find(|entry| entry.key.port == first_address.port())
+            .unwrap()
+            .expires_at = tokio::time::Instant::now();
+        drop(cache);
+        api.upload_test_addresses = Some(vec![first_address]);
+        api.upload_test_allow_non_public = false;
+        let error = api
+            .upload_prepared_part(
+                &upload_part(first_address),
+                b"12345".to_vec(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApiError::InvalidStreamUploadRequest(
+                StreamUploadValidationError::InvalidPresignedDestination
+            )
+        ));
+
+        first_task.abort_and_wait().await;
+        second_task.abort_and_wait().await;
     }
 }

@@ -18,6 +18,7 @@ pub mod openapi;
 pub mod panel;
 pub mod profile;
 pub mod reaction;
+pub mod stream_upload;
 
 pub use audio::{
     AudioActionEvent, AudioControlRequest, AudioOrLiveChannelMemberEvent, AudioOrLiveChannelType,
@@ -75,7 +76,8 @@ pub use menu::{
 pub use message::{
     ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
     InlineMediaUploadRequest, MediaFileType, MediaUploadRequest, MediaUploadResponse,
-    MessageAuthor, MessageRequest, MessageResponse, MessageType, QqMessage,
+    MediaUploadValidationError, MessageAuthor, MessageRequest, MessageResponse, MessageType,
+    QqMessage,
 };
 pub use notice::{
     MessageAuditEvent, MessageAuditOutcome, MessageDeleteEvent, NoticeValidationError,
@@ -91,4 +93,9 @@ pub use profile::{BotProfile, GroupBotState, GroupInfo};
 pub use reaction::{
     MessageReactionEvent, ReactionEmoji, ReactionTarget, ReactionUser, ReactionUsersPage,
     ReactionUsersRequest, ReactionValidationError,
+};
+pub use stream_upload::{
+    C2cStreamMessageRequest, C2cStreamMessageResponse, DecimalBytes, MediaUploadFinalizeRequest,
+    StreamContentType, StreamInputMode, StreamInputState, StreamUploadValidationError,
+    UploadConfig, UploadPart, UploadPartFinishRequest, UploadPrepareRequest, UploadPrepareResponse,
 };

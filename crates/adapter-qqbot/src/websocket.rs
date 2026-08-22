@@ -13,18 +13,19 @@ use bot_core::{
 };
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
-    ApiError, AudioControlRequest, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
-    CreateForumThreadRequest, CreateGroupJoinStrategyRequest, CreateGuildAnnouncementRequest,
-    CreatePanelRequest, CreateScheduleRequest, GatewayPayload, GenerateShareLinkRequest,
-    GroupMuteMemberOperation, GuildApiPermissionDemandRequest, GuildMemberPageRequest,
-    GuildMembersMuteRequest, GuildMuteRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest,
-    GuildRoleMutation, InlineMediaUploadRequest, Intents, InteractionResponseRequest,
-    ListSchedulesQuery, MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse, OpCode,
-    OpenApiClient, PageRequest, PanelListRequest, ReactionEmoji, ReactionUsersRequest,
-    RemoveGuildMemberRequest, ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
+    ApiError, AudioControlRequest, AuthError, C2cStreamMessageRequest, ChannelMessageRequest,
+    CreateDirectMessageRequest, CreateForumThreadRequest, CreateGroupJoinStrategyRequest,
+    CreateGuildAnnouncementRequest, CreatePanelRequest, CreateScheduleRequest, GatewayPayload,
+    GenerateShareLinkRequest, GroupMuteMemberOperation, GuildApiPermissionDemandRequest,
+    GuildMemberPageRequest, GuildMembersMuteRequest, GuildMuteRequest, GuildRoleMemberPageRequest,
+    GuildRoleMemberRequest, GuildRoleMutation, InlineMediaUploadRequest, Intents,
+    InteractionResponseRequest, ListSchedulesQuery, MediaFileType, MediaUploadFinalizeRequest,
+    MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient, PageRequest,
+    PanelListRequest, ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest,
+    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
     UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
     UpdateGroupJoinStrategyWhitelistRequest, UpdatePanelRequest, UpdatePanelTargetsRequest,
-    UpdateScheduleRequest,
+    UpdateScheduleRequest, UploadPartFinishRequest, UploadPrepareRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -481,9 +482,49 @@ struct RichMessageAction {
 struct MediaUploadAction {
     target: MessageTarget,
     file_type: u8,
-    url: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    upload_id: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
     #[serde(default)]
     send: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct C2cStreamMessageAction {
+    user_openid: String,
+    #[serde(flatten)]
+    request: C2cStreamMessageRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct C2cUploadPrepareAction {
+    user_openid: String,
+    #[serde(flatten)]
+    request: UploadPrepareRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupUploadPrepareAction {
+    group_openid: String,
+    #[serde(flatten)]
+    request: UploadPrepareRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct C2cUploadPartFinishAction {
+    user_openid: String,
+    #[serde(flatten)]
+    request: UploadPartFinishRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupUploadPartFinishAction {
+    group_openid: String,
+    #[serde(flatten)]
+    request: UploadPartFinishRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1034,6 +1075,9 @@ impl QqActionExecutor {
                 )
             }
             "qq.media.upload" => self.execute_media_upload(payload).await,
+            _ if is_stream_upload_action(name) => {
+                self.execute_stream_upload_action(name, payload).await
+            }
             "qq.bot.profile.get" | "qq.group.info.get" | "qq.group.bot-state.get" => {
                 self.execute_profile_action(name, payload).await
             }
@@ -1206,26 +1250,136 @@ impl QqActionExecutor {
         let action: MediaUploadAction = decode_platform_payload("qq.media.upload", payload)?;
         let file_type = MediaFileType::try_from(action.file_type)
             .map_err(|message| AdapterError::Action(message.to_owned()))?;
-        let mut request = MediaUploadRequest::from_url(file_type, action.url);
-        request.srv_send_msg = action.send;
-        let response = match &action.target {
-            MessageTarget::Group { group_id } => {
-                self.api.upload_group_media(group_id, &request).await
+        let (response, returns_message_id) = match (action.url, action.upload_id) {
+            (Some(url), None) => {
+                let mut request = MediaUploadRequest::from_url(file_type, url);
+                request.srv_send_msg = action.send;
+                let response = match &action.target {
+                    MessageTarget::Group { group_id } => {
+                        self.api.upload_group_media(group_id, &request).await
+                    }
+                    MessageTarget::Private { user_id } => {
+                        self.api.upload_c2c_media(user_id, &request).await
+                    }
+                    MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
+                        return Err(AdapterError::Action(
+                            "QQ guild media upload is not supported by this endpoint".to_owned(),
+                        ));
+                    }
+                };
+                (response, action.send)
             }
-            MessageTarget::Private { user_id } => {
-                self.api.upload_c2c_media(user_id, &request).await
+            (None, Some(upload_id)) => {
+                let mut request =
+                    MediaUploadFinalizeRequest::new(file_type, upload_id, action.file_name);
+                request.srv_send_msg = action.send;
+                let response = match &action.target {
+                    MessageTarget::Group { group_id } => {
+                        self.api.finalize_group_upload(group_id, &request).await
+                    }
+                    MessageTarget::Private { user_id } => {
+                        self.api.finalize_c2c_upload(user_id, &request).await
+                    }
+                    MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
+                        return Err(AdapterError::Action(
+                            "QQ guild media upload is not supported by this endpoint".to_owned(),
+                        ));
+                    }
+                };
+                (response, action.send)
             }
-            MessageTarget::Channel { .. } | MessageTarget::GuildDirect { .. } => {
+            (Some(_), Some(_)) => {
                 return Err(AdapterError::Action(
-                    "QQ guild media upload is not supported by this endpoint".to_owned(),
+                    "QQ media upload must not contain both url and upload_id".to_owned(),
                 ));
             }
+            (None, None) => {
+                return Err(AdapterError::Action(
+                    "QQ media upload requires either url or upload_id".to_owned(),
+                ));
+            }
+        };
+        let response = response.map_err(|error| map_action_error(&error))?;
+        let raw = serde_json::to_value(&response).map_err(|error| {
+            AdapterError::ActionUnknown(format!(
+                "QQ platform action `qq.media.upload` response could not be encoded: {error}"
+            ))
+        })?;
+        let message_id = returns_message_id
+            .then(|| {
+                response
+                    .message_id()
+                    .filter(|message_id| !message_id.trim().is_empty())
+                    .map(str::to_owned)
+            })
+            .flatten();
+        Ok(ActionResult { message_id, raw })
+    }
+
+    async fn execute_stream_upload_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        reject_stream_upload_action_fields(name, &payload)?;
+        match name {
+            "qq.c2c.stream-message.send" => {
+                let action: C2cStreamMessageAction = decode_platform_payload(name, payload)?;
+                let response = self
+                    .api
+                    .send_c2c_stream_message(&action.user_openid, &action.request)
+                    .await
+                    .map_err(|error| map_action_error(&error))?;
+                let raw = serde_json::to_value(&response).map_err(|error| {
+                    AdapterError::ActionUnknown(format!(
+                        "QQ platform action `{name}` response could not be encoded: {error}"
+                    ))
+                })?;
+                Ok(ActionResult {
+                    message_id: Some(response.id),
+                    raw,
+                })
+            }
+            "qq.c2c.upload.prepare" => {
+                let action: C2cUploadPrepareAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .prepare_c2c_upload(&action.user_openid, &action.request)
+                        .await,
+                )
+            }
+            "qq.group.upload.prepare" => {
+                let action: GroupUploadPrepareAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .prepare_group_upload(&action.group_openid, &action.request)
+                        .await,
+                )
+            }
+            "qq.c2c.upload.part-finish" => {
+                let action: C2cUploadPartFinishAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.c2c.upload.part-finish",
+                    "c2c",
+                    self.api
+                        .finish_c2c_upload_part(&action.user_openid, &action.request)
+                        .await,
+                )
+            }
+            "qq.group.upload.part-finish" => {
+                let action: GroupUploadPartFinishAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.group.upload.part-finish",
+                    "group",
+                    self.api
+                        .finish_group_upload_part(&action.group_openid, &action.request)
+                        .await,
+                )
+            }
+            _ => unreachable!("stream/upload Action dispatcher only calls known names"),
         }
-        .map_err(|error| map_action_error(&error))?;
-        Ok(ActionResult {
-            message_id: None,
-            raw: serde_json::to_value(response).unwrap_or(Value::Null),
-        })
     }
 
     async fn execute_profile_action(
@@ -2232,6 +2386,69 @@ fn is_audio_forum_action(name: &str) -> bool {
     )
 }
 
+fn is_stream_upload_action(name: &str) -> bool {
+    matches!(
+        name,
+        "qq.c2c.stream-message.send"
+            | "qq.c2c.upload.prepare"
+            | "qq.group.upload.prepare"
+            | "qq.c2c.upload.part-finish"
+            | "qq.group.upload.part-finish"
+    )
+}
+
+fn reject_stream_upload_action_fields(name: &str, payload: &Value) -> Result<(), AdapterError> {
+    let allowed = match name {
+        "qq.c2c.stream-message.send" => &[
+            "user_openid",
+            "input_mode",
+            "input_state",
+            "index",
+            "content_type",
+            "content_raw",
+            "event_id",
+            "msg_id",
+            "stream_msg_id",
+            "msg_seq",
+            "is_wakeup",
+        ][..],
+        "qq.c2c.upload.prepare" => &[
+            "user_openid",
+            "file_type",
+            "file_size",
+            "file_name",
+            "md5",
+            "sha1",
+            "md5_10m",
+        ],
+        "qq.group.upload.prepare" => &[
+            "group_openid",
+            "file_type",
+            "file_size",
+            "file_name",
+            "md5",
+            "sha1",
+            "md5_10m",
+        ],
+        "qq.c2c.upload.part-finish" => &[
+            "user_openid",
+            "upload_id",
+            "part_index",
+            "block_size",
+            "md5",
+        ],
+        "qq.group.upload.part-finish" => &[
+            "group_openid",
+            "upload_id",
+            "part_index",
+            "block_size",
+            "md5",
+        ],
+        _ => unreachable!("stream/upload Action field checker only calls known names"),
+    };
+    reject_unknown_object_fields(name, "payload", payload, allowed)
+}
+
 fn reject_audio_forum_action_fields(name: &str, payload: &Value) -> Result<(), AdapterError> {
     let allowed = match name {
         "qq.channel.audio.control" => &["channel_id", "audio_url", "text", "status"][..],
@@ -2446,10 +2663,30 @@ impl From<&bot_core::CommonMessage> for MessageLog {
 
 fn map_action_error(error: &ApiError) -> AdapterError {
     match error {
-        ApiError::Request(_)
+        ApiError::Request(source) => {
+            let diagnostic = if source.is_timeout() {
+                "request timed out"
+            } else if source.is_decode() {
+                "response decoding failed"
+            } else if source.is_body() {
+                "body transport failed"
+            } else if source.is_connect() {
+                "connection transport failed"
+            } else {
+                "request transport failed"
+            };
+            AdapterError::ActionUnknown(format!("{error}: {diagnostic}"))
+        }
+        ApiError::Dns(_)
+        | ApiError::DnsTimeout
+        | ApiError::DnsNoAddresses
+        | ApiError::UploadTimeout
         | ApiError::Decode(_)
         | ApiError::ResponseTooLarge
-        | ApiError::InvalidForumResponse(_) => AdapterError::ActionUnknown(error.to_string()),
+        | ApiError::InvalidForumResponse(_)
+        | ApiError::InvalidStreamUploadResponse(_) => {
+            AdapterError::ActionUnknown(error.to_string())
+        }
         ApiError::Authentication(_)
         | ApiError::HttpStatus { .. }
         | ApiError::Platform { .. }
@@ -2461,9 +2698,11 @@ fn map_action_error(error: &ApiError) -> AdapterError {
         | ApiError::InvalidChannelContentRequest(_)
         | ApiError::InvalidAudioRequest(_)
         | ApiError::InvalidForumRequest(_)
+        | ApiError::InvalidStreamUploadRequest(_)
         | ApiError::InvalidInteractionRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_)
+        | ApiError::InvalidMediaUploadRequest(_)
         | ApiError::InvalidRequest(_)
         | ApiError::InvalidUrl(_) => AdapterError::Action(error.to_string()),
     }
@@ -2766,6 +3005,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
     match error {
         ApiError::InvalidUrl(_)
         | ApiError::InvalidRequest(_)
+        | ApiError::InvalidMediaUploadRequest(_)
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildControlRequest(_)
         | ApiError::InvalidGuildRequest(_)
@@ -2774,6 +3014,7 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::InvalidChannelContentRequest(_)
         | ApiError::InvalidAudioRequest(_)
         | ApiError::InvalidForumRequest(_)
+        | ApiError::InvalidStreamUploadRequest(_)
         | ApiError::InvalidInteractionRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_) => true,
@@ -2781,10 +3022,15 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::HttpStatus { status, .. } => status.is_client_error() && status.as_u16() != 429,
         ApiError::Authentication(AuthError::Request(_) | AuthError::InvalidResponse(_))
         | ApiError::Request(_)
+        | ApiError::Dns(_)
+        | ApiError::DnsTimeout
+        | ApiError::DnsNoAddresses
+        | ApiError::UploadTimeout
         | ApiError::Platform { .. }
         | ApiError::ResponseTooLarge
         | ApiError::Decode(_)
-        | ApiError::InvalidForumResponse(_) => false,
+        | ApiError::InvalidForumResponse(_)
+        | ApiError::InvalidStreamUploadResponse(_) => false,
     }
 }
 

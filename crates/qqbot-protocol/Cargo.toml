@@ -22,7 +22,9 @@ url.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+rcgen.workspace = true
 tokio = { workspace = true, features = ["net"] }
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true
