@@ -80,8 +80,10 @@ pub use message::{
     QqMessage,
 };
 pub use notice::{
-    MessageAuditEvent, MessageAuditOutcome, MessageDeleteEvent, NoticeValidationError,
-    SubscribeMessageStatusEvent, SubscribeMessageTemplateResult, SubscriptionOperation,
+    C2cMessageStatusEvent, FriendAddEvent, FriendAuthor, FriendDeleteEvent, FriendScene,
+    GroupMessageStatusEvent, GroupRobotEvent, MessageAuditEvent, MessageAuditOutcome,
+    MessageDeleteEvent, NoticeValidationError, SubscribeMessageStatusEvent,
+    SubscribeMessageTemplateResult, SubscriptionOperation,
 };
 pub use openapi::{ApiError, OpenApiClient, OpenApiEnvironment};
 pub use panel::{

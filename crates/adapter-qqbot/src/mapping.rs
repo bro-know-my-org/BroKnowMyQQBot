@@ -7,9 +7,10 @@ use bot_core::{
 };
 use chrono::{DateTime, Utc};
 use qqbot_protocol::{
-    AudioActionEvent, AudioOrLiveChannelMemberEvent, AudioValidationError, ChannelEvent,
-    ForumPostEvent, ForumPublishAuditEvent, ForumReplyEvent, ForumThread, ForumValidationError,
-    GatewayPayload, GroupJoinRequestEvent, GroupMemberEvent, GroupMemberEventValidationError,
+    AudioActionEvent, AudioOrLiveChannelMemberEvent, AudioValidationError, C2cMessageStatusEvent,
+    ChannelEvent, ForumPostEvent, ForumPublishAuditEvent, ForumReplyEvent, ForumThread,
+    ForumValidationError, FriendAddEvent, FriendDeleteEvent, GatewayPayload, GroupJoinRequestEvent,
+    GroupMemberEvent, GroupMemberEventValidationError, GroupMessageStatusEvent, GroupRobotEvent,
     GuildDispatchValidationError, GuildEvent, GuildMemberEvent, InteractionEvent,
     InteractionValidationError, MessageAuditEvent, MessageAuditOutcome, MessageDeleteEvent,
     MessageReactionEvent, NoticeValidationError, OpenForumEvent, QqMessage,
@@ -23,29 +24,6 @@ const GROUP_EVENTS: &[&str] = &["GROUP_AT_MESSAGE_CREATE", "GROUP_MESSAGE_CREATE
 const PRIVATE_EVENTS: &[&str] = &["C2C_MESSAGE_CREATE"];
 const CHANNEL_EVENTS: &[&str] = &["AT_MESSAGE_CREATE", "MESSAGE_CREATE"];
 const GUILD_DIRECT_EVENTS: &[&str] = &["DIRECT_MESSAGE_CREATE"];
-const NOTICE_EVENTS: &[&str] = &[
-    "GUILD_CREATE",
-    "GUILD_UPDATE",
-    "GUILD_DELETE",
-    "CHANNEL_CREATE",
-    "CHANNEL_UPDATE",
-    "CHANNEL_DELETE",
-    "GUILD_MEMBER_ADD",
-    "GUILD_MEMBER_UPDATE",
-    "GUILD_MEMBER_REMOVE",
-    "MESSAGE_REACTION_ADD",
-    "MESSAGE_REACTION_REMOVE",
-    "GROUP_ADD_ROBOT",
-    "GROUP_DEL_ROBOT",
-    "GROUP_MSG_REJECT",
-    "GROUP_MSG_RECEIVE",
-    "GROUP_MEMBER_ADD",
-    "GROUP_MEMBER_REMOVE",
-    "FRIEND_ADD",
-    "FRIEND_DEL",
-    "C2C_MSG_REJECT",
-    "C2C_MSG_RECEIVE",
-];
 const REQUEST_EVENTS: &[&str] = &["GROUP_JOIN_REQUEST"];
 
 #[derive(Debug, Error)]
@@ -245,6 +223,17 @@ fn map_typed_notice(
         "MESSAGE_AUDIT_PASS" | "MESSAGE_AUDIT_REJECT" => {
             Some(map_message_audit(adapter, payload, event_type))
         }
+        "FRIEND_ADD" => Some(map_friend_add(adapter, payload, event_type)),
+        "FRIEND_DEL" => Some(map_friend_delete(adapter, payload, event_type)),
+        "GROUP_ADD_ROBOT" | "GROUP_DEL_ROBOT" => {
+            Some(map_group_robot(adapter, payload, event_type))
+        }
+        "GROUP_MSG_RECEIVE" | "GROUP_MSG_REJECT" => {
+            Some(map_group_message_status(adapter, payload, event_type))
+        }
+        "C2C_MSG_RECEIVE" | "C2C_MSG_REJECT" => {
+            Some(map_c2c_message_status(adapter, payload, event_type))
+        }
         "AUDIO_START" | "AUDIO_FINISH" | "AUDIO_ON_MIC" | "AUDIO_OFF_MIC" => {
             Some(map_audio_event(adapter, payload, event_type))
         }
@@ -268,15 +257,115 @@ fn map_typed_notice(
         "AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER" | "AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT" => {
             Some(map_audio_live_member_event(adapter, payload, event_type))
         }
-        _ if NOTICE_EVENTS.contains(&event_type) => Some(map_structured_event(
-            adapter,
-            payload,
-            event_type,
-            Some("timestamp"),
-            Event::Notice,
-        )),
         _ => None,
     }
+}
+
+fn map_friend_add(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = FriendAddEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+        event_type: event_type.to_owned(),
+        source,
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidNotice {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_unix_notice(adapter, payload, event_type, event.timestamp)
+}
+
+fn map_friend_delete(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        FriendDeleteEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidNotice {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_unix_notice(adapter, payload, event_type, event.timestamp)
+}
+
+fn map_group_robot(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        GroupRobotEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidNotice {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_unix_notice(adapter, payload, event_type, event.timestamp)
+}
+
+fn map_group_message_status(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = GroupMessageStatusEvent::deserialize(&payload.d).map_err(|source| {
+        MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        }
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidNotice {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_unix_notice(adapter, payload, event_type, event.timestamp)
+}
+
+fn map_c2c_message_status(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        C2cMessageStatusEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidNotice {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_unix_notice(adapter, payload, event_type, event.timestamp)
+}
+
+fn map_unix_notice(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+    timestamp: u64,
+) -> Result<EventEnvelope, MappingError> {
+    let timestamp = unix_timestamp(timestamp, event_type)?;
+    let mut envelope = map_structured_event(adapter, payload, event_type, None, Event::Notice)?;
+    envelope.timestamp = Some(timestamp);
+    Ok(envelope)
 }
 
 fn map_audio_event(
@@ -870,28 +959,112 @@ mod tests {
     }
 
     #[test]
-    fn maps_group_management_notice_with_stable_dispatch_id() {
-        let payload = GatewayPayload {
+    fn maps_all_social_status_notices_with_unix_timestamps() {
+        let timestamp = 1_784_570_617_u64;
+        let cases = [
+            (
+                "FRIEND_ADD",
+                json!({
+                    "openid":"user-id","timestamp":timestamp,"scene":9001,
+                    "scene_param":"callback-data","author":{
+                        "union_openid":"union-id","future_nested":true
+                    },"future":true
+                }),
+            ),
+            (
+                "FRIEND_DEL",
+                json!({"openid":"user-id","timestamp":timestamp,"future":true}),
+            ),
+            (
+                "GROUP_ADD_ROBOT",
+                json!({
+                    "group_openid":"group-id","op_member_openid":"member-id",
+                    "timestamp":timestamp,"future":true
+                }),
+            ),
+            (
+                "GROUP_DEL_ROBOT",
+                json!({
+                    "group_openid":"group-id","op_member_openid":"member-id",
+                    "timestamp":timestamp,"future":true
+                }),
+            ),
+            (
+                "GROUP_MSG_RECEIVE",
+                json!({
+                    "group_openid":"group-id","op_member_openid":"member-id",
+                    "timestamp":timestamp,"future":true
+                }),
+            ),
+            (
+                "GROUP_MSG_REJECT",
+                json!({
+                    "group_openid":"group-id","op_member_openid":"member-id",
+                    "timestamp":timestamp,"future":true
+                }),
+            ),
+            (
+                "C2C_MSG_RECEIVE",
+                json!({"openid":"user-id","timestamp":timestamp,"future":true}),
+            ),
+            (
+                "C2C_MSG_REJECT",
+                json!({"openid":"user-id","timestamp":timestamp,"future":true}),
+            ),
+        ];
+
+        for (sequence, (event_type, data)) in cases.into_iter().enumerate() {
+            let payload = GatewayPayload {
+                id: Some(format!("notice-{sequence}")),
+                op: OpCode::DISPATCH,
+                d: data,
+                s: Some(sequence as u64),
+                t: Some(event_type.to_owned()),
+            };
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            assert_eq!(envelope.id.as_str(), format!("notice-{sequence}"));
+            assert_eq!(
+                envelope.timestamp.unwrap().timestamp(),
+                i64::try_from(timestamp).unwrap()
+            );
+            assert_eq!(envelope.raw["d"]["future"], true);
+            let Event::Notice(notice) = envelope.event else {
+                panic!("expected notice event");
+            };
+            assert_eq!(notice["type"], event_type);
+            assert_eq!(notice["data"], payload.d);
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_social_status_notices() {
+        let base = GatewayPayload {
             id: Some("notice-id".to_owned()),
             op: OpCode::DISPATCH,
-            d: json!({
-                "group_openid":"group-id",
-                "op_member_openid":"member-id",
-                "timestamp":"2026-08-03T10:00:00Z"
-            }),
+            d: json!({"openid":"user-id","timestamp":"2026-08-22T10:00:00Z"}),
             s: Some(3),
-            t: Some("GROUP_ADD_ROBOT".to_owned()),
+            t: Some("C2C_MSG_RECEIVE".to_owned()),
         };
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &base),
+            Err(MappingError::Decode { .. })
+        ));
 
-        let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
-            .unwrap()
-            .unwrap();
-        assert_eq!(envelope.id.as_str(), "notice-id");
-        let Event::Notice(notice) = envelope.event else {
-            panic!("expected notice event");
-        };
-        assert_eq!(notice["type"], "GROUP_ADD_ROBOT");
-        assert_eq!(notice["data"]["group_openid"], "group-id");
+        let mut overflow = base.clone();
+        overflow.d = json!({"openid":"user-id","timestamp":u64::MAX});
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &overflow),
+            Err(MappingError::InvalidNotice { .. })
+        ));
+
+        let mut invalid_identifier = base;
+        invalid_identifier.d = json!({"openid":"user id","timestamp":1_784_570_617_u64});
+        assert!(matches!(
+            map_dispatch(&AdapterId::new("qq"), &invalid_identifier),
+            Err(MappingError::InvalidNotice { .. })
+        ));
     }
 
     #[test]
@@ -1895,7 +2068,8 @@ mod tests {
             op: OpCode::DISPATCH,
             d: json!({
                 "group_openid":"group-id",
-                "timestamp":"2026-08-03T10:00:00Z"
+                "op_member_openid":"member-id",
+                "timestamp":1_784_570_617_u64
             }),
             s: Some(4),
             t: Some("GROUP_MSG_RECEIVE".to_owned()),

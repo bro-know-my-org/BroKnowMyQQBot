@@ -798,6 +798,25 @@ mod tests {
         .unwrap()
     }
 
+    async fn send_signed(adapter: &QqWebhookAdapter, payload: &Value) -> Value {
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let response = adapter
+                .router()
+                .oneshot(signed_request(payload))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            (status, body)
+        })
+        .await
+        .expect("webhook request and response body should complete");
+        assert_eq!(status, StatusCode::OK);
+        serde_json::from_slice(&body).unwrap()
+    }
+
     fn audio_forum_payloads() -> Vec<(&'static str, Value)> {
         let audio = json!({
             "guild_id":"guild-id","channel_id":"channel-id",
@@ -1115,6 +1134,102 @@ mod tests {
             ]
             .map(Value::from)
         );
+    }
+
+    #[tokio::test]
+    async fn accepts_social_status_notices_through_webhook() {
+        let adapter = adapter();
+        let (events, mut received) = tokio::sync::mpsc::channel(8);
+        let (terminal_error, _terminal_failure) = tokio::sync::oneshot::channel();
+        adapter
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = Some(ActiveWebhookRun {
+            generation: 1,
+            events: EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap(),
+            terminal_error: Some(terminal_error),
+        });
+
+        let timestamp = 1_784_570_617_u64;
+        let payloads = [
+            (
+                "FRIEND_ADD",
+                json!({
+                    "openid":"user-openid","timestamp":timestamp,
+                    "scene":2003,"scene_param":"callback-data"
+                }),
+            ),
+            (
+                "FRIEND_DEL",
+                json!({"openid":"user-openid","timestamp":timestamp}),
+            ),
+            (
+                "GROUP_ADD_ROBOT",
+                json!({
+                    "group_openid":"group-openid","op_member_openid":"operator-openid",
+                    "timestamp":timestamp
+                }),
+            ),
+            (
+                "GROUP_DEL_ROBOT",
+                json!({
+                    "group_openid":"group-openid","op_member_openid":"operator-openid",
+                    "timestamp":timestamp
+                }),
+            ),
+            (
+                "GROUP_MSG_RECEIVE",
+                json!({
+                    "group_openid":"group-openid","op_member_openid":"operator-openid",
+                    "timestamp":timestamp
+                }),
+            ),
+            (
+                "GROUP_MSG_REJECT",
+                json!({
+                    "group_openid":"group-openid","op_member_openid":"operator-openid",
+                    "timestamp":timestamp
+                }),
+            ),
+            (
+                "C2C_MSG_RECEIVE",
+                json!({"openid":"user-openid","timestamp":timestamp}),
+            ),
+            (
+                "C2C_MSG_REJECT",
+                json!({"openid":"user-openid","timestamp":timestamp}),
+            ),
+        ];
+        for (sequence, (event_type, data)) in payloads.iter().enumerate() {
+            let payload = json!({
+                "id":format!("social-{sequence}"),"op":0,"d":data.clone(),
+                "s":sequence,"t":event_type
+            });
+            assert_eq!(
+                send_signed(&adapter, &payload).await,
+                json!({"op":12,"d":0})
+            );
+        }
+
+        for (expected, (event_type, _)) in payloads.iter().enumerate() {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
+                .await
+                .expect("social status event should reach the runtime queue")
+                .expect("QQ event queue should remain open");
+            assert_eq!(event.id.as_str(), format!("social-{expected}"));
+            assert_eq!(event.raw["t"], *event_type);
+            assert_eq!(
+                event.timestamp.unwrap().timestamp(),
+                i64::try_from(timestamp).unwrap()
+            );
+            let Event::Notice(notice) = &event.event else {
+                panic!("event {event_type} should be delivered as a notice");
+            };
+            assert_eq!(notice["type"], *event_type);
+            assert_eq!(notice["data"], payloads[expected].1);
+        }
     }
 
     #[tokio::test]

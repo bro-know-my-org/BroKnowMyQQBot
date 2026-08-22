@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::message::{MessageAuthor, QqMessage};
@@ -10,7 +10,9 @@ use crate::message::{MessageAuthor, QqMessage};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeValidationError {
     EmptyField { field: &'static str },
+    InvalidIdentifier { field: &'static str },
     InvalidTimestamp { field: &'static str },
+    InvalidUnixTimestamp { field: &'static str },
     MissingSubscriptionTarget,
 }
 
@@ -26,10 +28,22 @@ impl fmt::Display for NoticeValidationError {
             Self::EmptyField { field } => {
                 write!(formatter, "QQ notice `{field}` must not be empty")
             }
+            Self::InvalidIdentifier { field } => {
+                write!(
+                    formatter,
+                    "QQ notice `{field}` must not contain whitespace or control characters"
+                )
+            }
             Self::InvalidTimestamp { field } => {
                 write!(
                     formatter,
                     "QQ notice `{field}` must be an RFC 3339 timestamp"
+                )
+            }
+            Self::InvalidUnixTimestamp { field } => {
+                write!(
+                    formatter,
+                    "QQ notice `{field}` Unix seconds are outside the representable range"
                 )
             }
             Self::MissingSubscriptionTarget => {
@@ -40,6 +54,145 @@ impl fmt::Display for NoticeValidationError {
 }
 
 impl std::error::Error for NoticeValidationError {}
+
+/// A friend-add scene. Unknown integer values are retained for forward compatibility.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct FriendScene(u32);
+
+impl FriendScene {
+    pub const DEFAULT: Self = Self(1000);
+    pub const NETWORK_SEARCH_ALL: Self = Self(1001);
+    pub const NETWORK_SEARCH_BOT: Self = Self(1002);
+    pub const GROUP: Self = Self(1003);
+    pub const SPACE: Self = Self(1004);
+    pub const INTERNAL_PROFILE_SHARE: Self = Self(2001);
+    pub const EXTERNAL_PROFILE_SHARE: Self = Self(2002);
+    pub const INTERNAL_DEVELOPER_LINK: Self = Self(2003);
+    pub const EXTERNAL_DEVELOPER_LINK: Self = Self(2004);
+
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+}
+
+/// Information identifying the user who initiated a friend event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendAuthor {
+    /// The user's union-scoped `OpenID`.
+    pub union_openid: String,
+}
+
+/// Payload for the QQ `FRIEND_ADD` notice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendAddEvent {
+    /// Event time as non-negative Unix seconds.
+    pub timestamp: u64,
+    /// The user's app-scoped `OpenID`.
+    pub openid: String,
+    /// The documented friend-add source, retaining unknown integer values.
+    pub scene: FriendScene,
+    /// Developer callback data associated with the add-friend source; it may be empty.
+    pub scene_param: String,
+    /// Optional union-scoped identity; current official examples may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<FriendAuthor>,
+    /// Optional short code associated with a robot share link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_code: Option<String>,
+}
+
+impl FriendAddEvent {
+    pub fn validate(&self) -> Result<(), NoticeValidationError> {
+        validate_unix_timestamp(self.timestamp)?;
+        validate_identifier("openid", &self.openid)?;
+        if let Some(author) = &self.author {
+            validate_identifier("author.union_openid", &author.union_openid)?;
+        }
+        Ok(())
+    }
+}
+
+/// Payload for the QQ `FRIEND_DEL` notice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FriendDeleteEvent {
+    /// Event time as non-negative Unix seconds.
+    pub timestamp: u64,
+    /// The user's app-scoped `OpenID`.
+    pub openid: String,
+    /// Optional union-scoped identity; the official example omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<FriendAuthor>,
+}
+
+impl FriendDeleteEvent {
+    pub fn validate(&self) -> Result<(), NoticeValidationError> {
+        validate_unix_timestamp(self.timestamp)?;
+        validate_identifier("openid", &self.openid)?;
+        if let Some(author) = &self.author {
+            validate_identifier("author.union_openid", &author.union_openid)?;
+        }
+        Ok(())
+    }
+}
+
+/// Payload shared by `GROUP_ADD_ROBOT` and `GROUP_DEL_ROBOT`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupRobotEvent {
+    /// Event time as non-negative Unix seconds.
+    pub timestamp: u64,
+    /// The group `OpenID` affected by the operation.
+    pub group_openid: String,
+    /// The group member `OpenID` that added or removed the robot.
+    pub op_member_openid: String,
+}
+
+impl GroupRobotEvent {
+    pub fn validate(&self) -> Result<(), NoticeValidationError> {
+        validate_unix_timestamp(self.timestamp)?;
+        validate_identifier("group_openid", &self.group_openid)?;
+        validate_identifier("op_member_openid", &self.op_member_openid)
+    }
+}
+
+/// Payload shared by `GROUP_MSG_RECEIVE` and `GROUP_MSG_REJECT`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupMessageStatusEvent {
+    /// Event time as non-negative Unix seconds.
+    pub timestamp: u64,
+    /// The group `OpenID` whose receive setting changed.
+    pub group_openid: String,
+    /// The group member `OpenID` that changed the setting.
+    pub op_member_openid: String,
+}
+
+impl GroupMessageStatusEvent {
+    pub fn validate(&self) -> Result<(), NoticeValidationError> {
+        validate_unix_timestamp(self.timestamp)?;
+        validate_identifier("group_openid", &self.group_openid)?;
+        validate_identifier("op_member_openid", &self.op_member_openid)
+    }
+}
+
+/// Payload shared by `C2C_MSG_RECEIVE` and `C2C_MSG_REJECT`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct C2cMessageStatusEvent {
+    /// Event time as non-negative Unix seconds.
+    pub timestamp: u64,
+    /// The user `OpenID` whose C2C proactive-message setting changed.
+    pub openid: String,
+}
+
+impl C2cMessageStatusEvent {
+    pub fn validate(&self) -> Result<(), NoticeValidationError> {
+        validate_unix_timestamp(self.timestamp)?;
+        validate_identifier("openid", &self.openid)
+    }
+}
 
 /// Payload shared by `MESSAGE_DELETE`, `PUBLIC_MESSAGE_DELETE`, and
 /// `DIRECT_MESSAGE_DELETE`.
@@ -161,6 +314,30 @@ fn validate_non_empty(field: &'static str, value: &str) -> Result<(), NoticeVali
     } else {
         Ok(())
     }
+}
+
+fn validate_identifier(field: &'static str, value: &str) -> Result<(), NoticeValidationError> {
+    if value.is_empty() {
+        return Err(NoticeValidationError::EmptyField { field });
+    }
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(NoticeValidationError::InvalidIdentifier { field });
+    }
+    Ok(())
+}
+
+fn validate_unix_timestamp(timestamp: u64) -> Result<(), NoticeValidationError> {
+    if i64::try_from(timestamp)
+        .ok()
+        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0))
+        .is_none()
+    {
+        return Err(NoticeValidationError::InvalidUnixTimestamp { field: "timestamp" });
+    }
+    Ok(())
 }
 
 fn validate_optional_non_empty(

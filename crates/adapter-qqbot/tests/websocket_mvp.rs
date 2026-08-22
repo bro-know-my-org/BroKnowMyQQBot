@@ -7,7 +7,9 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use bot_core::{RuntimeBuilder, ShutdownHandle, shutdown_channel};
+use bot_core::{
+    Adapter, EventSender, RuntimeBuilder, RuntimeObserver, ShutdownHandle, shutdown_channel,
+};
 use builtin_plugins::{ActiveSendProbePlugin, EchoPlugin, PingPlugin};
 use futures_util::{SinkExt, StreamExt};
 use plugin_host::{PluginStore, StaticPluginHost};
@@ -217,8 +219,16 @@ async fn run_ping_dispatch(event_type: &str, data: Value) -> Value {
         .await
         .unwrap()
         .unwrap();
-    gateway_task.await.unwrap();
+    timeout(Duration::from_secs(5), gateway_task)
+        .await
+        .expect("mock gateway should stop after adapter shutdown")
+        .unwrap();
     http_task.abort();
+    let error = timeout(Duration::from_secs(5), http_task)
+        .await
+        .expect("HTTP task cancellation should complete")
+        .expect_err("HTTP task should be cancelled");
+    assert!(error.is_cancelled());
     reply
 }
 
@@ -308,6 +318,119 @@ async fn guild_direct_event_replies_through_dms_openapi() {
     assert_eq!(reply["content"], "pong");
     assert_eq!(reply["msg_id"], "source-message-id");
     assert!(reply.get("msg_type").is_none());
+}
+
+async fn assert_social_status_notice_through_websocket(event_type: &str, data: Value) {
+    let expected_timestamp = data["timestamp"]
+        .as_u64()
+        .expect("social status fixture should contain a Unix timestamp");
+    let expected_data = data.clone();
+    let (gateway_url, gateway_task) = start_gateway_dispatch(event_type, data).await;
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (base_url, _replies, http_task) = start_http(gateway_url, shutdown_handle.clone()).await;
+    let tokens = TokenManager::with_client_and_endpoint(
+        Client::new(),
+        base_url.join("app/getAppAccessToken").unwrap(),
+        "app-id",
+        SecretString::from("app-secret".to_owned().into_boxed_str()),
+    );
+    let api = OpenApiClient::with_base_url(base_url, tokens).unwrap();
+    let adapter = Arc::new(QqWebSocketAdapter::new(QqWebSocketConfig::default(), api));
+    let (events, mut received) = mpsc::channel(4);
+    let sender = EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap();
+    let running_adapter = Arc::clone(&adapter);
+    let run = tokio::spawn(async move { running_adapter.run(sender, shutdown_signal).await });
+
+    let event = timeout(Duration::from_secs(5), received.recv())
+        .await
+        .expect("social status event should reach the runtime queue")
+        .expect("QQ event queue should remain open");
+    assert_eq!(event.raw["t"], event_type);
+    assert_eq!(event.raw["d"], expected_data);
+    assert_eq!(
+        event.timestamp.unwrap().timestamp(),
+        i64::try_from(expected_timestamp).unwrap()
+    );
+    let bot_core::Event::Notice(notice) = event.event else {
+        panic!("event {event_type} should be delivered as a notice");
+    };
+    assert_eq!(notice["type"], event_type);
+    assert_eq!(notice["data"], expected_data);
+
+    shutdown_handle.shutdown();
+    timeout(Duration::from_secs(5), run)
+        .await
+        .expect("QQ adapter should stop")
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(5), gateway_task)
+        .await
+        .expect("mock gateway should stop after adapter shutdown")
+        .unwrap();
+    http_task.abort();
+    let error = timeout(Duration::from_secs(5), http_task)
+        .await
+        .expect("HTTP task cancellation should complete")
+        .expect_err("HTTP task should be cancelled");
+    assert!(error.is_cancelled());
+}
+
+#[tokio::test]
+async fn all_social_status_notices_reach_runtime_queue_through_websocket() {
+    let timestamp = 1_784_570_617_u64;
+    let cases = [
+        (
+            "FRIEND_ADD",
+            json!({
+                "openid":"user-id","timestamp":timestamp,"scene":9001,
+                "scene_param":"callback-data","future":true
+            }),
+        ),
+        (
+            "FRIEND_DEL",
+            json!({"openid":"user-id","timestamp":timestamp,"future":true}),
+        ),
+        (
+            "GROUP_ADD_ROBOT",
+            json!({
+                "group_openid":"group-id","op_member_openid":"operator-id",
+                "timestamp":timestamp,"future":true
+            }),
+        ),
+        (
+            "GROUP_DEL_ROBOT",
+            json!({
+                "group_openid":"group-id","op_member_openid":"operator-id",
+                "timestamp":timestamp,"future":true
+            }),
+        ),
+        (
+            "GROUP_MSG_RECEIVE",
+            json!({
+                "group_openid":"group-id","op_member_openid":"operator-id",
+                "timestamp":timestamp,"future":true
+            }),
+        ),
+        (
+            "GROUP_MSG_REJECT",
+            json!({
+                "group_openid":"group-id","op_member_openid":"operator-id",
+                "timestamp":timestamp,"future":true
+            }),
+        ),
+        (
+            "C2C_MSG_RECEIVE",
+            json!({"openid":"user-id","timestamp":timestamp,"future":true}),
+        ),
+        (
+            "C2C_MSG_REJECT",
+            json!({"openid":"user-id","timestamp":timestamp,"future":true}),
+        ),
+    ];
+
+    for (event_type, data) in cases {
+        assert_social_status_notice_through_websocket(event_type, data).await;
+    }
 }
 
 #[tokio::test]
