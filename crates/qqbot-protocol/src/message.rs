@@ -36,11 +36,17 @@ pub struct MessageAuthor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_openid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_openid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub union_openid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub union_user_account: Option<String>,
 }
 
 /// Attachment metadata included by QQ message events.

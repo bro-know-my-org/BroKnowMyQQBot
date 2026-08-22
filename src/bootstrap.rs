@@ -287,6 +287,9 @@ fn configured_qq_intents(config: &BotConfig) -> Intents {
     if config.qq.public_guild_messages {
         intents = intents.with_public_guild_messages();
     }
+    if config.qq.private_guild_messages {
+        intents = intents.with_guild_messages();
+    }
     if config.qq.direct_messages {
         intents = intents.with_direct_messages();
     }
@@ -396,5 +399,17 @@ mod tests {
         let disabled: BotConfig = toml::from_str("[qq]\nextended_events = false").unwrap();
         let disabled_intents = configured_qq_intents(&disabled);
         assert_eq!(disabled_intents, Intents::GROUP_AND_C2C_EVENT);
+    }
+
+    #[test]
+    fn private_guild_messages_require_an_explicit_intent_switch() {
+        let default = configured_qq_intents(&BotConfig::default());
+        assert!(!default.contains(Intents::GUILD_MESSAGES));
+
+        let enabled: BotConfig = toml::from_str("[qq]\nprivate_guild_messages = true").unwrap();
+        assert!(configured_qq_intents(&enabled).contains(Intents::GUILD_MESSAGES));
+
+        let extended: BotConfig = toml::from_str("[qq]\nextended_events = true").unwrap();
+        assert!(!configured_qq_intents(&extended).contains(Intents::GUILD_MESSAGES));
     }
 }

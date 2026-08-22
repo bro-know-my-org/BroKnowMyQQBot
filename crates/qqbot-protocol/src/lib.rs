@@ -10,6 +10,7 @@ pub mod guild_control;
 pub mod interaction;
 pub mod menu;
 pub mod message;
+pub mod notice;
 pub mod openapi;
 pub mod panel;
 pub mod profile;
@@ -55,7 +56,11 @@ pub use menu::{
 pub use message::{
     ChannelMessageRequest, CreateDirectMessageRequest, DirectMessageSession,
     InlineMediaUploadRequest, MediaFileType, MediaUploadRequest, MediaUploadResponse,
-    MessageRequest, MessageResponse, MessageType, QqMessage,
+    MessageAuthor, MessageRequest, MessageResponse, MessageType, QqMessage,
+};
+pub use notice::{
+    MessageAuditEvent, MessageAuditOutcome, MessageDeleteEvent, NoticeValidationError,
+    SubscribeMessageStatusEvent, SubscribeMessageTemplateResult, SubscriptionOperation,
 };
 pub use openapi::{ApiError, OpenApiClient, OpenApiEnvironment};
 pub use panel::{

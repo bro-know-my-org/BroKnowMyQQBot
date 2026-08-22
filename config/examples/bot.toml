@@ -5,6 +5,7 @@ enabled = true
 environment = "production"
 transport = "websocket"
 public_guild_messages = false
+private_guild_messages = false
 direct_messages = false
 extended_events = false
 check_only = false

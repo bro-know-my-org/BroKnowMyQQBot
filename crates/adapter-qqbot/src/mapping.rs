@@ -9,8 +9,9 @@ use chrono::{DateTime, Utc};
 use qqbot_protocol::{
     ChannelEvent, GatewayPayload, GroupJoinRequestEvent, GroupMemberEvent,
     GroupMemberEventValidationError, GuildDispatchValidationError, GuildEvent, GuildMemberEvent,
-    InteractionEvent, InteractionValidationError, MessageReactionEvent, QqMessage,
-    ReactionValidationError,
+    InteractionEvent, InteractionValidationError, MessageAuditEvent, MessageAuditOutcome,
+    MessageDeleteEvent, MessageReactionEvent, NoticeValidationError, QqMessage,
+    ReactionValidationError, SubscribeMessageStatusEvent,
 };
 use serde::Deserialize as _;
 use sha2::{Digest as _, Sha256};
@@ -42,8 +43,6 @@ const NOTICE_EVENTS: &[&str] = &[
     "FRIEND_DEL",
     "C2C_MSG_REJECT",
     "C2C_MSG_RECEIVE",
-    "MESSAGE_AUDIT_PASS",
-    "MESSAGE_AUDIT_REJECT",
 ];
 const REQUEST_EVENTS: &[&str] = &["GROUP_JOIN_REQUEST"];
 
@@ -93,6 +92,12 @@ pub(crate) enum MappingError {
         event_type: String,
         #[source]
         source: InteractionValidationError,
+    },
+    #[error("QQ notice dispatch `{event_type}` contains invalid data")]
+    InvalidNotice {
+        event_type: String,
+        #[source]
+        source: NoticeValidationError,
     },
 }
 
@@ -219,6 +224,13 @@ fn map_typed_notice(
         "GROUP_MEMBER_ADD" | "GROUP_MEMBER_REMOVE" => {
             Some(map_group_member(adapter, payload, event_type))
         }
+        "MESSAGE_DELETE" | "PUBLIC_MESSAGE_DELETE" | "DIRECT_MESSAGE_DELETE" => {
+            Some(map_message_delete(adapter, payload, event_type))
+        }
+        "SUBSCRIBE_MESSAGE_STATUS" => Some(map_subscription_status(adapter, payload, event_type)),
+        "MESSAGE_AUDIT_PASS" | "MESSAGE_AUDIT_REJECT" => {
+            Some(map_message_audit(adapter, payload, event_type))
+        }
         _ if NOTICE_EVENTS.contains(&event_type) => Some(map_structured_event(
             adapter,
             payload,
@@ -228,6 +240,88 @@ fn map_typed_notice(
         )),
         _ => None,
     }
+}
+
+fn map_message_delete(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        MessageDeleteEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidNotice {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    validate_optional_rfc3339(event.message.timestamp.as_deref(), event_type)?;
+    map_structured_event(adapter, payload, event_type, None, Event::Notice)
+}
+
+fn map_subscription_status(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = SubscribeMessageStatusEvent::deserialize(&payload.d).map_err(|source| {
+        MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        }
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidNotice {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    let mut latest_update = None;
+    for result in &event.result {
+        unix_timestamp(result.subscribe_ts, event_type)?;
+        unix_timestamp(result.update_ts, event_type)?;
+        latest_update = Some(latest_update.map_or(result.update_ts, |current: u64| {
+            current.max(result.update_ts)
+        }));
+    }
+    let mut envelope = map_structured_event(adapter, payload, event_type, None, Event::Notice)?;
+    envelope.timestamp = latest_update
+        .map(|timestamp| unix_timestamp(timestamp, event_type))
+        .transpose()?;
+    Ok(envelope)
+}
+
+fn map_message_audit(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        MessageAuditEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    let outcome = if event_type == "MESSAGE_AUDIT_PASS" {
+        MessageAuditOutcome::Pass
+    } else {
+        MessageAuditOutcome::Reject
+    };
+    event
+        .validate(outcome)
+        .map_err(|source| MappingError::InvalidNotice {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_structured_event(
+        adapter,
+        payload,
+        event_type,
+        Some("audit_time"),
+        Event::Notice,
+    )
 }
 
 fn map_guild_event(
@@ -295,6 +389,16 @@ fn validate_optional_rfc3339(value: Option<&str>, event_type: &str) -> Result<()
         })?;
     }
     Ok(())
+}
+
+fn unix_timestamp(timestamp: u64, event_type: &str) -> Result<DateTime<Utc>, MappingError> {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(|seconds| DateTime::from_timestamp(seconds, 0))
+        .ok_or_else(|| MappingError::InvalidUnixTimestamp {
+            event_type: event_type.to_owned(),
+            timestamp,
+        })
 }
 
 fn map_message_reaction(
@@ -1296,6 +1400,294 @@ mod tests {
             let mut payload = base.clone();
             payload.d = invalid;
             assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
+        }
+    }
+
+    #[test]
+    fn maps_all_channel_message_delete_notices() {
+        for event_type in [
+            "MESSAGE_DELETE",
+            "PUBLIC_MESSAGE_DELETE",
+            "DIRECT_MESSAGE_DELETE",
+        ] {
+            let payload = GatewayPayload {
+                id: Some(format!("{event_type}-id")),
+                op: OpCode::DISPATCH,
+                d: json!({
+                    "message": {
+                        "id":"message-id",
+                        "guild_id":"guild-id",
+                        "channel_id":"channel-id",
+                        "timestamp":"2026-08-22T10:00:00+08:00",
+                        "author":{"id":"author-id"},
+                        "future":true
+                    },
+                    "op_user":{"id":"operator-id","future":true},
+                    "future":true
+                }),
+                s: Some(20),
+                t: Some(event_type.to_owned()),
+            };
+
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            assert_eq!(envelope.timestamp, None);
+            let Event::Notice(body) = envelope.event else {
+                panic!("expected notice");
+            };
+            assert_eq!(body["type"], event_type);
+            assert_eq!(body["data"]["message"]["id"], "message-id");
+            assert_eq!(body["data"]["op_user"]["id"], "operator-id");
+            assert_eq!(envelope.raw["d"]["future"], true);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_channel_message_delete_notices() {
+        let base = GatewayPayload {
+            id: Some("delete-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "message": {
+                    "id":"message-id",
+                    "guild_id":"guild-id",
+                    "channel_id":"channel-id",
+                    "timestamp":"2026-08-22T10:00:00+08:00"
+                },
+                "op_user":{"id":"operator-id"}
+            }),
+            s: Some(20),
+            t: Some("PUBLIC_MESSAGE_DELETE".to_owned()),
+        };
+        for invalid in [
+            json!({
+                "message":{"id":" ","guild_id":"guild-id","channel_id":"channel-id"},
+                "op_user":{"id":"operator-id"}
+            }),
+            json!({
+                "message":{"id":"message-id","guild_id":" ","channel_id":"channel-id"},
+                "op_user":{"id":"operator-id"}
+            }),
+            json!({
+                "message":{"id":"message-id","guild_id":"guild-id","channel_id":" "},
+                "op_user":{"id":"operator-id"}
+            }),
+            json!({
+                "message":{"id":"message-id","guild_id":"guild-id","channel_id":"channel-id"},
+                "op_user":{"id":" "}
+            }),
+            json!({
+                "message":{
+                    "id":"message-id","guild_id":"guild-id","channel_id":"channel-id",
+                    "timestamp":"not-a-timestamp"
+                },
+                "op_user":{"id":"operator-id"}
+            }),
+        ] {
+            let mut payload = base.clone();
+            payload.d = invalid;
+            assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
+        }
+    }
+
+    #[test]
+    fn maps_subscription_status_targets_and_latest_update_time() {
+        for target in [
+            json!({"openid":"user-openid"}),
+            json!({"group_openid":"group-openid"}),
+            json!({"openid":"user-openid","group_openid":"group-openid"}),
+        ] {
+            let mut data = target;
+            data["result"] = json!([
+                {
+                    "template_id":10001,"custom_template_id":"custom-1","op":1,
+                    "subscribe_id":"subscribe-1","subscribe_ts":1_784_276_800,
+                    "update_ts":1_784_276_810
+                },
+                {
+                    "template_id":10002,"custom_template_id":"custom-2","op":99,
+                    "subscribe_id":"subscribe-2","subscribe_ts":1_784_276_805,
+                    "update_ts":1_784_276_820,"future":true
+                },
+                {
+                    "template_id":10003,"custom_template_id":"custom-3","op":2,
+                    "subscribe_id":"subscribe-3","subscribe_ts":1_784_276_806,
+                    "update_ts":1_784_276_815
+                }
+            ]);
+            let payload = GatewayPayload {
+                id: Some("subscription-id".to_owned()),
+                op: OpCode::DISPATCH,
+                d: data,
+                s: Some(21),
+                t: Some("SUBSCRIBE_MESSAGE_STATUS".to_owned()),
+            };
+            let envelope = map_dispatch(&AdapterId::new("qq"), &payload)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                envelope.timestamp.map(|timestamp| timestamp.timestamp()),
+                Some(1_784_276_820)
+            );
+            let Event::Notice(body) = envelope.event else {
+                panic!("expected notice");
+            };
+            assert_eq!(body["data"]["result"][1]["op"], 99);
+            assert_eq!(body["data"]["result"][2]["op"], 2);
+        }
+
+        let empty = GatewayPayload {
+            id: Some("subscription-empty-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({"openid":"user-openid","result":[]}),
+            s: Some(22),
+            t: Some("SUBSCRIBE_MESSAGE_STATUS".to_owned()),
+        };
+        assert_eq!(
+            map_dispatch(&AdapterId::new("qq"), &empty)
+                .unwrap()
+                .unwrap()
+                .timestamp,
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_subscription_status_notices() {
+        for data in [
+            json!({"result":[]}),
+            json!({
+                "openid":"user-openid",
+                "result":[{
+                    "template_id":1,"custom_template_id":"custom","op":1,
+                    "subscribe_id":"subscribe","subscribe_ts":u64::MAX,"update_ts":1
+                }]
+            }),
+            json!({
+                "openid":"user-openid",
+                "result":[{
+                    "template_id":1,"custom_template_id":"custom","op":1,
+                    "subscribe_id":"subscribe","subscribe_ts":1,"update_ts":u64::MAX
+                }]
+            }),
+        ] {
+            let payload = GatewayPayload {
+                id: Some("subscription-id".to_owned()),
+                op: OpCode::DISPATCH,
+                d: data,
+                s: Some(23),
+                t: Some("SUBSCRIBE_MESSAGE_STATUS".to_owned()),
+            };
+            assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
+        }
+    }
+
+    #[test]
+    fn maps_message_audit_outcome_from_dispatch_type() {
+        let base = GatewayPayload {
+            id: Some("audit-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "audit_id":"audit-record-id",
+                "message_id":"message-id",
+                "guild_id":"guild-id",
+                "channel_id":"channel-id",
+                "audit_time":"2026-08-22T10:01:00+08:00",
+                "create_time":"2026-08-22T10:00:00+08:00",
+                "future":true
+            }),
+            s: Some(24),
+            t: Some("MESSAGE_AUDIT_PASS".to_owned()),
+        };
+        let passed = map_dispatch(&AdapterId::new("qq"), &base).unwrap().unwrap();
+        assert_eq!(
+            passed.timestamp.unwrap().to_rfc3339(),
+            "2026-08-22T02:01:00+00:00"
+        );
+
+        for message_id in [serde_json::Value::Null, json!("")] {
+            let mut rejected = base.clone();
+            rejected.t = Some("MESSAGE_AUDIT_REJECT".to_owned());
+            rejected.d["message_id"] = message_id;
+            let envelope = map_dispatch(&AdapterId::new("qq"), &rejected)
+                .unwrap()
+                .unwrap();
+            let Event::Notice(body) = envelope.event else {
+                panic!("expected notice");
+            };
+            assert_eq!(body["type"], "MESSAGE_AUDIT_REJECT");
+        }
+
+        let mut rejected_without_message_id = base.clone();
+        rejected_without_message_id.t = Some("MESSAGE_AUDIT_REJECT".to_owned());
+        rejected_without_message_id
+            .d
+            .as_object_mut()
+            .unwrap()
+            .remove("message_id");
+        assert!(
+            map_dispatch(&AdapterId::new("qq"), &rejected_without_message_id)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut rejected_with_message_id = base.clone();
+        rejected_with_message_id.t = Some("MESSAGE_AUDIT_REJECT".to_owned());
+        assert!(
+            map_dispatch(&AdapterId::new("qq"), &rejected_with_message_id)
+                .unwrap()
+                .is_some()
+        );
+
+        let mut missing_pass_id = base;
+        missing_pass_id.d["message_id"] = serde_json::Value::Null;
+        assert!(map_dispatch(&AdapterId::new("qq"), &missing_pass_id).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_message_audit_timestamps_and_ignores_invented_delete_events() {
+        for (field, value) in [
+            ("audit_time", json!("not-a-timestamp")),
+            ("create_time", json!("not-a-timestamp")),
+            ("audit_time", json!(42)),
+        ] {
+            let mut data = json!({
+                "audit_id":"audit-record-id",
+                "message_id":"message-id",
+                "guild_id":"guild-id",
+                "channel_id":"channel-id",
+                "audit_time":"2026-08-22T10:01:00+08:00",
+                "create_time":"2026-08-22T10:00:00+08:00"
+            });
+            data[field] = value;
+            let payload = GatewayPayload {
+                id: Some("audit-id".to_owned()),
+                op: OpCode::DISPATCH,
+                d: data,
+                s: Some(25),
+                t: Some("MESSAGE_AUDIT_PASS".to_owned()),
+            };
+            assert!(map_dispatch(&AdapterId::new("qq"), &payload).is_err());
+        }
+
+        for event_type in [
+            "C2C_MESSAGE_DELETE",
+            "GROUP_MESSAGE_DELETE",
+            "GROUP_AT_MESSAGE_DELETE",
+        ] {
+            let payload = GatewayPayload {
+                id: Some("invented-id".to_owned()),
+                op: OpCode::DISPATCH,
+                d: json!({}),
+                s: Some(26),
+                t: Some(event_type.to_owned()),
+            };
+            assert!(
+                map_dispatch(&AdapterId::new("qq"), &payload)
+                    .unwrap()
+                    .is_none()
+            );
         }
     }
 

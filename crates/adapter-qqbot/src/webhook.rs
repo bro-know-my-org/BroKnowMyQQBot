@@ -23,7 +23,7 @@ use bot_core::{
     ShutdownSignal,
 };
 use ed25519_dalek::{Signature, Signer as _, SigningKey};
-use qqbot_protocol::{GatewayPayload, InteractionEvent, OpCode, OpenApiClient};
+use qqbot_protocol::{GatewayPayload, OpCode, OpenApiClient};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::json;
@@ -456,65 +456,75 @@ async fn dispatch_response(
     mut payload: GatewayPayload,
     signed_at: u64,
 ) -> Response {
-    let outer_event_id = payload
-        .id
-        .as_deref()
-        .filter(|event_id| !event_id.trim().is_empty() && event_id.len() <= MAX_EVENT_ID_BYTES)
-        .map(str::to_owned);
-    let interaction_event_id =
-        if outer_event_id.is_none() && payload.t.as_deref() == Some("INTERACTION_CREATE") {
-            InteractionEvent::deserialize(&payload.d)
-                .ok()
-                .and_then(|interaction| {
-                    (interaction.id.len() <= MAX_EVENT_ID_BYTES && interaction.validate().is_ok())
-                        .then_some(interaction.id)
-                })
-        } else {
-            None
-        };
-    let Some(event_id) = outer_event_id.or(interaction_event_id) else {
-        return callback_error(
-            StatusCode::BAD_REQUEST,
-            "dispatch event ID is missing or invalid",
-        );
+    let outer_event_id = match payload.id.as_deref() {
+        Some(event_id) if event_id.trim().is_empty() || event_id.len() > MAX_EVENT_ID_BYTES => {
+            if payload.t.as_deref() == Some("INTERACTION_CREATE") {
+                payload.id = None;
+                None
+            } else {
+                return callback_error(
+                    StatusCode::BAD_REQUEST,
+                    "dispatch event ID is missing or invalid",
+                );
+            }
+        }
+        Some(event_id) => Some(event_id.to_owned()),
+        None => None,
     };
-    if payload
-        .id
-        .as_deref()
-        .is_none_or(|candidate| candidate != event_id)
-        && payload.t.as_deref() == Some("INTERACTION_CREATE")
-    {
-        payload.id = None;
-    }
     let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(now) => now.as_secs(),
         Err(_) => {
             return callback_error(StatusCode::INTERNAL_SERVER_ERROR, "system clock is invalid");
         }
     };
-    match state.seen_events.lock().await.lookup(&event_id, now) {
-        Some(Reservation::Accepted) => {
-            debug!(adapter_id = %state.adapter_id, event_id = %compact_id(&event_id), "acknowledging duplicate QQ Webhook event");
-            return ack_response();
+    if let Some(event_id) = outer_event_id.as_deref() {
+        match state.seen_events.lock().await.lookup(event_id, now) {
+            Some(Reservation::Accepted) => {
+                debug!(adapter_id = %state.adapter_id, event_id = %compact_id(event_id), "acknowledging duplicate QQ Webhook event");
+                return ack_response();
+            }
+            Some(Reservation::Pending) => {
+                return callback_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "matching callback is still being accepted",
+                );
+            }
+            Some(Reservation::New | Reservation::Saturated) | None => {}
         }
-        Some(Reservation::Pending) => {
-            return callback_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "matching callback is still being accepted",
-            );
-        }
-        Some(Reservation::New | Reservation::Saturated) | None => {}
     }
     let mapped = match map_dispatch(&state.adapter_id, &payload) {
         Ok(mapped) => mapped,
         Err(error) => {
-            warn!(adapter_id = %state.adapter_id, event_id = %compact_id(&event_id), %error, "rejected malformed QQ Webhook dispatch");
-            return callback_error(StatusCode::BAD_REQUEST, "invalid dispatch payload");
+            warn!(adapter_id = %state.adapter_id, %error, "rejected malformed QQ Webhook dispatch");
+            return ack_response_with_code(1);
         }
     };
     let Some(event) = mapped else {
         return ack_response();
     };
+    let uses_mapped_fallback = outer_event_id.is_none();
+    let event_id = outer_event_id.unwrap_or_else(|| event.id.as_str().to_owned());
+    if event_id.trim().is_empty() || event_id.len() > MAX_EVENT_ID_BYTES {
+        return callback_error(
+            StatusCode::BAD_REQUEST,
+            "dispatch event ID is missing or invalid",
+        );
+    }
+    if uses_mapped_fallback {
+        match state.seen_events.lock().await.lookup(&event_id, now) {
+            Some(Reservation::Accepted) => {
+                debug!(adapter_id = %state.adapter_id, event_id = %compact_id(&event_id), "acknowledging duplicate QQ Webhook event");
+                return ack_response();
+            }
+            Some(Reservation::Pending) => {
+                return callback_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "matching callback is still being accepted",
+                );
+            }
+            Some(Reservation::New | Reservation::Saturated) | None => {}
+        }
+    }
     let expires_at = signed_at
         .saturating_add(state.timestamp_tolerance.as_secs())
         .max(now.saturating_add(state.request_timeout.as_secs()));
@@ -588,9 +598,13 @@ async fn dispatch_response(
 }
 
 fn ack_response() -> Response {
+    ack_response_with_code(0)
+}
+
+fn ack_response_with_code(code: u8) -> Response {
     Json(json!({
         "op": OpCode::HTTP_CALLBACK_ACK.value(),
-        "d": 0,
+        "d": code,
     }))
     .into_response()
 }
@@ -915,6 +929,182 @@ mod tests {
             }
             assert_eq!(received.recv().await.unwrap().id.as_str(), interaction_id);
         }
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn accepts_all_typed_notice_events_through_webhook() {
+        let adapter = adapter();
+        let (events, mut received) = tokio::sync::mpsc::channel(8);
+        let (terminal_error, _terminal_failure) = tokio::sync::oneshot::channel();
+        adapter
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = Some(ActiveWebhookRun {
+            generation: 1,
+            events: EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap(),
+            terminal_error: Some(terminal_error),
+        });
+
+        let deleted = json!({
+            "message":{
+                "id":"message-id","guild_id":"guild-id","channel_id":"channel-id",
+                "timestamp":"2026-08-22T10:00:00+08:00"
+            },
+            "op_user":{"id":"operator-id"}
+        });
+        let payloads = [
+            ("MESSAGE_DELETE", deleted.clone()),
+            ("PUBLIC_MESSAGE_DELETE", deleted.clone()),
+            ("DIRECT_MESSAGE_DELETE", deleted),
+            (
+                "SUBSCRIBE_MESSAGE_STATUS",
+                json!({
+                    "openid":"user-openid",
+                    "result":[{
+                        "template_id":10001,"custom_template_id":"custom-template","op":1,
+                        "subscribe_id":"subscribe-id","subscribe_ts":1_784_276_815,
+                        "update_ts":1_784_276_820
+                    }]
+                }),
+            ),
+            (
+                "MESSAGE_AUDIT_PASS",
+                json!({
+                    "audit_id":"audit-pass-id","message_id":"message-id",
+                    "guild_id":"guild-id","channel_id":"channel-id",
+                    "audit_time":"2026-08-22T10:01:00+08:00",
+                    "create_time":"2026-08-22T10:00:00+08:00"
+                }),
+            ),
+            (
+                "MESSAGE_AUDIT_REJECT",
+                json!({
+                    "audit_id":"audit-reject-id","guild_id":"guild-id",
+                    "channel_id":"channel-id",
+                    "audit_time":"2026-08-22T10:01:00+08:00",
+                    "create_time":"2026-08-22T10:00:00+08:00"
+                }),
+            ),
+        ];
+        for (sequence, (event_type, data)) in payloads.into_iter().enumerate() {
+            let payload = json!({
+                "id":format!("notice-{sequence}"),
+                "op":0,
+                "d":data,
+                "s":sequence,
+                "t":event_type
+            });
+            let response = adapter
+                .router()
+                .oneshot(signed_request(&payload))
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"op":12,"d":0})
+            );
+        }
+
+        let mut event_types = Vec::new();
+        for _ in 0..6 {
+            event_types.push(received.recv().await.unwrap().raw["t"].clone());
+        }
+        assert_eq!(
+            event_types,
+            [
+                "MESSAGE_DELETE",
+                "PUBLIC_MESSAGE_DELETE",
+                "DIRECT_MESSAGE_DELETE",
+                "SUBSCRIBE_MESSAGE_STATUS",
+                "MESSAGE_AUDIT_PASS",
+                "MESSAGE_AUDIT_REJECT",
+            ]
+            .map(Value::from)
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_notice_mapping_controls_webhook_acknowledgement() {
+        let adapter = adapter();
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+        let (terminal_error, _terminal_failure) = tokio::sync::oneshot::channel();
+        adapter
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = Some(ActiveWebhookRun {
+            generation: 1,
+            events: EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap(),
+            terminal_error: Some(terminal_error),
+        });
+
+        let valid = json!({
+            "op":0,
+            "d":{
+                "openid":"user-openid",
+                "result":[{
+                    "template_id":10001,
+                    "custom_template_id":"custom-template",
+                    "op":1,
+                    "subscribe_id":"subscribe-id",
+                    "subscribe_ts":1_784_276_815,
+                    "update_ts":1_784_276_820
+                }]
+            },
+            "s":30,
+            "t":"SUBSCRIBE_MESSAGE_STATUS"
+        });
+        for _ in 0..2 {
+            let response = adapter
+                .router()
+                .oneshot(signed_request(&valid))
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"op":12,"d":0})
+            );
+        }
+        assert!(
+            received
+                .recv()
+                .await
+                .unwrap()
+                .id
+                .as_str()
+                .starts_with("qq:SUBSCRIBE_MESSAGE_STATUS:30:")
+        );
+        assert!(received.try_recv().is_err());
+
+        let invalid = json!({
+            "id":"invalid-subscription-id",
+            "op":0,
+            "d":{"result":[]},
+            "s":31,
+            "t":"SUBSCRIBE_MESSAGE_STATUS"
+        });
+        let response = adapter
+            .router()
+            .oneshot(signed_request(&invalid))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"op":12,"d":1})
+        );
         assert!(received.try_recv().is_err());
     }
 
