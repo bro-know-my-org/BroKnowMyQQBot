@@ -120,6 +120,26 @@ impl Intents {
     pub const fn with_interactions(self) -> Self {
         self.union(Self::INTERACTION)
     }
+
+    #[must_use]
+    pub const fn with_open_forums(self) -> Self {
+        self.union(Self::OPEN_FORUMS_EVENT)
+    }
+
+    #[must_use]
+    pub const fn with_audio_live_members(self) -> Self {
+        self.union(Self::AUDIO_OR_LIVE_CHANNEL_MEMBER)
+    }
+
+    #[must_use]
+    pub const fn with_forums(self) -> Self {
+        self.union(Self::FORUMS_EVENT)
+    }
+
+    #[must_use]
+    pub const fn with_audio_actions(self) -> Self {
+        self.union(Self::AUDIO_ACTION)
+    }
 }
 
 impl Serialize for Intents {
@@ -192,15 +212,35 @@ mod tests {
 
     #[test]
     fn intents_use_numeric_wire_format_and_keep_unknown_bits() {
+        assert_eq!(Intents::empty().with_open_forums().bits(), 1_u32 << 18);
+        assert_eq!(
+            Intents::empty().with_audio_live_members().bits(),
+            1_u32 << 19
+        );
+        assert_eq!(Intents::empty().with_forums().bits(), 1_u32 << 28);
+        assert_eq!(Intents::empty().with_audio_actions().bits(), 1_u32 << 29);
+
         let intents = Intents::empty()
             .with_guild_messages()
             .with_group_and_c2c()
             .with_public_guild_messages()
             .with_direct_messages()
-            .with_interactions();
+            .with_interactions()
+            .with_open_forums()
+            .with_audio_live_members()
+            .with_forums()
+            .with_audio_actions();
         assert_eq!(
             serde_json::to_value(intents).unwrap(),
-            (1_u32 << 9) | (1_u32 << 12) | (1_u32 << 25) | (1_u32 << 26) | (1_u32 << 30)
+            (1_u32 << 9)
+                | (1_u32 << 12)
+                | (1_u32 << 18)
+                | (1_u32 << 19)
+                | (1_u32 << 25)
+                | (1_u32 << 26)
+                | (1_u32 << 28)
+                | (1_u32 << 29)
+                | (1_u32 << 30)
         );
 
         let decoded: Intents = serde_json::from_str("2147483648").unwrap();

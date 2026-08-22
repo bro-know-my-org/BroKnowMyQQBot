@@ -13,15 +13,15 @@ use bot_core::{
 };
 use futures_util::{SinkExt, StreamExt};
 use qqbot_protocol::{
-    ApiError, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
-    CreateGroupJoinStrategyRequest, CreateGuildAnnouncementRequest, CreatePanelRequest,
-    CreateScheduleRequest, GatewayPayload, GenerateShareLinkRequest, GroupMuteMemberOperation,
-    GuildApiPermissionDemandRequest, GuildMemberPageRequest, GuildMembersMuteRequest,
-    GuildMuteRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest, GuildRoleMutation,
-    InlineMediaUploadRequest, Intents, InteractionResponseRequest, ListSchedulesQuery,
-    MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse, OpCode, OpenApiClient,
-    PageRequest, PanelListRequest, ReactionEmoji, ReactionUsersRequest, RemoveGuildMemberRequest,
-    ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
+    ApiError, AudioControlRequest, AuthError, ChannelMessageRequest, CreateDirectMessageRequest,
+    CreateForumThreadRequest, CreateGroupJoinStrategyRequest, CreateGuildAnnouncementRequest,
+    CreatePanelRequest, CreateScheduleRequest, GatewayPayload, GenerateShareLinkRequest,
+    GroupMuteMemberOperation, GuildApiPermissionDemandRequest, GuildMemberPageRequest,
+    GuildMembersMuteRequest, GuildMuteRequest, GuildRoleMemberPageRequest, GuildRoleMemberRequest,
+    GuildRoleMutation, InlineMediaUploadRequest, Intents, InteractionResponseRequest,
+    ListSchedulesQuery, MediaFileType, MediaUploadRequest, MessageRequest, MessageResponse, OpCode,
+    OpenApiClient, PageRequest, PanelListRequest, ReactionEmoji, ReactionUsersRequest,
+    RemoveGuildMemberRequest, ReviewGroupJoinRequest, SetGroupMuteRequest, UpdateBotMenuRequest,
     UpdateChannelPermissionsRequest, UpdateGroupJoinStrategyRequest,
     UpdateGroupJoinStrategyWhitelistRequest, UpdatePanelRequest, UpdatePanelTargetsRequest,
     UpdateScheduleRequest,
@@ -772,6 +772,26 @@ struct UpdateChannelScheduleAction {
     request: UpdateScheduleRequest,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChannelAudioControlAction {
+    channel_id: String,
+    #[serde(flatten)]
+    request: AudioControlRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChannelThreadAction {
+    channel_id: String,
+    thread_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateChannelThreadAction {
+    channel_id: String,
+    #[serde(flatten)]
+    request: CreateForumThreadRequest,
+}
+
 impl QqActionExecutor {
     pub(crate) fn new(
         adapter_id: AdapterId,
@@ -1028,6 +1048,9 @@ impl QqActionExecutor {
             | "qq.bot.panel.target.update" => self.execute_panel_action(name, payload).await,
             _ if is_channel_content_action(name) => {
                 self.execute_channel_content_action(name, payload).await
+            }
+            _ if is_audio_forum_action(name) => {
+                self.execute_audio_forum_action(name, payload).await
             }
             "qq.interaction.respond" => {
                 reject_unknown_object_fields(
@@ -1551,6 +1574,74 @@ impl QqActionExecutor {
                 )
             }
             _ => unreachable!("schedule Action dispatcher only calls known names"),
+        }
+    }
+
+    async fn execute_audio_forum_action(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        reject_audio_forum_action_fields(name, &payload)?;
+        match name {
+            "qq.channel.audio.control" => {
+                let action: ChannelAudioControlAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.channel.audio.control",
+                    "channel",
+                    self.api
+                        .control_channel_audio(&action.channel_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.channel.mic.join" | "qq.channel.mic.leave" => {
+                let action: ChannelAction = decode_platform_payload(name, payload)?;
+                let (action_type, result) = if name == "qq.channel.mic.join" {
+                    (
+                        "qq.channel.mic.join",
+                        self.api.join_channel_mic(&action.channel_id).await,
+                    )
+                } else {
+                    (
+                        "qq.channel.mic.leave",
+                        self.api.leave_channel_mic(&action.channel_id).await,
+                    )
+                };
+                self.complete_unit_action(action_type, "channel", result)
+            }
+            "qq.channel.thread.list" => {
+                let action: ChannelAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(name, self.api.forum_threads(&action.channel_id).await)
+            }
+            "qq.channel.thread.get" => {
+                let action: ChannelThreadAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .forum_thread(&action.channel_id, &action.thread_id)
+                        .await,
+                )
+            }
+            "qq.channel.thread.create" => {
+                let action: CreateChannelThreadAction = decode_platform_payload(name, payload)?;
+                self.complete_typed_action(
+                    name,
+                    self.api
+                        .create_forum_thread(&action.channel_id, &action.request)
+                        .await,
+                )
+            }
+            "qq.channel.thread.delete" => {
+                let action: ChannelThreadAction = decode_platform_payload(name, payload)?;
+                self.complete_unit_action(
+                    "qq.channel.thread.delete",
+                    "channel",
+                    self.api
+                        .delete_forum_thread(&action.channel_id, &action.thread_id)
+                        .await,
+                )
+            }
+            _ => unreachable!("audio/forum Action dispatcher only calls known names"),
         }
     }
 
@@ -2128,6 +2219,32 @@ fn is_channel_content_action(name: &str) -> bool {
     )
 }
 
+fn is_audio_forum_action(name: &str) -> bool {
+    matches!(
+        name,
+        "qq.channel.audio.control"
+            | "qq.channel.mic.join"
+            | "qq.channel.mic.leave"
+            | "qq.channel.thread.list"
+            | "qq.channel.thread.get"
+            | "qq.channel.thread.create"
+            | "qq.channel.thread.delete"
+    )
+}
+
+fn reject_audio_forum_action_fields(name: &str, payload: &Value) -> Result<(), AdapterError> {
+    let allowed = match name {
+        "qq.channel.audio.control" => &["channel_id", "audio_url", "text", "status"][..],
+        "qq.channel.mic.join" | "qq.channel.mic.leave" | "qq.channel.thread.list" => {
+            &["channel_id"]
+        }
+        "qq.channel.thread.get" | "qq.channel.thread.delete" => &["channel_id", "thread_id"],
+        "qq.channel.thread.create" => &["channel_id", "title", "content", "format"],
+        _ => unreachable!("audio/forum Action field checker only calls known names"),
+    };
+    reject_unknown_object_fields(name, "payload", payload, allowed)
+}
+
 fn reject_channel_content_action_fields(name: &str, payload: &Value) -> Result<(), AdapterError> {
     let allowed = match name {
         "qq.guild.announce.create" => &[
@@ -2329,19 +2446,21 @@ impl From<&bot_core::CommonMessage> for MessageLog {
 
 fn map_action_error(error: &ApiError) -> AdapterError {
     match error {
-        ApiError::Request(_) | ApiError::Decode(_) => {
-            AdapterError::ActionUnknown(error.to_string())
-        }
+        ApiError::Request(_)
+        | ApiError::Decode(_)
+        | ApiError::ResponseTooLarge
+        | ApiError::InvalidForumResponse(_) => AdapterError::ActionUnknown(error.to_string()),
         ApiError::Authentication(_)
         | ApiError::HttpStatus { .. }
         | ApiError::Platform { .. }
-        | ApiError::ResponseTooLarge
         | ApiError::InvalidChannelPermissionRequest(_)
         | ApiError::InvalidGuildControlRequest(_)
         | ApiError::InvalidGuildRequest(_)
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
         | ApiError::InvalidChannelContentRequest(_)
+        | ApiError::InvalidAudioRequest(_)
+        | ApiError::InvalidForumRequest(_)
         | ApiError::InvalidInteractionRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_)
@@ -2653,6 +2772,8 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::InvalidMenuRequest(_)
         | ApiError::InvalidPanelRequest(_)
         | ApiError::InvalidChannelContentRequest(_)
+        | ApiError::InvalidAudioRequest(_)
+        | ApiError::InvalidForumRequest(_)
         | ApiError::InvalidInteractionRequest(_)
         | ApiError::InvalidReactionRequest(_)
         | ApiError::InvalidShareLinkRequest(_) => true,
@@ -2662,7 +2783,8 @@ fn is_fatal_api_error(error: &ApiError) -> bool {
         | ApiError::Request(_)
         | ApiError::Platform { .. }
         | ApiError::ResponseTooLarge
-        | ApiError::Decode(_) => false,
+        | ApiError::Decode(_)
+        | ApiError::InvalidForumResponse(_) => false,
     }
 }
 

@@ -301,6 +301,18 @@ fn configured_qq_intents(config: &BotConfig) -> Intents {
             | Intents::INTERACTION
             | Intents::MESSAGE_AUDIT;
     }
+    if config.qq.forum_events {
+        intents = intents.with_forums();
+    }
+    if config.qq.audio_events {
+        intents = intents.with_audio_actions();
+    }
+    if config.qq.open_forum_events {
+        intents = intents.with_open_forums();
+    }
+    if config.qq.audio_live_member_events {
+        intents = intents.with_audio_live_members();
+    }
     intents
 }
 
@@ -411,5 +423,39 @@ mod tests {
 
         let extended: BotConfig = toml::from_str("[qq]\nextended_events = true").unwrap();
         assert!(!configured_qq_intents(&extended).contains(Intents::GUILD_MESSAGES));
+    }
+
+    #[test]
+    fn special_audio_and_forum_intents_require_independent_switches() {
+        let default = configured_qq_intents(&BotConfig::default());
+        for intent in [
+            Intents::FORUMS_EVENT,
+            Intents::AUDIO_ACTION,
+            Intents::OPEN_FORUMS_EVENT,
+            Intents::AUDIO_OR_LIVE_CHANNEL_MEMBER,
+        ] {
+            assert!(!default.contains(intent));
+        }
+
+        let special_intents = Intents::FORUMS_EVENT
+            | Intents::AUDIO_ACTION
+            | Intents::OPEN_FORUMS_EVENT
+            | Intents::AUDIO_OR_LIVE_CHANNEL_MEMBER;
+        for (key, expected) in [
+            ("forum_events", Intents::FORUMS_EVENT),
+            ("audio_events", Intents::AUDIO_ACTION),
+            ("open_forum_events", Intents::OPEN_FORUMS_EVENT),
+            (
+                "audio_live_member_events",
+                Intents::AUDIO_OR_LIVE_CHANNEL_MEMBER,
+            ),
+        ] {
+            let config: BotConfig = toml::from_str(&format!("[qq]\n{key}=true")).unwrap();
+            assert_eq!(configured_qq_intents(&config) & special_intents, expected);
+        }
+
+        let extended: BotConfig = toml::from_str("[qq]\nextended_events=true").unwrap();
+        let intents = configured_qq_intents(&extended);
+        assert!(!intents.intersects(special_intents));
     }
 }

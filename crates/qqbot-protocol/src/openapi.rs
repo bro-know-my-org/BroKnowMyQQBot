@@ -8,10 +8,15 @@ use thiserror::Error;
 use url::Url;
 
 use crate::{
+    audio::{AudioControlRequest, AudioValidationError},
     auth::{AuthError, TokenManager},
     channel_content::{
         ChannelContentValidationError, CreateGuildAnnouncementRequest, CreateScheduleRequest,
         GuildAnnouncement, ListSchedulesQuery, PinsMessage, Schedule, UpdateScheduleRequest,
+    },
+    forum::{
+        CreateForumThreadRequest, ForumPublishTask, ForumThreadDetail, ForumThreadList,
+        ForumValidationError,
     },
     gateway::{Gateway, GatewayBot},
     group::{
@@ -117,6 +122,12 @@ pub enum ApiError {
     InvalidPanelRequest(#[source] PanelValidationError),
     #[error("invalid QQ channel-content request: {0}")]
     InvalidChannelContentRequest(#[source] ChannelContentValidationError),
+    #[error("invalid QQ audio request: {0}")]
+    InvalidAudioRequest(#[source] AudioValidationError),
+    #[error("invalid QQ forum request: {0}")]
+    InvalidForumRequest(#[source] ForumValidationError),
+    #[error("invalid QQ forum response: {0}")]
+    InvalidForumResponse(#[source] ForumValidationError),
 }
 
 /// Authenticated QQ `OpenAPI` client.
@@ -403,6 +414,80 @@ impl OpenApiClient {
         validate_path_id("channel_id", channel_id)?;
         validate_path_id("schedule_id", schedule_id)?;
         let url = self.endpoint(&["channels", channel_id, "schedules", schedule_id])?;
+        self.delete(url).await
+    }
+
+    pub async fn control_channel_audio(
+        &self,
+        channel_id: &str,
+        request: &AudioControlRequest,
+    ) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        request.validate().map_err(ApiError::InvalidAudioRequest)?;
+        let url = self.endpoint(&["channels", channel_id, "audio"])?;
+        self.post_json_unit(url, request).await
+    }
+
+    pub async fn join_channel_mic(&self, channel_id: &str) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        let url = self.endpoint(&["channels", channel_id, "mic"])?;
+        self.put(url).await
+    }
+
+    pub async fn leave_channel_mic(&self, channel_id: &str) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        let url = self.endpoint(&["channels", channel_id, "mic"])?;
+        self.delete(url).await
+    }
+
+    pub async fn forum_threads(&self, channel_id: &str) -> Result<ForumThreadList, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        let url = self.endpoint(&["channels", channel_id, "threads"])?;
+        let response: ForumThreadList = self.get_json(url).await?;
+        response
+            .validate()
+            .map_err(ApiError::InvalidForumResponse)?;
+        Ok(response)
+    }
+
+    pub async fn forum_thread(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+    ) -> Result<ForumThreadDetail, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("thread_id", thread_id)?;
+        let url = self.endpoint(&["channels", channel_id, "threads", thread_id])?;
+        let response: ForumThreadDetail = self.get_json(url).await?;
+        response
+            .validate()
+            .map_err(ApiError::InvalidForumResponse)?;
+        Ok(response)
+    }
+
+    pub async fn create_forum_thread(
+        &self,
+        channel_id: &str,
+        request: &CreateForumThreadRequest,
+    ) -> Result<ForumPublishTask, ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        request.validate().map_err(ApiError::InvalidForumRequest)?;
+        let url = self.endpoint(&["channels", channel_id, "threads"])?;
+        let response: ForumPublishTask = self.put_json_once(url, request).await?;
+        response
+            .validate()
+            .map_err(ApiError::InvalidForumResponse)?;
+        Ok(response)
+    }
+
+    pub async fn delete_forum_thread(
+        &self,
+        channel_id: &str,
+        thread_id: &str,
+    ) -> Result<(), ApiError> {
+        validate_path_id("channel_id", channel_id)?;
+        validate_path_id("thread_id", thread_id)?;
+        let url = self.endpoint(&["channels", channel_id, "threads", thread_id])?;
         self.delete(url).await
     }
 
@@ -1161,6 +1246,28 @@ impl OpenApiClient {
             .send_authorized(|token| self.client.put(url.clone()).qqbot_token(token).json(body))
             .await?;
         Self::decode_unit(response).await
+    }
+
+    async fn put_json_once<T, B>(&self, url: Url, body: &B) -> Result<T, ApiError>
+    where
+        T: DeserializeOwned,
+        B: Serialize + ?Sized,
+    {
+        let token = self.tokens.access_token().await?;
+        let response = self
+            .single_send_client
+            .put(url)
+            .qqbot_token(token.expose())
+            .json(body)
+            .send()
+            .await
+            .map_err(ApiError::Request)?;
+        let unauthorized = response.status() == StatusCode::UNAUTHORIZED;
+        let result = Self::decode(response).await;
+        if unauthorized && self.tokens.refresh_if_current(&token).await.is_err() {
+            self.tokens.invalidate_if_current(&token).await;
+        }
+        result
     }
 
     async fn put_json_unit_once<B>(&self, url: Url, body: &B) -> Result<(), ApiError>

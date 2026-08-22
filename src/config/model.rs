@@ -26,6 +26,10 @@ pub(crate) struct QqConfig {
     pub(crate) private_guild_messages: bool,
     pub(crate) direct_messages: bool,
     pub(crate) extended_events: QqExtendedEvents,
+    pub(crate) forum_events: bool,
+    pub(crate) audio_events: bool,
+    pub(crate) open_forum_events: bool,
+    pub(crate) audio_live_member_events: bool,
     pub(crate) check_only: bool,
     pub(crate) webhook: QqWebhookConfig,
 }
@@ -40,6 +44,10 @@ impl Default for QqConfig {
             private_guild_messages: false,
             direct_messages: false,
             extended_events: QqExtendedEvents::default(),
+            forum_events: false,
+            audio_events: false,
+            open_forum_events: false,
+            audio_live_member_events: false,
             check_only: false,
             webhook: QqWebhookConfig::default(),
         }

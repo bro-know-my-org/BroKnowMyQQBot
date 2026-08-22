@@ -2,8 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod audio;
 pub mod auth;
 pub mod channel_content;
+pub mod forum;
 pub mod gateway;
 pub mod group;
 pub mod guild;
@@ -17,12 +19,22 @@ pub mod panel;
 pub mod profile;
 pub mod reaction;
 
+pub use audio::{
+    AudioActionEvent, AudioControlRequest, AudioOrLiveChannelMemberEvent, AudioOrLiveChannelType,
+    AudioStatus, AudioValidationError,
+};
 pub use auth::{AccessToken, AuthError, TokenManager};
 pub use channel_content::{
     AnnouncementType, ChannelContentValidationError, CreateGuildAnnouncementRequest,
     CreateSchedule, CreateScheduleRequest, EpochMillis, GuildAnnouncement, ListSchedulesQuery,
     PinsMessage, RecommendChannel, Schedule, ScheduleRemindType, UpdateSchedule,
     UpdateScheduleRequest,
+};
+pub use forum::{
+    CreateForumThreadRequest, ForumAuditResult, ForumAuditType, ForumContent, ForumCreateTime,
+    ForumFormat, ForumListFinish, ForumPostEvent, ForumPostInfo, ForumPublishAuditEvent,
+    ForumPublishTask, ForumReplyEvent, ForumReplyInfo, ForumThread, ForumThreadDetail,
+    ForumThreadInfo, ForumThreadList, ForumValidationError, OpenForumEvent,
 };
 pub use gateway::{Gateway, GatewayBot, GatewayPayload, Intents, OpCode, SessionStartLimit};
 pub use group::{

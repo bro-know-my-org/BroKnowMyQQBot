@@ -7,10 +7,12 @@ use bot_core::{
 };
 use chrono::{DateTime, Utc};
 use qqbot_protocol::{
-    ChannelEvent, GatewayPayload, GroupJoinRequestEvent, GroupMemberEvent,
-    GroupMemberEventValidationError, GuildDispatchValidationError, GuildEvent, GuildMemberEvent,
-    InteractionEvent, InteractionValidationError, MessageAuditEvent, MessageAuditOutcome,
-    MessageDeleteEvent, MessageReactionEvent, NoticeValidationError, QqMessage,
+    AudioActionEvent, AudioOrLiveChannelMemberEvent, AudioValidationError, ChannelEvent,
+    ForumPostEvent, ForumPublishAuditEvent, ForumReplyEvent, ForumThread, ForumValidationError,
+    GatewayPayload, GroupJoinRequestEvent, GroupMemberEvent, GroupMemberEventValidationError,
+    GuildDispatchValidationError, GuildEvent, GuildMemberEvent, InteractionEvent,
+    InteractionValidationError, MessageAuditEvent, MessageAuditOutcome, MessageDeleteEvent,
+    MessageReactionEvent, NoticeValidationError, OpenForumEvent, QqMessage,
     ReactionValidationError, SubscribeMessageStatusEvent,
 };
 use serde::Deserialize as _;
@@ -98,6 +100,18 @@ pub(crate) enum MappingError {
         event_type: String,
         #[source]
         source: NoticeValidationError,
+    },
+    #[error("QQ audio dispatch `{event_type}` contains invalid data")]
+    InvalidAudio {
+        event_type: String,
+        #[source]
+        source: AudioValidationError,
+    },
+    #[error("QQ forum dispatch `{event_type}` contains invalid data")]
+    InvalidForum {
+        event_type: String,
+        #[source]
+        source: ForumValidationError,
     },
 }
 
@@ -231,6 +245,29 @@ fn map_typed_notice(
         "MESSAGE_AUDIT_PASS" | "MESSAGE_AUDIT_REJECT" => {
             Some(map_message_audit(adapter, payload, event_type))
         }
+        "AUDIO_START" | "AUDIO_FINISH" | "AUDIO_ON_MIC" | "AUDIO_OFF_MIC" => {
+            Some(map_audio_event(adapter, payload, event_type))
+        }
+        "FORUM_THREAD_CREATE" | "FORUM_THREAD_UPDATE" | "FORUM_THREAD_DELETE" => {
+            Some(map_forum_thread_event(adapter, payload, event_type))
+        }
+        "FORUM_POST_CREATE" | "FORUM_POST_DELETE" => {
+            Some(map_forum_post_event(adapter, payload, event_type))
+        }
+        "FORUM_REPLY_CREATE" | "FORUM_REPLY_DELETE" => {
+            Some(map_forum_reply_event(adapter, payload, event_type))
+        }
+        "FORUM_PUBLISH_AUDIT_RESULT" => Some(map_forum_audit_event(adapter, payload, event_type)),
+        "OPEN_FORUM_THREAD_CREATE"
+        | "OPEN_FORUM_THREAD_UPDATE"
+        | "OPEN_FORUM_THREAD_DELETE"
+        | "OPEN_FORUM_POST_CREATE"
+        | "OPEN_FORUM_POST_DELETE"
+        | "OPEN_FORUM_REPLY_CREATE"
+        | "OPEN_FORUM_REPLY_DELETE" => Some(map_open_forum_event(adapter, payload, event_type)),
+        "AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER" | "AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT" => {
+            Some(map_audio_live_member_event(adapter, payload, event_type))
+        }
         _ if NOTICE_EVENTS.contains(&event_type) => Some(map_structured_event(
             adapter,
             payload,
@@ -240,6 +277,166 @@ fn map_typed_notice(
         )),
         _ => None,
     }
+}
+
+fn map_audio_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        AudioActionEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidAudio {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_structured_event(adapter, payload, event_type, None, Event::Notice)
+}
+
+fn map_audio_live_member_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = AudioOrLiveChannelMemberEvent::deserialize(&payload.d).map_err(|source| {
+        MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        }
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidAudio {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_structured_event(adapter, payload, event_type, None, Event::Notice)
+}
+
+fn map_open_forum_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = OpenForumEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+        event_type: event_type.to_owned(),
+        source,
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidForum {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_structured_event(adapter, payload, event_type, None, Event::Notice)
+}
+
+fn map_forum_thread_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = ForumThread::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+        event_type: event_type.to_owned(),
+        source,
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidForum {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_forum_with_timestamp(adapter, payload, event_type, &event.thread_info.date_time)
+}
+
+fn map_forum_post_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event = ForumPostEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+        event_type: event_type.to_owned(),
+        source,
+    })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidForum {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_forum_with_timestamp(adapter, payload, event_type, &event.post_info.date_time)
+}
+
+fn map_forum_reply_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        ForumReplyEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidForum {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    map_forum_with_timestamp(adapter, payload, event_type, &event.reply_info.date_time)
+}
+
+fn map_forum_audit_event(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let event =
+        ForumPublishAuditEvent::deserialize(&payload.d).map_err(|source| MappingError::Decode {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    event
+        .validate()
+        .map_err(|source| MappingError::InvalidForum {
+            event_type: event_type.to_owned(),
+            source,
+        })?;
+    let mut envelope = map_structured_event(adapter, payload, event_type, None, Event::Notice)?;
+    envelope.timestamp = event
+        .date_time
+        .as_deref()
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|source| MappingError::InvalidTimestamp {
+            event_type: event_type.to_owned(),
+            source,
+        })?
+        .map(|value| value.with_timezone(&Utc));
+    Ok(envelope)
+}
+
+fn map_forum_with_timestamp(
+    adapter: &AdapterId,
+    payload: &GatewayPayload,
+    event_type: &str,
+    date_time: &str,
+) -> Result<EventEnvelope, MappingError> {
+    let mut envelope = map_structured_event(adapter, payload, event_type, None, Event::Notice)?;
+    envelope.timestamp = Some(
+        DateTime::parse_from_rfc3339(date_time)
+            .map_err(|source| MappingError::InvalidTimestamp {
+                event_type: event_type.to_owned(),
+                source,
+            })?
+            .with_timezone(&Utc),
+    );
+    Ok(envelope)
 }
 
 fn map_message_delete(

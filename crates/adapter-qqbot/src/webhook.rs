@@ -746,10 +746,11 @@ fn callback_error(status: StatusCode, message: &'static str) -> Response {
 #[cfg(test)]
 mod tests {
     use axum::http::{Request, StatusCode};
-    use bot_core::{Adapter as _, EventSender, RuntimeObserver};
+    use bot_core::{Adapter as _, Event, EventSender, RuntimeObserver};
     use ed25519_dalek::Signer as _;
     use secrecy::SecretString;
     use serde_json::{Value, json};
+    use tokio::sync::mpsc::error::TryRecvError;
     use tower::ServiceExt as _;
 
     use super::{
@@ -795,6 +796,88 @@ mod tests {
             api,
         )
         .unwrap()
+    }
+
+    fn audio_forum_payloads() -> Vec<(&'static str, Value)> {
+        let audio = json!({
+            "guild_id":"guild-id","channel_id":"channel-id",
+            "audio_url":"https://example.com/audio.mp3","text":"playing"
+        });
+        let thread = json!({
+            "guild_id":"guild-id","channel_id":"channel-id","author_id":"author-id",
+            "thread_info":{
+                "thread_id":"thread-id","title":"title","content":{"paragraphs":[]},
+                "date_time":"2026-08-22T10:00:00+08:00"
+            }
+        });
+        let post = json!({
+            "guild_id":"guild-id","channel_id":"channel-id","author_id":"author-id",
+            "post_info":{
+                "thread_id":"thread-id","post_id":"post-id","content":[],
+                "date_time":"2026-08-22T10:01:00+08:00"
+            }
+        });
+        let reply = json!({
+            "guild_id":"guild-id","channel_id":"channel-id","author_id":"author-id",
+            "reply_info":{
+                "thread_id":"thread-id","post_id":"post-id","reply_id":"reply-id",
+                "content":"{\"paragraphs\":[]}","date_time":"2026-08-22T10:02:00+08:00"
+            }
+        });
+        let forum_audit = json!({
+            "guild_id":"guild-id","channel_id":"channel-id","author_id":"author-id",
+            "thread_id":"thread-id","post_id":"","reply_id":"",
+            "type":1,"result":0,"err_msg":"","task_id":"task-id"
+        });
+        let open_forum = json!({
+            "guild_id":"guild-id","channel_id":"channel-id","author_id":"author-id"
+        });
+        let member = json!({
+            "guild_id":"guild-id","channel_id":"channel-id","channel_type":2,
+            "user_id":"user-id"
+        });
+        vec![
+            ("AUDIO_START", audio.clone()),
+            ("AUDIO_FINISH", audio.clone()),
+            ("AUDIO_ON_MIC", audio.clone()),
+            ("AUDIO_OFF_MIC", audio),
+            ("FORUM_THREAD_CREATE", thread.clone()),
+            ("FORUM_THREAD_UPDATE", thread.clone()),
+            ("FORUM_THREAD_DELETE", thread),
+            ("FORUM_POST_CREATE", post.clone()),
+            ("FORUM_POST_DELETE", post),
+            ("FORUM_REPLY_CREATE", reply.clone()),
+            ("FORUM_REPLY_DELETE", reply),
+            ("FORUM_PUBLISH_AUDIT_RESULT", forum_audit),
+            ("OPEN_FORUM_THREAD_CREATE", open_forum.clone()),
+            ("OPEN_FORUM_THREAD_UPDATE", open_forum.clone()),
+            ("OPEN_FORUM_THREAD_DELETE", open_forum.clone()),
+            ("OPEN_FORUM_POST_CREATE", open_forum.clone()),
+            ("OPEN_FORUM_POST_DELETE", open_forum.clone()),
+            ("OPEN_FORUM_REPLY_CREATE", open_forum.clone()),
+            ("OPEN_FORUM_REPLY_DELETE", open_forum),
+            ("AUDIO_OR_LIVE_CHANNEL_MEMBER_ENTER", member.clone()),
+            ("AUDIO_OR_LIVE_CHANNEL_MEMBER_EXIT", member),
+        ]
+    }
+
+    fn invalid_audio_forum_payloads() -> [(&'static str, Value); 2] {
+        [
+            (
+                "AUDIO_START",
+                json!({"guild_id":"","channel_id":"channel-id"}),
+            ),
+            (
+                "FORUM_THREAD_CREATE",
+                json!({
+                    "guild_id":"guild-id","channel_id":"channel-id","author_id":"author-id",
+                    "thread_info":{
+                        "thread_id":"thread-id","title":"title","content":"content",
+                        "date_time":"not-a-timestamp"
+                    }
+                }),
+            ),
+        ]
     }
 
     #[test]
@@ -879,7 +962,7 @@ mod tests {
             assert_eq!(ack, json!({"op": 12, "d": 0}));
         }
         assert_eq!(received.recv().await.unwrap().id.as_str(), "event-id");
-        assert!(received.try_recv().is_err());
+        assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[tokio::test]
@@ -929,7 +1012,7 @@ mod tests {
             }
             assert_eq!(received.recv().await.unwrap().id.as_str(), interaction_id);
         }
-        assert!(received.try_recv().is_err());
+        assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[tokio::test]
@@ -1002,6 +1085,11 @@ mod tests {
                 .oneshot(signed_request(&payload))
                 .await
                 .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "event {event_type} should return HTTP success"
+            );
             let body = axum::body::to_bytes(response.into_body(), 4096)
                 .await
                 .unwrap();
@@ -1027,6 +1115,112 @@ mod tests {
             ]
             .map(Value::from)
         );
+    }
+
+    #[tokio::test]
+    async fn accepts_all_audio_and_forum_events_through_webhook() {
+        let adapter = adapter();
+        let (events, mut received) = tokio::sync::mpsc::channel(32);
+        let (terminal_error, _terminal_failure) = tokio::sync::oneshot::channel();
+        adapter
+            .state
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active = Some(ActiveWebhookRun {
+            generation: 1,
+            events: EventSender::new(events, adapter.id().clone(), RuntimeObserver::new()).unwrap(),
+            terminal_error: Some(terminal_error),
+        });
+
+        let payloads = audio_forum_payloads();
+
+        for (sequence, (event_type, data)) in payloads.iter().enumerate() {
+            let payload = json!({
+                "id":format!("audio-forum-{sequence}"),
+                "op":0,
+                "d":data,
+                "s":sequence,
+                "t":event_type
+            });
+            let response = adapter
+                .router()
+                .oneshot(signed_request(&payload))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "event {event_type} should return HTTP success"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"op":12,"d":0}),
+                "event {event_type} should be accepted"
+            );
+        }
+
+        for (event_type, _) in &payloads {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for event {event_type}"))
+                .unwrap_or_else(|| panic!("event channel closed before {event_type}"));
+            assert_eq!(event.raw["t"], *event_type);
+            let Event::Notice(body) = &event.event else {
+                panic!("event {event_type} should be delivered as a notice");
+            };
+            assert_eq!(body["type"], *event_type);
+            assert_eq!(body["data"], event.raw["d"]);
+            let expected_timestamp = match *event_type {
+                "FORUM_THREAD_CREATE" | "FORUM_THREAD_UPDATE" | "FORUM_THREAD_DELETE" => {
+                    Some("2026-08-22T02:00:00+00:00")
+                }
+                "FORUM_POST_CREATE" | "FORUM_POST_DELETE" => Some("2026-08-22T02:01:00+00:00"),
+                "FORUM_REPLY_CREATE" | "FORUM_REPLY_DELETE" => Some("2026-08-22T02:02:00+00:00"),
+                _ => None,
+            };
+            if let Some(expected_timestamp) = expected_timestamp {
+                assert_eq!(
+                    event.timestamp.as_ref().map(chrono::DateTime::to_rfc3339),
+                    Some(expected_timestamp.to_owned()),
+                    "event {event_type} needs its exact forum timestamp"
+                );
+            } else {
+                assert!(
+                    event.timestamp.is_none(),
+                    "event {event_type} must not invent a timestamp"
+                );
+            }
+        }
+
+        for (sequence, (event_type, data)) in invalid_audio_forum_payloads().into_iter().enumerate()
+        {
+            let payload = json!({
+                "id":format!("invalid-audio-forum-{sequence}"),
+                "op":0,"d":data,"s":100 + sequence,"t":event_type
+            });
+            let response = adapter
+                .router()
+                .oneshot(signed_request(&payload))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "invalid event {event_type} should still return an ACK"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&body).unwrap(),
+                json!({"op":12,"d":1})
+            );
+        }
+        assert!(matches!(received.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[tokio::test]
