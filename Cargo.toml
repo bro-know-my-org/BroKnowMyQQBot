@@ -69,6 +69,7 @@ zstd.workspace = true
 [dev-dependencies]
 
 [build-dependencies]
+chrono.workspace = true
 serde_json.workspace = true
 
 [lints]

@@ -11,6 +11,7 @@ mod management;
 mod plugin_dev;
 mod plugin_marketplace;
 mod plugins;
+mod version;
 
 use std::process::ExitCode;
 

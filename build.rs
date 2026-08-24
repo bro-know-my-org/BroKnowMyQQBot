@@ -1,6 +1,13 @@
-use std::{env, fs, process::Command};
+use std::{
+    env, fs,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use chrono::{DateTime, Utc};
 
 fn main() {
+    emit_build_date();
     println!("cargo:rerun-if-env-changed=BKMQB_GIT_REV");
     println!("cargo:rerun-if-env-changed=BKMQB_GIT_REPOSITORY");
     let provenance = match env::var("BKMQB_GIT_REV") {
@@ -32,6 +39,30 @@ fn main() {
         println!("cargo:rustc-env=BKMQB_GIT_REV={revision}");
         println!("cargo:rustc-env=BKMQB_GIT_REPOSITORY={repository}");
     }
+}
+
+fn emit_build_date() {
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    let epoch_seconds = match env::var("SOURCE_DATE_EPOCH") {
+        Ok(value) => value
+            .parse::<i64>()
+            .unwrap_or_else(|_| panic!("SOURCE_DATE_EPOCH must be a Unix timestamp")),
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("SOURCE_DATE_EPOCH must be a Unix timestamp")
+        }
+        Err(env::VarError::NotPresent) => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the system clock must not be before the Unix epoch")
+            .as_secs()
+            .try_into()
+            .expect("the build timestamp must fit in i64"),
+    };
+    let build_time = DateTime::<Utc>::from_timestamp(epoch_seconds, 0)
+        .unwrap_or_else(|| panic!("SOURCE_DATE_EPOCH is outside the supported date range"));
+    println!(
+        "cargo:rustc-env=BKMQB_BUILD_DATE={}",
+        build_time.format("%Y-%m-%d")
+    );
 }
 
 fn watch_git_metadata() {

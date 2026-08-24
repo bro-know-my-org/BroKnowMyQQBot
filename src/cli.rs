@@ -24,7 +24,7 @@ use crate::{
     config::BotConfig,
     plugin_dev,
     plugin_marketplace::{MarketplaceClient, MarketplacePlugin, validate_selector},
-    plugins,
+    plugins, version,
 };
 
 const MAX_PLUGIN_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
@@ -47,7 +47,7 @@ pub(crate) async fn run(arguments: Vec<String>) -> Result<RunOutcome, Box<dyn st
             require_argument_count(&arguments, 1, "bkmqb run")?;
             return Ok(RunOutcome::StartBot);
         }
-        "version" | "--version" | "-V" => println!("bkmqb {}", env!("CARGO_PKG_VERSION")),
+        "version" | "--version" | "-V" => println!("{}", version::display()),
         "config" => run_config(&arguments[1..])?,
         "browser" => browser::run(&arguments[1..]).await?,
         "plugin" => run_plugin(&arguments[1..]).await?,

@@ -17,6 +17,7 @@ use crate::{
     config::{self, BotConfig, ManagementConfig, load_secret_environment},
     logging, management,
     plugins::load_plugins,
+    version,
 };
 use adapter_onebot11::{OneBot11Adapter, OneBot11Config};
 use adapter_qqbot::{QqWebSocketAdapter, QqWebSocketConfig, QqWebhookAdapter, QqWebhookConfig};
@@ -135,6 +136,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     }
     let runtime = runtime_builder.build()?;
     info!(
+        version = %version::display(),
         qq_enabled = config.qq.enabled,
         onebot11_enabled = config.onebot11.enabled,
         "starting BroKnowMyQQBot adapters"
