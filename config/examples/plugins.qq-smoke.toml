@@ -10,4 +10,9 @@ bundled = [
     "scheduler-probe",
     "qq-extension-probe",
     "active-send-probe",
+    "devtools",
 ]
+
+# Replace with the stable sender ID allowed to run privileged diagnostics.
+[bundled_config.devtools]
+owners = ["replace-with-qq-sender-id"]

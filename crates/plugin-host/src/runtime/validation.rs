@@ -210,6 +210,10 @@ pub(super) fn validate_output(
     }
     let mut command_ids = HashSet::new();
     for command in &output.commands {
+        let trusted_platform_query = plugin
+            .trusted_platform_queries
+            .iter()
+            .any(|query| query.action_name() == command.kind);
         if !matches!(
             command.kind.as_str(),
             "message.reply"
@@ -220,7 +224,8 @@ pub(super) fn validate_output(
                 | "browser.run"
                 | "schedule.create"
                 | "schedule.cancel"
-        ) {
+        ) && !trusted_platform_query
+        {
             return Err(invalid(format!(
                 "command kind `{}` is not part of the supported BPP baseline",
                 command.kind
@@ -235,7 +240,7 @@ pub(super) fn validate_output(
                 command.command_id
             )));
         }
-        if !plugin.granted_capabilities.contains(&command.kind) {
+        if !trusted_platform_query && !plugin.granted_capabilities.contains(&command.kind) {
             return Err(invalid(format!(
                 "capability `{}` is not granted",
                 command.kind

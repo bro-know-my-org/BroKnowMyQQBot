@@ -117,6 +117,44 @@ pub enum PluginInstanceState {
     Stopped,
 }
 
+/// Host-only capabilities available to trusted in-process static plugins.
+///
+/// These capabilities are deliberately outside BPP and are never derived from
+/// a plugin Manifest or administrator grants. Callers must enumerate each
+/// read-only platform Action that the trusted plugin may execute.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrustedPluginCapabilities {
+    platform_queries: BTreeSet<TrustedPlatformQuery>,
+}
+
+impl TrustedPluginCapabilities {
+    #[must_use]
+    pub fn with_platform_query(mut self, query: TrustedPlatformQuery) -> Self {
+        self.platform_queries.insert(query);
+        self
+    }
+}
+
+/// Closed set of read-only platform Actions exposed to trusted static plugins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TrustedPlatformQuery {
+    QqGuildApiPermissionList,
+}
+
+impl TrustedPlatformQuery {
+    const fn action_name(self) -> &'static str {
+        match self {
+            Self::QqGuildApiPermissionList => "qq.guild.api-permission.list",
+        }
+    }
+
+    const fn platform(self) -> &'static str {
+        match self {
+            Self::QqGuildApiPermissionList => "qq.official",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StaticPluginHost {
     name: String,
@@ -190,6 +228,24 @@ impl StaticPluginHost {
         config: BTreeMap<String, Value>,
         administrator_grants: BTreeSet<String>,
     ) -> Result<(), PluginHostError> {
+        self.register_with_trusted_capabilities(
+            plugin,
+            instance_id,
+            config,
+            administrator_grants,
+            TrustedPluginCapabilities::default(),
+        )
+        .await
+    }
+
+    async fn register_with_trusted_capabilities(
+        &mut self,
+        plugin: Arc<dyn StaticPlugin>,
+        instance_id: impl Into<String>,
+        config: BTreeMap<String, Value>,
+        administrator_grants: BTreeSet<String>,
+        trusted_capabilities: TrustedPluginCapabilities,
+    ) -> Result<(), PluginHostError> {
         let instance_id = instance_id.into();
         let manifest = plugin.manifest().clone();
         manifest
@@ -219,6 +275,7 @@ impl StaticPluginHost {
             instance_id,
             config: StdMutex::new(config.clone()),
             granted_capabilities,
+            trusted_platform_queries: trusted_capabilities.platform_queries,
             execution,
             state: StdMutex::new(LifecycleState {
                 state: PluginInstanceState::Draining,
@@ -257,6 +314,26 @@ impl StaticPluginHost {
     ) -> Result<(), PluginHostError> {
         let grants = requested_capabilities(plugin.manifest());
         self.register(plugin, instance_id, config, grants).await
+    }
+
+    /// Registers trusted in-process code with explicitly enumerated Host-only
+    /// capabilities that are unavailable to BPP and WASM plugins.
+    pub async fn register_trusted_with_capabilities(
+        &mut self,
+        plugin: Arc<dyn StaticPlugin>,
+        instance_id: impl Into<String>,
+        config: BTreeMap<String, Value>,
+        trusted_capabilities: TrustedPluginCapabilities,
+    ) -> Result<(), PluginHostError> {
+        let grants = requested_capabilities(plugin.manifest());
+        self.register_with_trusted_capabilities(
+            plugin,
+            instance_id,
+            config,
+            grants,
+            trusted_capabilities,
+        )
+        .await
     }
 
     pub async fn update_config(
@@ -353,17 +430,60 @@ impl StaticPluginHost {
         plugin: Arc<dyn StaticPlugin>,
         config: BTreeMap<String, Value>,
     ) -> Result<(), PluginHostError> {
-        let grants = requested_capabilities(plugin.manifest());
-        self.upgrade(instance_id, plugin, config, grants).await
+        self.upgrade_trusted_with_capabilities(
+            instance_id,
+            plugin,
+            config,
+            TrustedPluginCapabilities::default(),
+        )
+        .await
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Upgrades trusted in-process code while explicitly replacing its
+    /// Host-only capabilities. Capabilities are never inherited implicitly.
+    pub async fn upgrade_trusted_with_capabilities(
+        &mut self,
+        instance_id: &str,
+        plugin: Arc<dyn StaticPlugin>,
+        config: BTreeMap<String, Value>,
+        trusted_capabilities: TrustedPluginCapabilities,
+    ) -> Result<(), PluginHostError> {
+        let grants = requested_capabilities(plugin.manifest());
+        self.upgrade_with_trusted_capabilities(
+            instance_id,
+            plugin,
+            config,
+            grants,
+            trusted_capabilities,
+        )
+        .await
+    }
+
     pub async fn upgrade(
         &mut self,
         instance_id: &str,
         plugin: Arc<dyn StaticPlugin>,
         config: BTreeMap<String, Value>,
         administrator_grants: BTreeSet<String>,
+    ) -> Result<(), PluginHostError> {
+        self.upgrade_with_trusted_capabilities(
+            instance_id,
+            plugin,
+            config,
+            administrator_grants,
+            TrustedPluginCapabilities::default(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn upgrade_with_trusted_capabilities(
+        &mut self,
+        instance_id: &str,
+        plugin: Arc<dyn StaticPlugin>,
+        config: BTreeMap<String, Value>,
+        administrator_grants: BTreeSet<String>,
+        trusted_capabilities: TrustedPluginCapabilities,
     ) -> Result<(), PluginHostError> {
         let Some(index) = self
             .plugins
@@ -404,6 +524,7 @@ impl StaticPluginHost {
             instance_id: instance_id.to_owned(),
             config: StdMutex::new(config.clone()),
             granted_capabilities,
+            trusted_platform_queries: trusted_capabilities.platform_queries,
             execution,
             state: StdMutex::new(LifecycleState {
                 state: PluginInstanceState::Draining,
@@ -1053,6 +1174,7 @@ impl StaticPluginHost {
                         &plugin.instance_id,
                         &plugin.manifest,
                         &plugin.granted_capabilities,
+                        &plugin.trusted_platform_queries,
                         &self.adapters,
                     )
                     .await
@@ -1606,6 +1728,7 @@ struct RegisteredPlugin {
     instance_id: String,
     config: StdMutex<BTreeMap<String, Value>>,
     granted_capabilities: BTreeSet<String>,
+    trusted_platform_queries: BTreeSet<TrustedPlatformQuery>,
     execution: InvocationGate,
     state: StdMutex<LifecycleState>,
 }
@@ -1904,14 +2027,20 @@ mod tests {
 
     use super::{
         ACTION_COMPLETION_DEPTH_NAMESPACE, InvocationGate, LifecycleState, PluginHostError,
-        RegisteredPlugin, StaticPluginHost, validate_config_schema, validate_output,
-        validate_plugin_config, validation::redact_sensitive_fields,
+        RegisteredPlugin, StaticPluginHost, TrustedPlatformQuery, TrustedPluginCapabilities,
+        validate_config_schema, validate_output, validate_plugin_config,
+        validation::redact_sensitive_fields,
     };
 
     #[derive(Debug)]
     struct SchemaPlugin {
         manifest: PluginManifest,
         schema: Value,
+    }
+
+    #[derive(Debug)]
+    struct FailingInitPlugin {
+        manifest: PluginManifest,
     }
 
     #[derive(Debug)]
@@ -1990,6 +2119,25 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl StaticPlugin for FailingInitPlugin {
+        fn manifest(&self) -> &PluginManifest {
+            &self.manifest
+        }
+
+        async fn init(&self, _context: InitContext) -> Result<(), PluginError> {
+            Err(PluginError::Permanent("candidate init failed".to_owned()))
+        }
+
+        async fn on_event(
+            &self,
+            _event: &PluginEventEnvelope,
+            _queries: &dyn HostQueries,
+        ) -> Result<HandlerOutput, PluginError> {
+            Ok(HandlerOutput::default())
+        }
+    }
+
     fn schema_plugin(schema: Value) -> SchemaPlugin {
         SchemaPlugin {
             manifest: PingPlugin::default().manifest().clone(),
@@ -2007,6 +2155,7 @@ mod tests {
             instance_id: "dev.bkm.ping/test".to_owned(),
             config: StdMutex::new(BTreeMap::new()),
             granted_capabilities: BTreeSet::default(),
+            trusted_platform_queries: BTreeSet::default(),
             execution,
             state: StdMutex::new(LifecycleState::ready()),
         }
@@ -2111,6 +2260,91 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("not granted"));
+    }
+
+    #[test]
+    fn trusted_platform_queries_are_allowlisted_outside_the_bpp_baseline() {
+        let output = HandlerOutput {
+            disposition: Disposition::Continue,
+            state_ops: Vec::new(),
+            commands: vec![PluginCommand {
+                command_id: "permissions".to_owned(),
+                kind: "qq.guild.api-permission.list".to_owned(),
+                idempotency_key: None,
+                deadline_ms: None,
+                payload: json!({"guild_id":"guild-id"}),
+            }],
+            diagnostics: Vec::new(),
+        };
+        let error = validate_output(&plugin_without_grants(), &output).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not part of the supported BPP baseline")
+        );
+
+        let mut plugin = plugin_without_grants();
+        plugin
+            .trusted_platform_queries
+            .insert(TrustedPlatformQuery::QqGuildApiPermissionList);
+        validate_output(&plugin, &output).unwrap();
+    }
+
+    #[tokio::test]
+    async fn trusted_upgrade_capabilities_are_replaced_revoked_and_rolled_back() {
+        let query = TrustedPlatformQuery::QqGuildApiPermissionList;
+        let capabilities = TrustedPluginCapabilities::default().with_platform_query(query);
+        let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+        host.register_trusted_with_capabilities(
+            Arc::new(PingPlugin::default()),
+            "dev.bkm.ping/upgrade-capabilities",
+            BTreeMap::new(),
+            capabilities.clone(),
+        )
+        .await
+        .unwrap();
+
+        host.upgrade_trusted_with_capabilities(
+            "dev.bkm.ping/upgrade-capabilities",
+            Arc::new(PingPlugin::default()),
+            BTreeMap::new(),
+            capabilities.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(host.plugins[0].trusted_platform_queries.contains(&query));
+
+        host.upgrade_trusted(
+            "dev.bkm.ping/upgrade-capabilities",
+            Arc::new(PingPlugin::default()),
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(host.plugins[0].trusted_platform_queries.is_empty());
+
+        host.upgrade_trusted_with_capabilities(
+            "dev.bkm.ping/upgrade-capabilities",
+            Arc::new(PingPlugin::default()),
+            BTreeMap::new(),
+            capabilities.clone(),
+        )
+        .await
+        .unwrap();
+        let failing = FailingInitPlugin {
+            manifest: PingPlugin::default().manifest().clone(),
+        };
+        assert!(
+            host.upgrade_trusted_with_capabilities(
+                "dev.bkm.ping/upgrade-capabilities",
+                Arc::new(failing),
+                BTreeMap::new(),
+                TrustedPluginCapabilities::default(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(host.plugins[0].trusted_platform_queries.contains(&query));
     }
 
     #[test]

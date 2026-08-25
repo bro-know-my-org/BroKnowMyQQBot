@@ -13,8 +13,8 @@ use bot_core::{
     shutdown_channel,
 };
 use builtin_plugins::{
-    ActionResultProbePlugin, BrowserProbePlugin, ConfigProbePlugin, HttpProbePlugin, PingPlugin,
-    QqExtensionProbePlugin, SchedulerProbePlugin,
+    ActionResultProbePlugin, BrowserProbePlugin, ConfigProbePlugin, DevToolsPlugin,
+    HttpProbePlugin, PingPlugin, QqExtensionProbePlugin, SchedulerProbePlugin,
 };
 use plugin_api::{
     ActionCompleted, ActionStatus, BrowserPermission, BrowserRun, BrowserStep, HandlerOutput,
@@ -28,7 +28,7 @@ use plugin_fixtures::{
 use plugin_host::{
     BrowserArtifact, BrowserExecution, BrowserExecutionError, BrowserExecutor, CommitOptions,
     HttpExecutionError, HttpExecutor, PluginHostError, PluginInstanceState, PluginStore,
-    SecureHttpExecutor, StaticPluginHost,
+    SecureHttpExecutor, StaticPluginHost, TrustedPlatformQuery, TrustedPluginCapabilities,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
@@ -230,6 +230,14 @@ struct MockAdapter {
 }
 
 #[derive(Debug)]
+struct DevToolsAdapter {
+    id: AdapterId,
+    event: Mutex<Option<EventEnvelope>>,
+    actions: mpsc::Sender<Action>,
+    shutdown: ShutdownHandle,
+}
+
+#[derive(Debug)]
 struct MultiEventAdapter {
     id: AdapterId,
     events: Mutex<Vec<EventEnvelope>>,
@@ -335,6 +343,74 @@ impl Adapter for MockAdapter {
     }
 }
 
+#[async_trait]
+impl Adapter for DevToolsAdapter {
+    fn id(&self) -> &AdapterId {
+        &self.id
+    }
+
+    fn platform(&self) -> &'static str {
+        "qq.official"
+    }
+
+    async fn run(
+        &self,
+        events: bot_core::EventSender,
+        mut shutdown: ShutdownSignal,
+    ) -> Result<(), AdapterError> {
+        events.mark_ready();
+        if let Some(event) = self.event.lock().await.take() {
+            events
+                .send(event)
+                .await
+                .map_err(|_| AdapterError::EventQueueClosed)?;
+        }
+        shutdown.cancelled().await;
+        Ok(())
+    }
+
+    async fn execute(&self, action: Action) -> Result<ActionResult, AdapterError> {
+        let is_query = matches!(
+            &action,
+            Action::Platform { name, .. } if name == "qq.guild.api-permission.list"
+        );
+        let is_reply = matches!(&action, Action::Reply(_));
+        self.actions
+            .send(action)
+            .await
+            .map_err(|_| AdapterError::Action("action receiver closed".to_owned()))?;
+        if is_reply {
+            self.shutdown.shutdown();
+        }
+        if is_query {
+            Ok(ActionResult {
+                message_id: None,
+                raw: json!({
+                    "apis":[
+                        {
+                            "path":"/guilds/{guild_id}",
+                            "method":"GET",
+                            "desc":"获取频道",
+                            "auth_status":1
+                        },
+                        {
+                            "path":"/guilds/{guild_id}/channels",
+                            "method":"POST",
+                            "desc":"创建子频道",
+                            "auth_status":1
+                        }
+                    ]
+                }),
+            })
+        } else {
+            Ok(ActionResult {
+                message_id: Some("devtools-reply".to_owned()),
+                raw: Value::Null,
+            })
+        }
+    }
+}
+
 fn message_event(text: &str) -> EventEnvelope {
     EventEnvelope {
         id: EventId::new("plugin-event"),
@@ -358,6 +434,32 @@ fn message_event(text: &str) -> EventEnvelope {
         }),
         raw: json!({"test":true}),
     }
+}
+
+fn devtools_event(adapter_id: &str, sender_id: &str) -> EventEnvelope {
+    let mut event = message_event("/api-permissions");
+    event.adapter = AdapterId::new(adapter_id);
+    event.event = Event::Message(CommonMessage {
+        message_id: "source-message".to_owned(),
+        target: MessageTarget::Channel {
+            channel_id: "channel-id".to_owned(),
+        },
+        sender: Sender {
+            id: sender_id.to_owned(),
+            display_name: None,
+        },
+        text: "/api-permissions".to_owned(),
+        segments: vec![MessageSegment::Text {
+            text: "/api-permissions".to_owned(),
+        }],
+        reply_to: None,
+    });
+    event.raw = json!({
+        "op":0,
+        "t":"MESSAGE_CREATE",
+        "d":{"guild_id":"guild-id","channel_id":"channel-id"}
+    });
+    event
 }
 
 fn group_event(id: &str, group_id: &str, text: &str) -> EventEnvelope {
@@ -504,6 +606,159 @@ async fn qq_raw_extension_requires_manifest_and_administrator_grant() {
         run_qq_extension_probe(false).await,
         "qq extension unavailable"
     );
+}
+
+#[tokio::test]
+async fn devtools_executes_only_its_allowlisted_platform_query() {
+    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(DevToolsPlugin::default()),
+            "dev.bkm.devtools/test",
+            BTreeMap::from([("owners".to_owned(), json!(["user-id"]))]),
+            TrustedPluginCapabilities::default()
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
+        )
+        .await
+        .unwrap();
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (action_sender, mut actions) = mpsc::channel(2);
+    let adapter = Arc::new(DevToolsAdapter {
+        id: AdapterId::new("qq-devtools"),
+        event: Mutex::new(Some(devtools_event("qq-devtools", "user-id"))),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+    });
+    let runtime = RuntimeBuilder::new()
+        .adapter(adapter)
+        .handler(Arc::new(plugins))
+        .build()
+        .unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.run(shutdown_signal),
+    )
+    .await
+    .expect("DevTools runtime should complete before the timeout")
+    .unwrap();
+    let Action::Platform { name, payload } = actions.recv().await.unwrap() else {
+        panic!("expected platform query");
+    };
+    assert_eq!(name, "qq.guild.api-permission.list");
+    assert_eq!(payload, json!({"guild_id":"guild-id"}));
+    let Action::Reply(reply) = actions.recv().await.unwrap() else {
+        panic!("expected API permission reply");
+    };
+    assert!(reply.content.starts_with("API permissions: 2 total"));
+    assert!(
+        reply
+            .content
+            .contains("[1] POST /guilds/{guild_id}/channels — 创建子频道")
+    );
+    assert!(reply.content.len() < 600);
+}
+
+#[tokio::test]
+async fn devtools_owner_configuration_fails_closed() {
+    for config in [
+        BTreeMap::new(),
+        BTreeMap::from([("owners".to_owned(), json!([]))]),
+        BTreeMap::from([("owners".to_owned(), json!("owner-id"))]),
+        BTreeMap::from([("owners".to_owned(), json!(["owner-id", "owner-id"]))]),
+    ] {
+        let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+        assert!(
+            plugins
+                .register_trusted_with_capabilities(
+                    Arc::new(DevToolsPlugin::default()),
+                    "dev.bkm.devtools/invalid-config",
+                    config,
+                    TrustedPluginCapabilities::default()
+                        .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
+                )
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn devtools_non_owner_never_reaches_platform_action() {
+    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(DevToolsPlugin::default()),
+            "dev.bkm.devtools/non-owner",
+            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+            TrustedPluginCapabilities::default()
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
+        )
+        .await
+        .unwrap();
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (action_sender, mut actions) = mpsc::channel(2);
+    let adapter = Arc::new(DevToolsAdapter {
+        id: AdapterId::new("qq-devtools-non-owner"),
+        event: Mutex::new(Some(devtools_event("qq-devtools-non-owner", "intruder-id"))),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+    });
+    let runtime = RuntimeBuilder::new()
+        .adapter(adapter)
+        .handler(Arc::new(plugins))
+        .build()
+        .unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.run(shutdown_signal),
+    )
+    .await
+    .expect("non-owner DevTools runtime should complete")
+    .unwrap();
+    let Action::Reply(reply) = actions.recv().await.unwrap() else {
+        panic!("expected owner restriction reply");
+    };
+    assert!(reply.content.contains("restricted to configured owners"));
+    assert!(actions.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn ordinary_trusted_registration_cannot_execute_platform_queries() {
+    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+    plugins
+        .register_trusted(
+            Arc::new(DevToolsPlugin::default()),
+            "dev.bkm.devtools/ordinary-trusted",
+            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+        )
+        .await
+        .unwrap();
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (action_sender, mut actions) = mpsc::channel(1);
+    let adapter = Arc::new(MockAdapter {
+        id: AdapterId::new("qq-devtools-ordinary"),
+        event: Mutex::new(Some(devtools_event("qq-devtools-ordinary", "owner-id"))),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+        outcome: ActionOutcome::Succeeded,
+        shutdown_after_send: true,
+    });
+    let runtime = RuntimeBuilder::new()
+        .adapter(adapter)
+        .handler(Arc::new(plugins))
+        .build()
+        .unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.run(shutdown_signal),
+    )
+    .await
+    .expect("ordinary trusted runtime should complete")
+    .unwrap();
+    assert!(actions.try_recv().is_err());
 }
 
 async fn run_action_result_probe(outcome: ActionOutcome) -> ActionCompleted {

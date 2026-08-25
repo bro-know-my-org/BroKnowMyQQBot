@@ -13,10 +13,14 @@ use thiserror::Error;
 use tracing::info;
 
 use builtin_plugins::{
-    ActiveSendProbePlugin, AdminPlugin, BrowserProbePlugin, CounterPlugin, EchoPlugin, HelpPlugin,
-    HttpProbePlugin, PingPlugin, QqExtensionProbePlugin, ReminderPlugin, SchedulerProbePlugin,
+    ActiveSendProbePlugin, AdminPlugin, BrowserProbePlugin, CounterPlugin, DevToolsPlugin,
+    EchoPlugin, HelpPlugin, HttpProbePlugin, PingPlugin, QqExtensionProbePlugin, ReminderPlugin,
+    SchedulerProbePlugin,
 };
-use plugin_host::{PluginStore, StaticPluginHost, ValidatedPluginPackage, WasmPlugin};
+use plugin_host::{
+    PluginStore, StaticPluginHost, TrustedPlatformQuery, TrustedPluginCapabilities,
+    ValidatedPluginPackage, WasmPlugin,
+};
 
 const MAX_INSTALLATION_FILE_BYTES: usize = 1024 * 1024;
 const MAX_CONFIGURED_OWNERS: usize = 32;
@@ -32,6 +36,7 @@ const BUNDLED_PLUGIN_INSTANCES: &[(&str, &str)] = &[
     ("scheduler-probe", "dev.bkm.scheduler-probe/default"),
     ("qq-extension-probe", "dev.bkm.qq-extension-probe/default"),
     ("active-send-probe", "dev.bkm.active-send-probe/default"),
+    ("devtools", "dev.bkm.devtools/default"),
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -348,13 +353,21 @@ async fn register_bundled_plugins(
             "scheduler-probe" => std::sync::Arc::new(SchedulerProbePlugin::default()),
             "qq-extension-probe" => std::sync::Arc::new(QqExtensionProbePlugin::default()),
             "active-send-probe" => std::sync::Arc::new(ActiveSendProbePlugin::default()),
+            "devtools" => std::sync::Arc::new(DevToolsPlugin::default()),
             _ => return Err(Box::new(PluginConfigError::UnknownBundled(name))),
         };
+        let trusted_capabilities = if name == "devtools" {
+            TrustedPluginCapabilities::default()
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList)
+        } else {
+            TrustedPluginCapabilities::default()
+        };
         plugins
-            .register_trusted(
+            .register_trusted_with_capabilities(
                 plugin,
                 instance_id,
                 configs.get(&name).cloned().unwrap_or_default(),
+                trusted_capabilities,
             )
             .await?;
         instance_ids.insert(instance_id.to_owned());

@@ -4,7 +4,8 @@ use super::{
     Action, ActionCompleted, ActionStatus, Adapter, AdapterError, Arc, AssetDigest, AssetStore,
     BTreeMap, BTreeSet, BrowserExecutionError, BrowserExecutor, BrowserRun, BrowserStep,
     ContextError, ExecutionOrigin, HttpExecutionError, HttpExecutor, HttpRequest, MediaReply,
-    MediaSend, PluginCommand, PluginError, PluginManifest, SendMessageAction, Value,
+    MediaSend, PluginCommand, PluginError, PluginManifest, SendMessageAction, TrustedPlatformQuery,
+    Value,
 };
 use bot_core::{MediaAttachment, ReplyMediaAction, SendMediaAction};
 use plugin_api::{PluginMessageTarget, url_path_matches_prefix};
@@ -20,8 +21,59 @@ pub(super) async fn execute_context_command(
     instance_id: &str,
     manifest: &PluginManifest,
     granted_capabilities: &BTreeSet<String>,
+    trusted_platform_queries: &BTreeSet<TrustedPlatformQuery>,
     adapters: &BTreeMap<String, Arc<dyn Adapter>>,
 ) -> Result<Value, PluginError> {
+    if let Some(query) = trusted_platform_queries
+        .iter()
+        .find(|query| query.action_name() == command.kind)
+    {
+        let action = Action::Platform {
+            name: command.kind.clone(),
+            payload: command.payload.clone(),
+        };
+        let result = match origin {
+            ExecutionOrigin::Event(context) => {
+                if context.platform() != query.platform() {
+                    return Err(PluginError::Permanent(format!(
+                        "trusted platform query `{}` requires platform `{}`",
+                        query.action_name(),
+                        query.platform()
+                    )));
+                }
+                context
+                    .execute(action)
+                    .await
+                    .map_err(|error| context_command_error(&error))?
+            }
+            ExecutionOrigin::Recovered(origin) => {
+                let adapter = adapters.get(&origin.adapter_id).ok_or_else(|| {
+                    PluginError::Permanent(format!(
+                        "recovered event adapter `{}` is unavailable",
+                        origin.adapter_id
+                    ))
+                })?;
+                if adapter.platform() != query.platform() {
+                    return Err(PluginError::Permanent(format!(
+                        "trusted platform query `{}` requires platform `{}`",
+                        query.action_name(),
+                        query.platform()
+                    )));
+                }
+                adapter
+                    .execute(action)
+                    .await
+                    .map_err(|error| adapter_command_error(&error))?
+            }
+            ExecutionOrigin::Scheduled { .. } => {
+                return Err(PluginError::Permanent(
+                    "trusted platform queries are unavailable for scheduled events".to_owned(),
+                ));
+            }
+        };
+        return serde_json::to_value(result)
+            .map_err(|error| PluginError::Permanent(error.to_string()));
+    }
     match command.kind.as_str() {
         "message.reply" => {
             let message_text = command
@@ -575,9 +627,128 @@ pub(super) const fn action_status_name(status: ActionStatus) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use plugin_api::{PluginError, PluginManifest};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
-    use super::authorize_browser_url;
+    use bot_core::{
+        Action, ActionResult, Adapter, AdapterError, AdapterId, EventSender, ShutdownSignal,
+    };
+    use plugin_api::{PluginCommand, PluginError, PluginManifest};
+    use serde_json::{Value, json};
+
+    use crate::{
+        AssetStore, OutboxOrigin, SecureHttpExecutor, TrustedPlatformQuery,
+        UnavailableBrowserExecutor,
+    };
+
+    use super::{ExecutionOrigin, authorize_browser_url, execute_context_command};
+
+    #[derive(Debug)]
+    struct QueryAdapter {
+        id: AdapterId,
+        platform: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for QueryAdapter {
+        fn id(&self) -> &AdapterId {
+            &self.id
+        }
+
+        fn platform(&self) -> &'static str {
+            self.platform
+        }
+
+        async fn run(
+            &self,
+            events: EventSender,
+            mut shutdown: ShutdownSignal,
+        ) -> Result<(), AdapterError> {
+            events.mark_ready();
+            shutdown.cancelled().await;
+            Ok(())
+        }
+
+        async fn execute(&self, action: Action) -> Result<ActionResult, AdapterError> {
+            assert!(matches!(
+                action,
+                Action::Platform { ref name, .. }
+                    if name == "qq.guild.api-permission.list"
+            ));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ActionResult {
+                message_id: None,
+                raw: json!({"apis":[]}),
+            })
+        }
+    }
+
+    fn platform_query_command() -> PluginCommand {
+        PluginCommand {
+            command_id: "permissions".to_owned(),
+            kind: "qq.guild.api-permission.list".to_owned(),
+            idempotency_key: None,
+            deadline_ms: None,
+            payload: json!({"guild_id":"guild-id"}),
+        }
+    }
+
+    fn platform_query_manifest() -> PluginManifest {
+        PluginManifest::from_toml(
+            r#"
+                manifest_version = 1
+                id = "dev.bkm.query-boundary"
+                version = "1.0.0"
+                protocol = ">=1.0,<2.0"
+
+                [metadata]
+                default_locale = "en"
+
+                [metadata.locales.en]
+                name = "Query Boundary"
+            "#,
+        )
+        .unwrap()
+    }
+
+    async fn execute_recovered_query(
+        trusted_queries: BTreeSet<TrustedPlatformQuery>,
+        platform: &'static str,
+    ) -> (Result<Value, PluginError>, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let adapter: Arc<dyn Adapter> = Arc::new(QueryAdapter {
+            id: AdapterId::new("query-adapter"),
+            platform,
+            calls: Arc::clone(&calls),
+        });
+        let adapters = BTreeMap::from([("query-adapter".to_owned(), adapter)]);
+        let origin = OutboxOrigin {
+            source_event_id: "source".to_owned(),
+            adapter_id: "query-adapter".to_owned(),
+            reply_target: None,
+            source_message_id: None,
+        };
+        let result = execute_context_command(
+            ExecutionOrigin::Recovered(&origin),
+            &platform_query_command(),
+            &SecureHttpExecutor::default(),
+            &UnavailableBrowserExecutor,
+            &AssetStore::default(),
+            "dev.bkm.query-boundary/test",
+            &platform_query_manifest(),
+            &BTreeSet::new(),
+            &trusted_queries,
+            &adapters,
+        )
+        .await;
+        (result, calls.load(Ordering::SeqCst))
+    }
 
     #[test]
     fn browser_authorization_matches_the_exact_origin_and_path_boundary() {
@@ -621,5 +792,43 @@ mod tests {
                 Err(PluginError::PermissionDenied(_))
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn trusted_platform_queries_are_closed_and_platform_bound() {
+        let allowed = BTreeSet::from([TrustedPlatformQuery::QqGuildApiPermissionList]);
+
+        let (ordinary, calls) = execute_recovered_query(BTreeSet::new(), "qq.official").await;
+        assert!(matches!(ordinary, Err(PluginError::Permanent(_))));
+        assert_eq!(calls, 0);
+
+        let (wrong_platform, calls) = execute_recovered_query(allowed.clone(), "onebot11").await;
+        assert!(
+            matches!(wrong_platform, Err(PluginError::Permanent(message)) if message.contains("requires platform `qq.official`"))
+        );
+        assert_eq!(calls, 0);
+
+        let (recovered, calls) = execute_recovered_query(allowed.clone(), "qq.official").await;
+        assert_eq!(recovered.unwrap()["raw"]["apis"], json!([]));
+        assert_eq!(calls, 1);
+
+        let scheduled = execute_context_command(
+            ExecutionOrigin::Scheduled {
+                adapter_id: "query-adapter",
+            },
+            &platform_query_command(),
+            &SecureHttpExecutor::default(),
+            &UnavailableBrowserExecutor,
+            &AssetStore::default(),
+            "dev.bkm.query-boundary/test",
+            &platform_query_manifest(),
+            &BTreeSet::new(),
+            &allowed,
+            &BTreeMap::new(),
+        )
+        .await;
+        assert!(
+            matches!(scheduled, Err(PluginError::Permanent(message)) if message.contains("unavailable for scheduled events"))
+        );
     }
 }

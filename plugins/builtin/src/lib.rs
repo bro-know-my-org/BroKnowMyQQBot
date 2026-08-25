@@ -18,10 +18,12 @@ use tokio::time::{Duration, sleep};
 
 mod basic;
 mod business;
+mod devtools;
 mod probes;
 
 pub use basic::{CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin};
 pub use business::{AdminPlugin, ReminderPlugin};
+pub use devtools::DevToolsPlugin;
 pub use probes::{
     ActionResultProbePlugin, ActiveSendProbePlugin, BrowserProbePlugin, ConfigProbePlugin,
     HttpProbePlugin, QqExtensionProbePlugin, SchedulerProbePlugin,

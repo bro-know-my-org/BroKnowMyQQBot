@@ -7,7 +7,9 @@ bundled = ["ping", "help", "echo", "counter", "reminder"]
 # owners = ["your-sender-id"]
 
 # Optional functional coverage plugins can be added explicitly:
-# bundled = ["ping", "help", "echo", "counter", "http-probe", "browser-probe", "scheduler-probe", "qq-extension-probe"]
+# bundled = ["ping", "help", "echo", "counter", "devtools", "http-probe", "browser-probe", "scheduler-probe", "qq-extension-probe"]
+# [bundled_config.devtools]
+# owners = ["your-sender-id"]
 
 # Add local WebAssembly Component packages explicitly. Relative package paths
 # are resolved from this file. Grants are intersected with plugin.toml and are
