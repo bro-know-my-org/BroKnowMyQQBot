@@ -219,9 +219,32 @@ mod tests {
     }
 
     fn read_log(root: &std::path::Path) -> String {
-        let month = fs::read_dir(root).unwrap().next().unwrap().unwrap().path();
-        let file = fs::read_dir(month).unwrap().next().unwrap().unwrap().path();
+        let month = sorted_entries(root)
+            .into_iter()
+            .find(|entry| entry.file_type().unwrap().is_dir())
+            .unwrap()
+            .path();
+        let file = sorted_entries(&month)
+            .into_iter()
+            .find(|entry| {
+                entry.file_type().unwrap().is_file()
+                    && entry
+                        .path()
+                        .extension()
+                        .is_some_and(|extension| extension == "jsonl")
+            })
+            .unwrap()
+            .path();
         fs::read_to_string(file).unwrap()
+    }
+
+    fn sorted_entries(root: &std::path::Path) -> Vec<fs::DirEntry> {
+        let mut entries = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(fs::DirEntry::file_name);
+        entries
     }
 
     fn temporary_directory() -> PathBuf {
