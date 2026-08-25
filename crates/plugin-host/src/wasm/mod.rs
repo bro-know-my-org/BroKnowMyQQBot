@@ -113,29 +113,29 @@ impl StoreData {
 impl types::Host for StoreData {}
 
 impl queries::Host for StoreData {
-    async fn config_get(
+    fn config_get(
         &mut self,
         key: String,
-    ) -> Result<Option<types::EncodedValue>, types::HostError> {
-        Ok(self.config.get(&key).map(Self::encoded_json))
+    ) -> impl Future<Output = Result<Option<types::EncodedValue>, types::HostError>> {
+        std::future::ready(Ok(self.config.get(&key).map(Self::encoded_json)))
     }
 
-    async fn state_get(
+    fn state_get(
         &mut self,
         key: String,
-    ) -> Result<Option<types::StateValue>, types::HostError> {
-        Ok(self.state.get(&key).map(|value| types::StateValue {
+    ) -> impl Future<Output = Result<Option<types::StateValue>, types::HostError>> {
+        std::future::ready(Ok(self.state.get(&key).map(|value| types::StateValue {
             value: value.value.clone(),
             revision: value.revision,
-        }))
+        })))
     }
 
-    async fn state_scan(
+    fn state_scan(
         &mut self,
         prefix: String,
         limit: u32,
-    ) -> Result<Vec<types::StateEntry>, types::HostError> {
-        Ok(self
+    ) -> impl Future<Output = Result<Vec<types::StateEntry>, types::HostError>> {
+        std::future::ready(Ok(self
             .state
             .range(prefix.clone()..)
             .take_while(|(key, _)| key.starts_with(&prefix))
@@ -145,19 +145,22 @@ impl queries::Host for StoreData {
                 value: value.value.clone(),
                 revision: value.revision,
             })
-            .collect())
+            .collect()))
     }
 
-    async fn asset_get(&mut self, path: String) -> Result<Option<Vec<u8>>, types::HostError> {
-        Ok(self.assets.get(&path).cloned())
+    fn asset_get(
+        &mut self,
+        path: String,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, types::HostError>> {
+        std::future::ready(Ok(self.assets.get(&path).cloned()))
     }
 
-    async fn granted_capabilities(&mut self) -> Vec<String> {
-        self.granted_capabilities.iter().cloned().collect()
+    fn granted_capabilities(&mut self) -> impl Future<Output = Vec<String>> {
+        std::future::ready(self.granted_capabilities.iter().cloned().collect())
     }
 
-    async fn invocation_time_ms(&mut self) -> i64 {
-        self.invocation_time_ms
+    fn invocation_time_ms(&mut self) -> impl Future<Output = i64> {
+        std::future::ready(self.invocation_time_ms)
     }
 }
 

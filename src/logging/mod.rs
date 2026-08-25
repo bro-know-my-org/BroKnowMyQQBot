@@ -166,7 +166,7 @@ fn non_blocking(
 mod tests {
     use std::{fs, path::PathBuf, time::SystemTime};
 
-    use tracing_subscriber::{filter::filter_fn, fmt, layer::SubscriberExt as _};
+    use tracing_subscriber::{filter::filter_fn, fmt};
 
     use super::*;
 
@@ -191,9 +191,11 @@ mod tests {
             .with_filter(filter_fn(|metadata| {
                 metadata.target() == MESSAGE_LOG_TARGET
             }));
-        let subscriber = tracing_subscriber::registry()
-            .with(runtime_layer)
-            .with(message_layer);
+        let subscriber = tracing_subscriber::layer::SubscriberExt::with(
+            tracing_subscriber::registry(),
+            runtime_layer,
+        );
+        let subscriber = tracing_subscriber::layer::SubscriberExt::with(subscriber, message_layer);
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(event_type = "READY", "runtime-event");

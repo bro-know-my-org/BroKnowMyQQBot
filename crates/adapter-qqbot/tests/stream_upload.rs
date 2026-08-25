@@ -203,11 +203,11 @@ async fn harness() -> (
         requests: Mutex::new(Vec::new()),
         token_count: Mutex::new(0),
     });
-    let app = Router::new()
+    let router = Router::new()
         .fallback(any(endpoint))
         .with_state(Arc::clone(&state));
     let server_task = TestServerTask(Some(tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, router).await.unwrap();
     })));
     let base_url = Url::parse(&format!("{origin}/")).unwrap();
     let tokens = TokenManager::with_client_and_endpoint(
