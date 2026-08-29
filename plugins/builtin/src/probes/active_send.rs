@@ -1,6 +1,6 @@
 use super::{
     Disposition, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest,
-    StaticPlugin, async_trait, command_argument, ignored, json, message_plugin_manifest,
+    StaticPlugin, async_trait, command_argument, diagnostic_plugin_manifest, ignored, json,
     message_text, plugin_command,
 };
 
@@ -12,7 +12,7 @@ pub struct ActiveSendProbePlugin {
 
 impl Default for ActiveSendProbePlugin {
     fn default() -> Self {
-        let mut manifest = message_plugin_manifest(
+        let mut manifest = diagnostic_plugin_manifest(
             "dev.bkm.active-send-probe",
             "Active Send Probe",
             "active-send",

@@ -1,8 +1,8 @@
 use super::{
     ActionCompleted, ActionStatus, BTreeMap, BTreeSet, Disposition, HandlerOutput, HostQueries,
     HttpPermission, HttpRequest, HttpResponse, PluginCommand, PluginError, PluginEventEnvelope,
-    PluginManifest, StateOp, StaticPlugin, Subscription, Value, async_trait, ignored, is_command,
-    json, message_plugin_manifest, message_text, reply,
+    PluginManifest, StateOp, StaticPlugin, Subscription, Value, async_trait,
+    diagnostic_plugin_manifest, ignored, is_command, json, message_text, reply,
 };
 
 #[derive(Debug)]
@@ -12,7 +12,7 @@ pub struct HttpProbePlugin {
 
 impl Default for HttpProbePlugin {
     fn default() -> Self {
-        let mut manifest = message_plugin_manifest(
+        let mut manifest = diagnostic_plugin_manifest(
             "dev.bkm.http-probe",
             "HTTP Probe",
             "http-probe",

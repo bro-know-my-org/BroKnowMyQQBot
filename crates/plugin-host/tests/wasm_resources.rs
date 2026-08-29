@@ -14,7 +14,8 @@ use bot_core::{
 };
 use builtin_plugins::PingPlugin;
 use plugin_api::{
-    HostQueries, InitContext, PluginError, PluginEventEnvelope, StateValue, StaticPlugin,
+    CallerAuthority, HostQueries, InitContext, PluginError, PluginEventEnvelope, StateValue,
+    StaticPlugin,
 };
 use plugin_host::{
     PluginInstanceState, PluginStore, StaticPluginHost, ValidatedPluginPackage, WasmPlugin,
@@ -124,6 +125,10 @@ impl HostQueries for Queries {
 
     fn invocation_time_ms(&self) -> i64 {
         1_700_000_000_000
+    }
+
+    fn caller_authority(&self) -> CallerAuthority {
+        CallerAuthority::default()
     }
 }
 

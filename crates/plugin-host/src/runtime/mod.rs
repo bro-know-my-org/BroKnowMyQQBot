@@ -23,11 +23,11 @@ use bot_core::{
 };
 use futures_util::FutureExt;
 use plugin_api::{
-    ActionCompleted, ActionStatus, BPP_VERSION, BrowserRun, BrowserStep, CommandDeclaration,
-    Disposition, ExtensionPayload, HandlerOutput, HealthStatus, HostQueries, HttpRequest,
-    InitContext, MediaReply, MediaSend, PluginCommand, PluginError, PluginEventEnvelope,
-    PluginManifest, RuntimeMode, ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp,
-    StateValue, StaticPlugin,
+    ActionCompleted, ActionStatus, BPP_VERSION, BrowserRun, BrowserStep, CallerAuthority,
+    CallerRole, CommandDeclaration, Disposition, ExtensionPayload, HandlerOutput, HealthStatus,
+    HostQueries, HttpRequest, InitContext, MediaReply, MediaSend, PluginCommand, PluginError,
+    PluginEventEnvelope, PluginManifest, RuntimeMode, ScheduleCancel, ScheduleCreate,
+    ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -59,6 +59,7 @@ const MAX_DELIVERY_ATTEMPTS: u32 = 3;
 const CIRCUIT_BREAKER_FAILURES: u32 = 3;
 const DELIVERY_RETRY_BASE_MS: u64 = 25;
 const ACTION_COMPLETION_DEPTH_NAMESPACE: &str = "dev.bkm.host/action-completion-depth";
+const ADMIN_STATE_PREFIX: &str = "admins/";
 
 #[derive(Debug, Error)]
 pub enum PluginHostError {
@@ -68,6 +69,8 @@ pub enum PluginHostError {
     DuplicateInstance(String),
     #[error("plugin command or alias `{0}` is already registered")]
     DuplicateCommand(String),
+    #[error("authority provider {0:?} is already registered")]
+    DuplicateAuthorityProvider(TrustedAuthorityProvider),
     #[error("plugin `{plugin_id}` configuration is invalid: {message}")]
     InvalidConfig { plugin_id: String, message: String },
     #[error("plugin `{plugin_id}` configuration schema is invalid: {message}")]
@@ -125,6 +128,7 @@ pub enum PluginInstanceState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrustedPluginCapabilities {
     platform_queries: BTreeSet<TrustedPlatformQuery>,
+    authority_provider: Option<TrustedAuthorityProvider>,
 }
 
 impl TrustedPluginCapabilities {
@@ -133,6 +137,19 @@ impl TrustedPluginCapabilities {
         self.platform_queries.insert(query);
         self
     }
+
+    #[must_use]
+    pub fn with_authority_provider(mut self, provider: TrustedAuthorityProvider) -> Self {
+        self.authority_provider = Some(provider);
+        self
+    }
+}
+
+/// Host-trusted source of caller ownership and delegated administration data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustedAuthorityProvider {
+    Administration,
+    DevToolsLegacy,
 }
 
 /// Closed set of read-only platform Actions exposed to trusted static plugins.
@@ -254,6 +271,7 @@ impl StaticPluginHost {
         if self.instances.contains(&instance_id) {
             return Err(PluginHostError::DuplicateInstance(instance_id));
         }
+        self.validate_authority_provider_assignment(trusted_capabilities.authority_provider, None)?;
         for command in &manifest.commands {
             for name in std::iter::once(&command.name).chain(&command.aliases) {
                 if self.command_names.contains(name) {
@@ -276,6 +294,7 @@ impl StaticPluginHost {
             config: StdMutex::new(config.clone()),
             granted_capabilities,
             trusted_platform_queries: trusted_capabilities.platform_queries,
+            authority_provider: trusted_capabilities.authority_provider,
             execution,
             state: StdMutex::new(LifecycleState {
                 state: PluginInstanceState::Draining,
@@ -417,11 +436,30 @@ impl StaticPluginHost {
 
     /// Returns the command declarations from all currently registered plugin
     /// manifests in deterministic plugin registration order.
-    pub fn command_declarations(&self) -> Vec<CommandDeclaration> {
-        self.plugins
-            .iter()
-            .flat_map(|plugin| plugin.manifest.commands.iter().cloned())
-            .collect()
+    pub fn command_declarations(&self) -> Result<Vec<CommandDeclaration>, PluginHostError> {
+        let mut commands = Vec::new();
+        for plugin in &self.plugins {
+            if plugin.state()? == PluginInstanceState::Ready {
+                commands.extend(plugin.manifest.commands.iter().cloned());
+            }
+        }
+        Ok(commands)
+    }
+
+    fn validate_authority_provider_assignment(
+        &self,
+        provider: Option<TrustedAuthorityProvider>,
+        replacing_index: Option<usize>,
+    ) -> Result<(), PluginHostError> {
+        let Some(provider) = provider else {
+            return Ok(());
+        };
+        if self.plugins.iter().enumerate().any(|(index, plugin)| {
+            Some(index) != replacing_index && plugin.authority_provider == Some(provider)
+        }) {
+            return Err(PluginHostError::DuplicateAuthorityProvider(provider));
+        }
+        Ok(())
     }
 
     pub async fn upgrade_trusted(
@@ -510,6 +548,10 @@ impl StaticPluginHost {
                 "an upgrade cannot decrease state_version".to_owned(),
             ));
         }
+        self.validate_authority_provider_assignment(
+            trusted_capabilities.authority_provider,
+            Some(index),
+        )?;
         validate_upgrade_commands(&self.plugins, index, &manifest)?;
         validate_config_schema(plugin.as_ref(), &manifest.id.to_string(), &config)?;
         supervised_validate_config(plugin.as_ref(), &manifest, &config).await?;
@@ -525,6 +567,7 @@ impl StaticPluginHost {
             config: StdMutex::new(config.clone()),
             granted_capabilities,
             trusted_platform_queries: trusted_capabilities.platform_queries,
+            authority_provider: trusted_capabilities.authority_provider,
             execution,
             state: StdMutex::new(LifecycleState {
                 state: PluginInstanceState::Draining,
@@ -636,6 +679,10 @@ impl StaticPluginHost {
                     .map(|priority| (priority, plugin))
             })
             .collect::<Vec<_>>();
+        if plugins.is_empty() {
+            return Ok(());
+        }
+        let envelope = Self::event_envelope(&context, event, event_type)?;
         plugins.sort_by_key(|(priority, plugin)| (*priority, plugin.manifest.id.clone()));
 
         for (_, plugin) in plugins {
@@ -651,10 +698,15 @@ impl StaticPluginHost {
                     warn!(plugin_id = %plugin.manifest.id, "plugin lifecycle changed while invocation was queued");
                     return Ok(None);
                 }
-                let envelope = Self::event_envelope(&context, event, event_type)?;
-                self.deliver_with_retry(plugin, ExecutionOrigin::Event(&context), envelope)
-                    .await
-                    .map(Some)
+                let caller_authority = self.resolve_caller_authority(&envelope, None)?;
+                self.deliver_with_authority(
+                    plugin,
+                    ExecutionOrigin::Event(&context),
+                    envelope.clone(),
+                    caller_authority,
+                )
+                .await
+                .map(Some)
             }
             .await;
             match result {
@@ -702,11 +754,23 @@ impl StaticPluginHost {
         origin: ExecutionOrigin<'_>,
         envelope: PluginEventEnvelope,
     ) -> Result<bool, PluginHostError> {
+        let caller_authority = self.resolve_caller_authority(&envelope, Some(plugin))?;
+        self.deliver_with_authority(plugin, origin, envelope, caller_authority)
+            .await
+    }
+
+    async fn deliver_with_authority(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        origin: ExecutionOrigin<'_>,
+        envelope: PluginEventEnvelope,
+        caller_authority: CallerAuthority,
+    ) -> Result<bool, PluginHostError> {
         let (stop, completions) = self
-            .deliver_single_with_retry(plugin, origin, envelope)
+            .deliver_single_with_retry(plugin, origin, envelope, &caller_authority)
             .await?;
         if let Err(error) = self
-            .deliver_action_completions(plugin, origin, completions)
+            .deliver_action_completions(plugin, origin, completions, &caller_authority)
             .await
         {
             error!(
@@ -724,11 +788,12 @@ impl StaticPluginHost {
         plugin: &Arc<RegisteredPlugin>,
         origin: ExecutionOrigin<'_>,
         completions: VecDeque<PluginEventEnvelope>,
+        caller_authority: &CallerAuthority,
     ) -> Result<(), PluginHostError> {
         let mut queue = completions;
         while let Some(envelope) = queue.pop_front() {
             let (_, nested) = self
-                .deliver_single_with_retry(plugin, origin, envelope)
+                .deliver_single_with_retry(plugin, origin, envelope, caller_authority)
                 .await?;
             queue.extend(nested);
             if plugin.state()? == PluginInstanceState::Disabled {
@@ -743,6 +808,7 @@ impl StaticPluginHost {
         plugin: &Arc<RegisteredPlugin>,
         origin: ExecutionOrigin<'_>,
         mut envelope: PluginEventEnvelope,
+        caller_authority: &CallerAuthority,
     ) -> Result<(bool, VecDeque<PluginEventEnvelope>), PluginHostError> {
         if self.store.circuit_open(&plugin.instance_id)? {
             plugin.set_state(PluginInstanceState::Disabled)?;
@@ -771,7 +837,9 @@ impl StaticPluginHost {
                 return Ok((false, VecDeque::new()));
             };
             let result = async {
-                let output = self.invoke_envelope(plugin, &envelope).await?;
+                let output = self
+                    .invoke_envelope(plugin, &envelope, caller_authority)
+                    .await?;
                 let stop = output.disposition == Disposition::Stop;
                 let completions = self
                     .commit_and_execute(
@@ -1070,6 +1138,7 @@ impl StaticPluginHost {
         &self,
         plugin: &RegisteredPlugin,
         envelope: &PluginEventEnvelope,
+        caller_authority: &CallerAuthority,
     ) -> Result<HandlerOutput, PluginHostError> {
         let state = self.store.snapshot(&plugin.instance_id)?;
         let config = plugin.config_snapshot()?;
@@ -1078,6 +1147,7 @@ impl StaticPluginHost {
             state: &state,
             granted_capabilities: &plugin.granted_capabilities,
             invocation_time_ms: envelope.received_at_ms,
+            caller_authority,
         };
         let invocation =
             AssertUnwindSafe(plugin.plugin.on_event(envelope, &queries)).catch_unwind();
@@ -1551,6 +1621,102 @@ impl StaticPluginHost {
         }
         first_error.map_or(Ok(()), Err)
     }
+
+    fn resolve_caller_authority(
+        &self,
+        envelope: &PluginEventEnvelope,
+        current_plugin: Option<&RegisteredPlugin>,
+    ) -> Result<CallerAuthority, PluginHostError> {
+        let platform = self.adapters.get(&envelope.adapter_id).map_or_else(
+            || envelope.adapter_id.clone(),
+            |adapter| adapter.platform().to_owned(),
+        );
+        if envelope.event_type != "message.created" {
+            return Ok(CallerAuthority {
+                role: CallerRole::User,
+                platform,
+                subject_hint: None,
+            });
+        }
+        let Some(sender) = envelope
+            .payload
+            .pointer("/data/sender/id")
+            .and_then(Value::as_str)
+            .filter(|sender| {
+                !sender.is_empty() && sender.len() <= 124 && !sender.chars().any(char::is_control)
+            })
+        else {
+            return Ok(CallerAuthority {
+                role: CallerRole::User,
+                platform,
+                subject_hint: None,
+            });
+        };
+        let administration = self
+            .plugins
+            .iter()
+            .map(AsRef::as_ref)
+            .find(|plugin| {
+                plugin.authority_provider == Some(TrustedAuthorityProvider::Administration)
+            })
+            .or_else(|| {
+                current_plugin.filter(|plugin| {
+                    plugin.authority_provider == Some(TrustedAuthorityProvider::Administration)
+                })
+            });
+        let legacy_devtools = self
+            .plugins
+            .iter()
+            .map(AsRef::as_ref)
+            .find(|plugin| {
+                plugin.authority_provider == Some(TrustedAuthorityProvider::DevToolsLegacy)
+            })
+            .or_else(|| {
+                current_plugin.filter(|plugin| {
+                    plugin.authority_provider == Some(TrustedAuthorityProvider::DevToolsLegacy)
+                })
+            });
+        let owner_provider = administration.or(legacy_devtools);
+        let owner = owner_provider
+            .map(RegisteredPlugin::config_snapshot)
+            .transpose()?
+            .as_ref()
+            .and_then(|config| config.get("owners").and_then(Value::as_array))
+            .is_some_and(|owners| owners.iter().any(|owner| owner.as_str() == Some(sender)));
+        let role = if owner {
+            CallerRole::Owner
+        } else if let Some(administration) = administration {
+            let key = delegated_admin_state_key(sender);
+            if self
+                .store
+                .state_get(&administration.instance_id, &key)?
+                .as_ref()
+                .is_some_and(|value| value.value.as_slice() == sender.as_bytes())
+            {
+                CallerRole::Admin
+            } else {
+                CallerRole::User
+            }
+        } else {
+            CallerRole::User
+        };
+        Ok(CallerAuthority {
+            role,
+            platform,
+            subject_hint: None,
+        })
+    }
+}
+
+fn delegated_admin_state_key(sender: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut key = String::with_capacity(ADMIN_STATE_PREFIX.len() + sender.len() * 2);
+    key.push_str(ADMIN_STATE_PREFIX);
+    for byte in sender.bytes() {
+        key.push(char::from(HEX[usize::from(byte >> 4)]));
+        key.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    key
 }
 
 #[async_trait]
@@ -1729,6 +1895,7 @@ struct RegisteredPlugin {
     config: StdMutex<BTreeMap<String, Value>>,
     granted_capabilities: BTreeSet<String>,
     trusted_platform_queries: BTreeSet<TrustedPlatformQuery>,
+    authority_provider: Option<TrustedAuthorityProvider>,
     execution: InvocationGate,
     state: StdMutex<LifecycleState>,
 }
@@ -1837,6 +2004,7 @@ struct InvocationQueries<'a> {
     state: &'a BTreeMap<String, StateValue>,
     granted_capabilities: &'a BTreeSet<String>,
     invocation_time_ms: i64,
+    caller_authority: &'a CallerAuthority,
 }
 
 impl HostQueries for InvocationQueries<'_> {
@@ -1863,6 +2031,10 @@ impl HostQueries for InvocationQueries<'_> {
 
     fn invocation_time_ms(&self) -> i64 {
         self.invocation_time_ms
+    }
+
+    fn caller_authority(&self) -> CallerAuthority {
+        self.caller_authority.clone()
     }
 }
 
@@ -2016,10 +2188,10 @@ mod tests {
     };
 
     use bot_core::MessageTarget;
-    use builtin_plugins::PingPlugin;
+    use builtin_plugins::{AdminPlugin, PingPlugin};
     use plugin_api::{
-        Disposition, ExtensionPayload, HandlerOutput, HostQueries, InitContext, PluginCommand,
-        PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin,
+        CallerRole, Disposition, ExtensionPayload, HandlerOutput, HostQueries, InitContext,
+        PluginCommand, PluginError, PluginEventEnvelope, PluginManifest, StateOp, StaticPlugin,
     };
     use serde_json::{Value, json};
 
@@ -2027,9 +2199,9 @@ mod tests {
 
     use super::{
         ACTION_COMPLETION_DEPTH_NAMESPACE, InvocationGate, LifecycleState, PluginHostError,
-        RegisteredPlugin, StaticPluginHost, TrustedPlatformQuery, TrustedPluginCapabilities,
-        validate_config_schema, validate_output, validate_plugin_config,
-        validation::redact_sensitive_fields,
+        RegisteredPlugin, StaticPluginHost, TrustedAuthorityProvider, TrustedPlatformQuery,
+        TrustedPluginCapabilities, delegated_admin_state_key, validate_config_schema,
+        validate_output, validate_plugin_config, validation::redact_sensitive_fields,
     };
 
     #[derive(Debug)]
@@ -2156,6 +2328,7 @@ mod tests {
             config: StdMutex::new(BTreeMap::new()),
             granted_capabilities: BTreeSet::default(),
             trusted_platform_queries: BTreeSet::default(),
+            authority_provider: None,
             execution,
             state: StdMutex::new(LifecycleState::ready()),
         }
@@ -2293,7 +2466,9 @@ mod tests {
     #[tokio::test]
     async fn trusted_upgrade_capabilities_are_replaced_revoked_and_rolled_back() {
         let query = TrustedPlatformQuery::QqGuildApiPermissionList;
-        let capabilities = TrustedPluginCapabilities::default().with_platform_query(query);
+        let capabilities = TrustedPluginCapabilities::default()
+            .with_platform_query(query)
+            .with_authority_provider(TrustedAuthorityProvider::Administration);
         let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
         host.register_trusted_with_capabilities(
             Arc::new(PingPlugin::default()),
@@ -2313,6 +2488,10 @@ mod tests {
         .await
         .unwrap();
         assert!(host.plugins[0].trusted_platform_queries.contains(&query));
+        assert_eq!(
+            host.plugins[0].authority_provider,
+            Some(TrustedAuthorityProvider::Administration)
+        );
 
         host.upgrade_trusted(
             "dev.bkm.ping/upgrade-capabilities",
@@ -2322,6 +2501,7 @@ mod tests {
         .await
         .unwrap();
         assert!(host.plugins[0].trusted_platform_queries.is_empty());
+        assert_eq!(host.plugins[0].authority_provider, None);
 
         host.upgrade_trusted_with_capabilities(
             "dev.bkm.ping/upgrade-capabilities",
@@ -2345,6 +2525,60 @@ mod tests {
             .is_err()
         );
         assert!(host.plugins[0].trusted_platform_queries.contains(&query));
+        assert_eq!(
+            host.plugins[0].authority_provider,
+            Some(TrustedAuthorityProvider::Administration)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_authority_providers_on_registration_and_upgrade() {
+        let administration = TrustedPluginCapabilities::default()
+            .with_authority_provider(TrustedAuthorityProvider::Administration);
+        let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+        host.register_trusted_with_capabilities(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/authority-primary",
+            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+            administration.clone(),
+        )
+        .await
+        .unwrap();
+
+        let error = host
+            .register_trusted_with_capabilities(
+                Arc::new(PingPlugin::default()),
+                "dev.bkm.ping/authority-duplicate",
+                BTreeMap::new(),
+                administration.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginHostError::DuplicateAuthorityProvider(TrustedAuthorityProvider::Administration)
+        ));
+
+        host.register_trusted(
+            Arc::new(PingPlugin::default()),
+            "dev.bkm.ping/authority-upgrade",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        let error = host
+            .upgrade_trusted_with_capabilities(
+                "dev.bkm.ping/authority-upgrade",
+                Arc::new(PingPlugin::default()),
+                BTreeMap::new(),
+                administration,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginHostError::DuplicateAuthorityProvider(TrustedAuthorityProvider::Administration)
+        ));
     }
 
     #[test]
@@ -2523,6 +2757,179 @@ mod tests {
         assert!(events.lock().unwrap().is_empty());
         assert!(store.circuit_open(instance_id).unwrap());
         assert_eq!(store.dead_letters(Some(instance_id)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_resolves_owner_admin_user_and_missing_sender_in_one_place() {
+        let store = PluginStore::in_memory().unwrap();
+        let mut host = StaticPluginHost::new(store.clone());
+        host.register_trusted_with_capabilities(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/default",
+            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::Administration),
+        )
+        .await
+        .unwrap();
+        store
+            .commit(
+                "dev.bkm.admin/default",
+                "seed-admin",
+                &[StateOp::Put {
+                    key: delegated_admin_state_key("admin-id"),
+                    value: b"admin-id".to_vec(),
+                    expected_revision: None,
+                }],
+                &[],
+                CommitOptions::new(1024 * 1024),
+            )
+            .unwrap();
+
+        let envelope = |sender: Option<&str>| PluginEventEnvelope {
+            protocol_version: "1.2.0".to_owned(),
+            event_id: "authority-test".to_owned(),
+            delivery_id: "delivery".to_owned(),
+            invocation_id: "invocation".to_owned(),
+            occurred_at_ms: None,
+            received_at_ms: 0,
+            adapter_id: "qq.official".to_owned(),
+            event_type: "message.created".to_owned(),
+            trace_id: None,
+            payload: sender.map_or_else(
+                || json!({"data": {}}),
+                |sender| json!({"data": {"sender": {"id": sender}}}),
+            ),
+            extensions: Vec::new(),
+        };
+
+        assert_eq!(
+            host.resolve_caller_authority(&envelope(Some("owner-id")), None)
+                .unwrap()
+                .role,
+            CallerRole::Owner
+        );
+        assert_eq!(
+            host.resolve_caller_authority(&envelope(Some("admin-id")), None)
+                .unwrap()
+                .role,
+            CallerRole::Admin
+        );
+        assert_eq!(
+            host.resolve_caller_authority(&envelope(Some("ordinary")), None)
+                .unwrap()
+                .role,
+            CallerRole::User
+        );
+        assert_eq!(
+            host.resolve_caller_authority(&envelope(None), None)
+                .unwrap()
+                .role,
+            CallerRole::User
+        );
+    }
+
+    #[tokio::test]
+    async fn command_catalog_only_contains_ready_plugin_instances() {
+        let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+        host.register_trusted(
+            Arc::new(PingPlugin::default()),
+            "dev.bkm.ping/catalog",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            host.command_declarations()
+                .unwrap()
+                .iter()
+                .map(|command| command.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ping"]
+        );
+
+        host.shutdown().await.unwrap();
+        assert!(host.command_declarations().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn authority_ignores_unmarked_instances_even_at_reserved_instance_id() {
+        let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+        host.register_trusted(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/default",
+            BTreeMap::from([("owners".to_owned(), json!(["claimed-owner"]))]),
+        )
+        .await
+        .unwrap();
+        let envelope = PluginEventEnvelope {
+            protocol_version: "1.2.0".to_owned(),
+            event_id: "untrusted-authority".to_owned(),
+            delivery_id: "delivery".to_owned(),
+            invocation_id: "invocation".to_owned(),
+            occurred_at_ms: None,
+            received_at_ms: 0,
+            adapter_id: "qq.official".to_owned(),
+            event_type: "message.created".to_owned(),
+            trace_id: None,
+            payload: json!({"data": {"sender": {"id": "claimed-owner"}}}),
+            extensions: Vec::new(),
+        };
+
+        assert_eq!(
+            host.resolve_caller_authority(&envelope, None).unwrap().role,
+            CallerRole::User
+        );
+    }
+
+    #[tokio::test]
+    async fn administration_owner_config_precedes_legacy_devtools_owner_config() {
+        let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+        host.register_trusted_with_capabilities(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/default",
+            BTreeMap::from([("owners".to_owned(), json!(["admin-owner"]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::Administration),
+        )
+        .await
+        .unwrap();
+        host.register_trusted_with_capabilities(
+            Arc::new(builtin_plugins::DevToolsPlugin::default()),
+            "dev.bkm.devtools/default",
+            BTreeMap::from([("owners".to_owned(), json!(["devtools-owner"]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
+        )
+        .await
+        .unwrap();
+        let envelope = |sender: &str| PluginEventEnvelope {
+            protocol_version: "1.2.0".to_owned(),
+            event_id: "authority-source".to_owned(),
+            delivery_id: "delivery".to_owned(),
+            invocation_id: "invocation".to_owned(),
+            occurred_at_ms: None,
+            received_at_ms: 0,
+            adapter_id: "qq.official".to_owned(),
+            event_type: "message.created".to_owned(),
+            trace_id: None,
+            payload: json!({"data": {"sender": {"id": sender}}}),
+            extensions: Vec::new(),
+        };
+
+        assert_eq!(
+            host.resolve_caller_authority(&envelope("admin-owner"), None)
+                .unwrap()
+                .role,
+            CallerRole::Owner
+        );
+        assert_eq!(
+            host.resolve_caller_authority(&envelope("devtools-owner"), None)
+                .unwrap()
+                .role,
+            CallerRole::User
+        );
     }
 
     fn origin_for_test(event_id: &str) -> OutboxOrigin {

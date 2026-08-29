@@ -308,6 +308,8 @@ mod tests {
     use sha2::{Digest, Sha256};
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
+    use plugin_api::Audience;
+
     use super::{PluginPackageError, ValidatedPluginPackage, hex_digest};
 
     const MANIFEST: &str = r#"
@@ -321,6 +323,16 @@ mod tests {
 
         [metadata.locales.en]
         name = "Package Fixture"
+
+        [[commands]]
+        name = "admin"
+
+        [[commands.subcommands]]
+        name = "whoami"
+
+        [[commands.subcommands]]
+        name = "grant"
+        audience = "owner"
     "#;
     const COMPONENT: &[u8] = b"\0asm\x0d\0\x01\0";
 
@@ -352,6 +364,14 @@ mod tests {
         let bytes = package(&valid_entries());
         let validated = ValidatedPluginPackage::from_bytes(&bytes).unwrap();
         assert_eq!(validated.manifest().id.as_str(), "dev.bkm.package-fixture");
+        assert_eq!(
+            validated.manifest().commands[0].subcommands[0].audience,
+            Audience::Public
+        );
+        assert_eq!(
+            validated.manifest().commands[0].subcommands[1].audience,
+            Audience::Owner
+        );
         assert_eq!(validated.component(), COMPONENT);
         assert!(validated.config_schema().is_some());
         assert_eq!(
@@ -362,6 +382,20 @@ mod tests {
             validated.package_sha256(),
             hex_digest(Sha256::digest(&bytes).as_slice())
         );
+    }
+
+    #[test]
+    fn wasm_package_rejects_unknown_command_audience() {
+        let invalid_manifest = MANIFEST.replace("audience = \"owner\"", "audience = \"root\"");
+        let bytes = package(&[
+            ("plugin.toml", invalid_manifest.as_bytes()),
+            ("component.wasm", COMPONENT),
+        ]);
+
+        assert!(matches!(
+            ValidatedPluginPackage::from_bytes(&bytes),
+            Err(PluginPackageError::Manifest(_))
+        ));
     }
 
     #[test]

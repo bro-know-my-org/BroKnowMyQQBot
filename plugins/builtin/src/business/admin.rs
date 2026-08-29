@@ -1,7 +1,7 @@
 use super::super::{
-    BTreeMap, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest,
-    StateOp, StaticPlugin, Value, async_trait, command_tail, hex_bytes, ignored, json,
-    message_plugin_manifest, message_text, reply,
+    Audience, BTreeMap, CallerRole, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope,
+    PluginManifest, StateOp, StaticPlugin, SubcommandDeclaration, Value, async_trait, command_tail,
+    hex_bytes, ignored, json, message_plugin_manifest, message_text, reply,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -18,13 +18,20 @@ pub struct AdminPlugin {
 
 impl Default for AdminPlugin {
     fn default() -> Self {
-        let manifest = message_plugin_manifest(
+        let mut manifest = message_plugin_manifest(
             "dev.bkm.admin",
             "Administration",
             "admin",
             "message.reply",
             true,
         );
+        "管理员功能".clone_into(&mut manifest.commands[0].description);
+        manifest.commands[0].subcommands = vec![
+            subcommand("whoami", "查询自己的身份", Audience::Public),
+            subcommand("list", "查看管理员列表", Audience::Admin),
+            subcommand("grant", "委派管理员", Audience::Owner),
+            subcommand("revoke", "撤销管理员", Audience::Owner),
+        ];
         Self {
             manifest,
             config_schema: json!({
@@ -85,47 +92,49 @@ impl StaticPlugin for AdminPlugin {
         let Some(arguments) = command_tail(text, "/admin") else {
             return Ok(ignored());
         };
-        let sender = sender_id(event)?;
-        if !valid_identity(sender) {
-            return Err(PluginError::Permanent(
-                "message sender ID is invalid".to_owned(),
-            ));
-        }
-        let authorized = is_admin(queries, sender);
-        if arguments == "whoami" {
-            return Ok(reply(
-                event,
-                if authorized {
-                    "administrator"
-                } else {
-                    "not an administrator"
-                },
-                Vec::new(),
-            ));
-        }
-        if !authorized {
-            return Ok(reply(
-                event,
-                "administrator permission required",
-                Vec::new(),
-            ));
-        }
-        if arguments == "list" {
-            return Ok(reply(event, &admin_list(queries), Vec::new()));
-        }
         let mut parts = arguments.split_whitespace();
         let operation = parts.next();
         let subject = parts.next();
-        if parts.next().is_some() || subject.is_none_or(|value| !valid_identity(value)) {
+        let extra = parts.next();
+        if extra.is_some() || subject.is_some_and(|value| !valid_identity(value)) {
             return Ok(usage(event));
         }
-        let subject = subject.expect("validated subject is present");
-        if already_audited(queries, &event.event_id)? {
-            return Ok(ignored());
-        }
-        match operation {
-            Some("grant") => grant(event, queries, sender, subject),
-            Some("revoke") => revoke(event, queries, sender, subject),
+        let authority = queries.caller_authority();
+        match (operation, subject) {
+            (Some("whoami"), None) => Ok(reply(
+                event,
+                match authority.role {
+                    CallerRole::Owner => "owner",
+                    CallerRole::Admin => "administrator",
+                    CallerRole::User => "ordinary user",
+                },
+                Vec::new(),
+            )),
+            (Some("list"), None) if authority.role == CallerRole::User => Ok(reply(
+                event,
+                "administrator permission required",
+                Vec::new(),
+            )),
+            (Some("list"), None) => Ok(reply(event, &admin_list(queries), Vec::new())),
+            (Some(operation @ ("grant" | "revoke")), Some(subject)) => {
+                if authority.role != CallerRole::Owner {
+                    return Ok(reply(event, "owner permission required", Vec::new()));
+                }
+                let sender = sender_id(event)?;
+                if !valid_identity(sender) {
+                    return Err(PluginError::Permanent(
+                        "message sender ID is invalid".to_owned(),
+                    ));
+                }
+                if already_audited(queries, &event.event_id)? {
+                    return Ok(ignored());
+                }
+                match operation {
+                    "grant" => grant(event, queries, sender, subject),
+                    "revoke" => revoke(event, queries, sender, subject),
+                    _ => unreachable!("operation pattern only accepts grant or revoke"),
+                }
+            }
             _ => Ok(usage(event)),
         }
     }
@@ -303,4 +312,12 @@ fn usage(event: &PluginEventEnvelope) -> HandlerOutput {
         "usage: /admin whoami|list|grant <sender-id>|revoke <sender-id>",
         Vec::new(),
     )
+}
+
+fn subcommand(name: &str, description: &str, audience: Audience) -> SubcommandDeclaration {
+    SubcommandDeclaration {
+        name: name.to_owned(),
+        description: description.to_owned(),
+        audience,
+    }
 }

@@ -1,6 +1,6 @@
 use super::{
     HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin,
-    Value, async_trait, ignored, is_command, message_plugin_manifest, message_text, reply,
+    Value, async_trait, diagnostic_plugin_manifest, ignored, is_command, message_text, reply,
 };
 
 #[derive(Debug)]
@@ -10,7 +10,7 @@ pub struct QqExtensionProbePlugin {
 
 impl Default for QqExtensionProbePlugin {
     fn default() -> Self {
-        let mut manifest = message_plugin_manifest(
+        let mut manifest = diagnostic_plugin_manifest(
             "dev.bkm.qq-extension-probe",
             "QQ Extension Probe",
             "qq-extension",

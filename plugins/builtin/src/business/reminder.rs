@@ -1,8 +1,9 @@
 use super::super::{
-    ActionCompleted, ActionStatus, BTreeSet, CommandDeclaration, Disposition, HandlerOutput,
-    HostQueries, PluginError, PluginEventEnvelope, PluginManifest, ScheduleCancel, ScheduleCreate,
-    ScheduleTriggered, StateOp, StaticPlugin, Subscription, Value, async_trait, command_tail,
-    hex_bytes, ignored, json, message_plugin_manifest, message_text, plugin_command, reply,
+    ActionCompleted, ActionStatus, Audience, BTreeSet, CommandDeclaration, Disposition,
+    HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest, ScheduleCancel,
+    ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin, Subscription, Value, async_trait,
+    command_tail, hex_bytes, ignored, json, message_plugin_manifest, message_text, plugin_command,
+    reply,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -28,8 +29,8 @@ impl Default for ReminderPlugin {
             true,
         );
         manifest.commands.extend([
-            command("reminders", "List your pending reminders"),
-            command("remind-cancel", "Cancel one of your reminders"),
+            command("reminders", "查看提醒"),
+            command("remind-cancel", "取消提醒"),
         ]);
         manifest.subscriptions.extend([
             Subscription {
@@ -472,6 +473,8 @@ fn command(name: &str, description: &str) -> CommandDeclaration {
         name: name.to_owned(),
         aliases: Vec::new(),
         description: description.to_owned(),
+        audience: Audience::Public,
+        subcommands: Vec::new(),
     }
 }
 

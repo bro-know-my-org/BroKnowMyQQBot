@@ -1,9 +1,9 @@
 use super::{
-    ActionCompleted, ActionStatus, BTreeSet, CommandDeclaration, Disposition, HandlerOutput,
-    HostQueries, PluginError, PluginEventEnvelope, PluginManifest, ScheduleCancel, ScheduleCreate,
-    ScheduleTriggered, StaticPlugin, Subscription, Value, async_trait, command_argument,
-    command_tail, hex_bytes, ignored, json, message_plugin_manifest, message_text, plugin_command,
-    reply,
+    ActionCompleted, ActionStatus, Audience, BTreeSet, CommandDeclaration, Disposition,
+    HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest, ScheduleCancel,
+    ScheduleCreate, ScheduleTriggered, StaticPlugin, Subscription, Value, async_trait,
+    command_argument, command_tail, diagnostic_plugin_manifest, hex_bytes, ignored, json,
+    message_text, plugin_command, reply,
 };
 
 const MAX_PENDING_TASKS: usize = 128;
@@ -15,7 +15,7 @@ pub struct SchedulerProbePlugin {
 
 impl Default for SchedulerProbePlugin {
     fn default() -> Self {
-        let mut manifest = message_plugin_manifest(
+        let mut manifest = diagnostic_plugin_manifest(
             "dev.bkm.scheduler-probe",
             "Scheduler Probe",
             "schedule",
@@ -26,6 +26,8 @@ impl Default for SchedulerProbePlugin {
             name: "schedule-cancel".to_owned(),
             aliases: Vec::new(),
             description: "Cancel a scheduler probe task".to_owned(),
+            audience: Audience::DevDiagnostic,
+            subcommands: Vec::new(),
         });
         manifest.subscriptions.extend([
             Subscription {

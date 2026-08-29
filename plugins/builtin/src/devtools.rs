@@ -1,8 +1,8 @@
 use super::{
-    ActionCompleted, ActionStatus, BTreeSet, Disposition, HandlerOutput, HostQueries,
-    PluginCommand, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin, Subscription,
-    Value, async_trait, command_argument, command_declaration, ignored, is_command, json,
-    message_plugin_manifest, message_text, reply,
+    ActionCompleted, ActionStatus, Audience, BTreeSet, CallerRole, Disposition, HandlerOutput,
+    HostQueries, PluginCommand, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin,
+    Subscription, Value, async_trait, command_argument, command_declaration,
+    diagnostic_plugin_manifest, ignored, is_command, json, message_text, reply,
 };
 use std::collections::BTreeMap;
 
@@ -52,7 +52,7 @@ pub struct DevToolsPlugin {
 
 impl Default for DevToolsPlugin {
     fn default() -> Self {
-        let mut manifest = message_plugin_manifest(
+        let mut manifest = diagnostic_plugin_manifest(
             "dev.bkm.devtools",
             "Developer Tools",
             "whoami",
@@ -65,6 +65,7 @@ impl Default for DevToolsPlugin {
             "api-permissions",
             "List QQ guild API permissions",
         ));
+        manifest.commands[1].audience = Audience::DevDiagnostic;
         manifest.subscriptions.push(Subscription {
             id: "platform-query-results".to_owned(),
             event: "action.completed".to_owned(),
@@ -154,10 +155,13 @@ impl StaticPlugin for DevToolsPlugin {
                 None => return Ok(ignored()),
             }
         };
-        if !configured_owner(event, queries)? {
+        if !matches!(
+            queries.caller_authority().role,
+            CallerRole::Admin | CallerRole::Owner
+        ) {
             return Ok(reply(
                 event,
-                "API permission diagnostics are restricted to configured owners",
+                "API permission diagnostics are restricted to configured owners and delegated administrators",
                 Vec::new(),
             ));
         }
@@ -379,26 +383,6 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, PluginE
         .ok_or_else(|| PluginError::Permanent(format!("API permission {field} is invalid")))
 }
 
-fn configured_owner(
-    event: &PluginEventEnvelope,
-    queries: &dyn HostQueries,
-) -> Result<bool, PluginError> {
-    let sender = event
-        .payload
-        .pointer("/data/sender/id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| PluginError::Permanent("message sender ID is unavailable".to_owned()))?;
-    if !valid_identity(sender) {
-        return Err(PluginError::Permanent(
-            "message sender ID is invalid".to_owned(),
-        ));
-    }
-    Ok(queries
-        .config_get("owners")
-        .and_then(Value::as_array)
-        .is_some_and(|owners| owners.iter().any(|owner| owner.as_str() == Some(sender))))
-}
-
 fn valid_identity(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 124
@@ -440,13 +424,16 @@ fn qq_guild_id(event: &PluginEventEnvelope) -> Result<Option<String>, PluginErro
 mod tests {
     use std::collections::BTreeSet;
 
-    use plugin_api::{ActionCompleted, ActionStatus, ExtensionPayload, StateValue};
+    use plugin_api::{
+        ActionCompleted, ActionStatus, CallerAuthority, ExtensionPayload, StateValue,
+    };
 
     use super::*;
 
     struct Queries {
         capabilities: BTreeSet<String>,
         owners: Value,
+        role: CallerRole,
     }
 
     impl HostQueries for Queries {
@@ -469,12 +456,21 @@ mod tests {
         fn invocation_time_ms(&self) -> i64 {
             0
         }
+
+        fn caller_authority(&self) -> CallerAuthority {
+            CallerAuthority {
+                role: self.role,
+                platform: "qq.official".to_owned(),
+                subject_hint: None,
+            }
+        }
     }
 
     fn queries() -> Queries {
         Queries {
             capabilities: BTreeSet::new(),
             owners: json!(["sender-id"]),
+            role: CallerRole::Owner,
         }
     }
 
@@ -549,6 +545,7 @@ mod tests {
                 &Queries {
                     capabilities: BTreeSet::new(),
                     owners: json!(["another-owner"]),
+                    role: CallerRole::User,
                 },
             )
             .await

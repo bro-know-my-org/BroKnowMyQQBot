@@ -13,13 +13,13 @@ use bot_core::{
     shutdown_channel,
 };
 use builtin_plugins::{
-    ActionResultProbePlugin, BrowserProbePlugin, ConfigProbePlugin, DevToolsPlugin,
-    HttpProbePlugin, PingPlugin, QqExtensionProbePlugin, SchedulerProbePlugin,
+    ActionResultProbePlugin, AdminPlugin, BrowserProbePlugin, ConfigProbePlugin, DevToolsPlugin,
+    HelpPlugin, HttpProbePlugin, PingPlugin, QqExtensionProbePlugin, SchedulerProbePlugin,
 };
 use plugin_api::{
     ActionCompleted, ActionStatus, BrowserPermission, BrowserRun, BrowserStep, HandlerOutput,
     HostQueries, HttpPermission, HttpRequest, HttpResponse, PluginError, PluginEventEnvelope,
-    PluginManifest, StaticPlugin,
+    PluginManifest, StateOp, StaticPlugin,
 };
 use plugin_fixtures::{
     MigrationFixturePlugin, PanicFixturePlugin, PartitionFixturePlugin, QuotaFixturePlugin,
@@ -28,7 +28,8 @@ use plugin_fixtures::{
 use plugin_host::{
     BrowserArtifact, BrowserExecution, BrowserExecutionError, BrowserExecutor, CommitOptions,
     HttpExecutionError, HttpExecutor, PluginHostError, PluginInstanceState, PluginStore,
-    SecureHttpExecutor, StaticPluginHost, TrustedPlatformQuery, TrustedPluginCapabilities,
+    SecureHttpExecutor, StaticPluginHost, TrustedAuthorityProvider, TrustedPlatformQuery,
+    TrustedPluginCapabilities,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
@@ -301,7 +302,11 @@ impl Adapter for MockAdapter {
     }
 
     fn platform(&self) -> &'static str {
-        "qq.official"
+        if self.id.as_str().starts_with("onebot") {
+            "onebot11"
+        } else {
+            "qq.official"
+        }
     }
 
     async fn run(
@@ -502,12 +507,129 @@ async fn static_ping_plugin_runs_through_runtime_and_original_adapter() {
         .build()
         .unwrap();
 
-    runtime.run(shutdown_signal).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.run(shutdown_signal),
+    )
+    .await
+    .expect("static ping runtime should complete")
+    .unwrap();
     let Action::Reply(reply) = actions.recv().await.unwrap() else {
         panic!("expected plugin reply");
     };
     assert_eq!(reply.content, "pong");
     assert_eq!(reply.source_message_id, "source-message");
+}
+
+async fn run_authority_help(sender: &str, delegated: bool, adapter_id: &str) -> String {
+    let store = PluginStore::in_memory().unwrap();
+    let mut plugins = StaticPluginHost::new(store.clone());
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/default",
+            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::Administration),
+        )
+        .await
+        .unwrap();
+    if delegated {
+        store
+            .commit(
+                "dev.bkm.admin/default",
+                "seed-delegated-admin",
+                &[StateOp::Put {
+                    key: delegated_admin_key(sender),
+                    value: sender.as_bytes().to_vec(),
+                    expected_revision: None,
+                }],
+                &[],
+                CommitOptions::new(1024 * 1024),
+            )
+            .unwrap();
+    }
+    let help = HelpPlugin::with_commands(plugins.command_declarations().unwrap());
+    plugins
+        .register_trusted(Arc::new(help), "dev.bkm.help/default", BTreeMap::new())
+        .await
+        .unwrap();
+
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (action_sender, mut actions) = mpsc::channel(1);
+    let mut event = message_event("/help");
+    event.adapter = AdapterId::new(adapter_id);
+    let Event::Message(message) = &mut event.event else {
+        unreachable!("message_event always creates a message")
+    };
+    sender.clone_into(&mut message.sender.id);
+    let adapter = Arc::new(MockAdapter {
+        id: AdapterId::new(adapter_id),
+        event: Mutex::new(Some(event)),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+        outcome: ActionOutcome::Succeeded,
+        shutdown_after_send: false,
+    });
+    let plugins = plugins.with_adapter(adapter.clone());
+    let runtime = RuntimeBuilder::new()
+        .adapter(adapter)
+        .handler(Arc::new(plugins))
+        .build()
+        .unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.run(shutdown_signal),
+    )
+    .await
+    .expect("authority-aware help runtime should complete")
+    .unwrap();
+    let Action::Reply(reply) = actions.recv().await.unwrap() else {
+        panic!("expected help reply");
+    };
+    reply.content
+}
+
+fn delegated_admin_key(sender: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(sender.len() * 2);
+    for byte in sender.bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    format!("admins/{encoded}")
+}
+
+#[tokio::test]
+async fn authority_help_runs_end_to_end_for_user_admin_owner_and_onebot() {
+    let ordinary = run_authority_help("sensitive-user-id", false, "qq-help").await;
+    assert!(ordinary.starts_with("当前身份：普通用户\n当前平台：QQ 官方"));
+    assert!(ordinary.contains("/admin whoami"));
+    assert!(ordinary.contains("需要更高权限"));
+    assert!(ordinary.find("/admin whoami").unwrap() < ordinary.find("需要更高权限").unwrap());
+    assert!(ordinary.find("需要更高权限").unwrap() < ordinary.find("/admin list").unwrap());
+    assert!(!ordinary.contains("sensitive-user-id"));
+
+    let administrator = run_authority_help("admin-id", true, "qq-help").await;
+    assert!(administrator.starts_with("当前身份：管理员\n当前平台：QQ 官方"));
+    assert!(
+        administrator.find("/admin list").unwrap() < administrator.find("需要更高权限").unwrap()
+    );
+    let elevated = administrator.find("需要更高权限").unwrap();
+    assert!(elevated < administrator.find("/admin grant").unwrap());
+    assert!(elevated < administrator.find("/admin revoke").unwrap());
+
+    let owner = run_authority_help("owner-id", false, "qq-help").await;
+    assert!(owner.starts_with("当前身份：所有者\n当前平台：QQ 官方"));
+    assert!(owner.contains("/admin grant"));
+    assert!(owner.contains("/admin revoke"));
+    assert!(owner.contains("[所有者]"));
+    assert!(!owner.contains("需要更高权限"));
+
+    let onebot = run_authority_help("sensitive-onebot-id", false, "onebot-help").await;
+    assert!(onebot.starts_with("当前身份：普通用户\n当前平台：OneBot 11"));
+    assert!(!onebot.contains("sensitive-onebot-id"));
 }
 
 #[tokio::test]
@@ -617,7 +739,8 @@ async fn devtools_executes_only_its_allowlisted_platform_query() {
             "dev.bkm.devtools/test",
             BTreeMap::from([("owners".to_owned(), json!(["user-id"]))]),
             TrustedPluginCapabilities::default()
-                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList)
+                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
         )
         .await
         .unwrap();
@@ -692,7 +815,8 @@ async fn devtools_non_owner_never_reaches_platform_action() {
             "dev.bkm.devtools/non-owner",
             BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
             TrustedPluginCapabilities::default()
-                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList)
+                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
         )
         .await
         .unwrap();
@@ -725,7 +849,7 @@ async fn devtools_non_owner_never_reaches_platform_action() {
 }
 
 #[tokio::test]
-async fn ordinary_trusted_registration_cannot_execute_platform_queries() {
+async fn ordinary_trusted_registration_cannot_become_an_authority_provider() {
     let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
     plugins
         .register_trusted(
@@ -757,6 +881,52 @@ async fn ordinary_trusted_registration_cannot_execute_platform_queries() {
     )
     .await
     .expect("ordinary trusted runtime should complete")
+    .unwrap();
+    let Action::Reply(reply) = actions.recv().await.unwrap() else {
+        panic!("expected authority restriction reply");
+    };
+    assert!(reply.content.contains("restricted to configured owners"));
+    assert!(actions.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn authority_provider_without_platform_query_cannot_execute_it() {
+    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(DevToolsPlugin::default()),
+            "dev.bkm.devtools/authority-only",
+            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
+        )
+        .await
+        .unwrap();
+    let (shutdown_handle, shutdown_signal) = shutdown_channel();
+    let (action_sender, mut actions) = mpsc::channel(1);
+    let adapter = Arc::new(MockAdapter {
+        id: AdapterId::new("qq-devtools-authority-only"),
+        event: Mutex::new(Some(devtools_event(
+            "qq-devtools-authority-only",
+            "owner-id",
+        ))),
+        actions: action_sender,
+        shutdown: shutdown_handle,
+        outcome: ActionOutcome::Succeeded,
+        shutdown_after_send: true,
+    });
+    let runtime = RuntimeBuilder::new()
+        .adapter(adapter)
+        .handler(Arc::new(plugins))
+        .build()
+        .unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.run(shutdown_signal),
+    )
+    .await
+    .expect("authority-only runtime should complete")
     .unwrap();
     assert!(actions.try_recv().is_err());
 }

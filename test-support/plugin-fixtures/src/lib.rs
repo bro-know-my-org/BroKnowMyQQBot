@@ -296,6 +296,8 @@ impl Default for QuotaFixturePlugin {
             name: "quota-fixture".to_owned(),
             aliases: Vec::new(),
             description: "Trigger an atomic storage quota rejection".to_owned(),
+            audience: plugin_api::Audience::Hidden,
+            subcommands: Vec::new(),
         });
         manifest
             .permissions

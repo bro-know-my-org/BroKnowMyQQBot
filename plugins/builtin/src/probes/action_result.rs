@@ -1,7 +1,7 @@
 use super::{
     ActionCompleted, BTreeSet, Disposition, HandlerOutput, HostQueries, PluginError,
     PluginEventEnvelope, PluginManifest, StateOp, StaticPlugin, Subscription, async_trait,
-    hex_bytes, ignored, is_command, message_plugin_manifest, message_text, reply,
+    diagnostic_plugin_manifest, hex_bytes, ignored, is_command, message_text, reply,
 };
 
 #[derive(Debug)]
@@ -11,7 +11,7 @@ pub struct ActionResultProbePlugin {
 
 impl Default for ActionResultProbePlugin {
     fn default() -> Self {
-        let mut manifest = message_plugin_manifest(
+        let mut manifest = diagnostic_plugin_manifest(
             "dev.bkm.action-result-probe",
             "Action Result Probe",
             "probe-action-result",

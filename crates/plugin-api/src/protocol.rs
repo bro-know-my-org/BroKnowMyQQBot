@@ -339,12 +339,44 @@ pub struct StateValue {
     pub revision: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CallerRole {
+    #[default]
+    User,
+    Admin,
+    Owner,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallerAuthority {
+    pub role: CallerRole,
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_hint: Option<String>,
+}
+
+impl Default for CallerAuthority {
+    fn default() -> Self {
+        Self {
+            role: CallerRole::User,
+            platform: "unknown".to_owned(),
+            subject_hint: None,
+        }
+    }
+}
+
 pub trait HostQueries: Send + Sync {
     fn config_get(&self, key: &str) -> Option<&Value>;
     fn state_get(&self, key: &str) -> Option<&StateValue>;
     fn state_scan(&self, prefix: &str, limit: usize) -> Vec<(&str, &StateValue)>;
     fn granted_capabilities(&self) -> &BTreeSet<String>;
     fn invocation_time_ms(&self) -> i64;
+    /// Host-derived caller context for bundled static plugins. This is not a
+    /// BPP 1.2 WIT query; exposing it to WASM requires a future protocol minor.
+    fn caller_authority(&self) -> CallerAuthority {
+        CallerAuthority::default()
+    }
 }
 
 #[derive(Debug, Clone)]

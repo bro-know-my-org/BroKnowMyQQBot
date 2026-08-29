@@ -18,8 +18,8 @@ use builtin_plugins::{
     SchedulerProbePlugin,
 };
 use plugin_host::{
-    PluginStore, StaticPluginHost, TrustedPlatformQuery, TrustedPluginCapabilities,
-    ValidatedPluginPackage, WasmPlugin,
+    PluginStore, StaticPluginHost, TrustedAuthorityProvider, TrustedPlatformQuery,
+    TrustedPluginCapabilities, ValidatedPluginPackage, WasmPlugin,
 };
 
 const MAX_INSTALLATION_FILE_BYTES: usize = 1024 * 1024;
@@ -307,7 +307,7 @@ async fn load_validated_package(
 async fn register_help_plugin(
     plugins: &mut StaticPluginHost,
 ) -> Result<(), plugin_host::PluginHostError> {
-    let help = HelpPlugin::with_commands(plugins.command_declarations());
+    let help = HelpPlugin::with_commands(plugins.command_declarations()?);
     plugins
         .register_trusted(
             std::sync::Arc::new(help),
@@ -322,11 +322,19 @@ async fn register_bundled_plugins(
     selected: Option<Vec<String>>,
     configs: &BTreeMap<String, BTreeMap<String, Value>>,
 ) -> Result<(bool, BTreeSet<String>), Box<dyn std::error::Error>> {
-    let selected = selected.unwrap_or_else(|| {
+    let mut selected = selected.unwrap_or_else(|| {
         ["ping", "help", "echo", "counter", "reminder"]
             .map(str::to_owned)
             .to_vec()
     });
+    if let (Some(admin), Some(devtools)) = (
+        selected.iter().position(|name| name == "admin"),
+        selected.iter().position(|name| name == "devtools"),
+    ) {
+        if devtools < admin {
+            selected.swap(devtools, admin);
+        }
+    }
     let mut seen = BTreeSet::new();
     let mut instance_ids = BTreeSet::new();
     let mut include_help = false;
@@ -356,11 +364,13 @@ async fn register_bundled_plugins(
             "devtools" => std::sync::Arc::new(DevToolsPlugin::default()),
             _ => return Err(Box::new(PluginConfigError::UnknownBundled(name))),
         };
-        let trusted_capabilities = if name == "devtools" {
-            TrustedPluginCapabilities::default()
+        let trusted_capabilities = match name.as_str() {
+            "admin" => TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::Administration),
+            "devtools" => TrustedPluginCapabilities::default()
                 .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList)
-        } else {
-            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
+            _ => TrustedPluginCapabilities::default(),
         };
         plugins
             .register_trusted_with_capabilities(
@@ -582,6 +592,40 @@ mod tests {
                 .instance_manifest("dev.bkm.reminder/default")
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn bundled_admin_registers_before_legacy_devtools_regardless_of_selection_order() {
+        let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
+        let configs = BTreeMap::from([
+            (
+                "admin".to_owned(),
+                BTreeMap::from([("owners".to_owned(), serde_json::json!(["admin-owner"]))]),
+            ),
+            (
+                "devtools".to_owned(),
+                BTreeMap::from([("owners".to_owned(), serde_json::json!(["legacy-owner"]))]),
+            ),
+        ]);
+
+        register_bundled_plugins(
+            &mut plugins,
+            Some(vec!["devtools".to_owned(), "admin".to_owned()]),
+            &configs,
+        )
+        .await
+        .unwrap();
+
+        let commands = plugins.command_declarations().unwrap();
+        let admin = commands
+            .iter()
+            .position(|command| command.name == "admin")
+            .unwrap();
+        let devtools = commands
+            .iter()
+            .position(|command| command.name == "api-permissions")
+            .unwrap();
+        assert!(admin < devtools);
     }
 
     #[tokio::test]

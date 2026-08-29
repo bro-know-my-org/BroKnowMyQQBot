@@ -131,14 +131,7 @@ impl PluginManifest {
                 ));
             }
         }
-        let mut command_names = BTreeSet::new();
-        for command in &self.commands {
-            for name in std::iter::once(&command.name).chain(&command.aliases) {
-                if name.is_empty() || !command_names.insert(name) {
-                    return Err(ManifestError::DuplicateCommand(name.clone()));
-                }
-            }
-        }
+        validate_commands(&self.commands)?;
         validate_http_permissions(&self.permissions.http)?;
         for permission in &self.permissions.browser {
             permission.validate()?;
@@ -189,6 +182,42 @@ impl PluginManifest {
         );
         capabilities
     }
+}
+
+fn is_valid_command_token(value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(char::is_whitespace)
+        && !value.chars().any(char::is_control)
+}
+
+fn validate_commands(commands: &[CommandDeclaration]) -> Result<(), ManifestError> {
+    let mut command_names = BTreeSet::new();
+    for command in commands {
+        for name in std::iter::once(&command.name).chain(&command.aliases) {
+            if !is_valid_command_token(name) {
+                return Err(ManifestError::InvalidCommand(name.clone()));
+            }
+            if !command_names.insert(name) {
+                return Err(ManifestError::DuplicateCommand(name.clone()));
+            }
+        }
+        let mut subcommand_names = BTreeSet::new();
+        for subcommand in &command.subcommands {
+            if !is_valid_command_token(&subcommand.name) {
+                return Err(ManifestError::InvalidSubcommand {
+                    command: command.name.clone(),
+                    subcommand: subcommand.name.clone(),
+                });
+            }
+            if !subcommand_names.insert(&subcommand.name) {
+                return Err(ManifestError::DuplicateSubcommand {
+                    command: command.name.clone(),
+                    subcommand: subcommand.name.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn requirement_matches_bpp_1_0(requirement: &VersionReq) -> bool {
@@ -454,6 +483,39 @@ pub struct CommandDeclaration {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub description: String,
+    /// Help-catalog metadata only; it does not alter BPP command execution.
+    #[serde(default, skip_serializing_if = "Audience::is_public")]
+    pub audience: Audience,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subcommands: Vec<SubcommandDeclaration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubcommandDeclaration {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Omission intentionally means `public`, independently of the parent.
+    #[serde(default, skip_serializing_if = "Audience::is_public")]
+    pub audience: Audience,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Audience {
+    #[default]
+    Public,
+    Admin,
+    Owner,
+    DevDiagnostic,
+    Hidden,
+}
+
+impl Audience {
+    pub const fn is_public(value: &Self) -> bool {
+        matches!(value, Self::Public)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -757,6 +819,12 @@ pub enum ManifestError {
     DuplicateSubscription(String),
     #[error("duplicate plugin command or alias `{0}`")]
     DuplicateCommand(String),
+    #[error("invalid plugin command or alias {0:?}")]
+    InvalidCommand(String),
+    #[error("duplicate plugin subcommand `{command} {subcommand}`")]
+    DuplicateSubcommand { command: String, subcommand: String },
+    #[error("invalid plugin subcommand {command:?} {subcommand:?}")]
+    InvalidSubcommand { command: String, subcommand: String },
     #[error("invalid plugin HTTP permission: {0}")]
     InvalidHttpPermission(String),
     #[error("invalid plugin browser permission: {0}")]
@@ -772,8 +840,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        BrowserPermission, HttpPermission, LocalizedPluginMetadata, ManifestError, PluginManifest,
-        PluginMetadata, is_canonical_locale, is_valid_http_credential_name,
+        Audience, BrowserPermission, HttpPermission, LocalizedPluginMetadata, ManifestError,
+        PluginManifest, PluginMetadata, is_canonical_locale, is_valid_http_credential_name,
         url_path_matches_prefix,
     };
 
@@ -813,6 +881,115 @@ mod tests {
 
         assert_eq!(manifest.id.as_str(), "dev.bkm.ping");
         assert_eq!(manifest.subscriptions.len(), 1);
+    }
+
+    #[test]
+    fn command_audience_defaults_to_public_and_parses_subcommands() {
+        let manifest = PluginManifest::from_toml(
+            r#"
+                manifest_version = 1
+                id = "dev.bkm.admin"
+                version = "0.1.0"
+                protocol = ">=1.0,<2.0"
+
+                [metadata]
+                default_locale = "en"
+
+                [metadata.locales.en]
+                name = "Admin"
+
+                [[commands]]
+                name = "admin"
+
+                [[commands.subcommands]]
+                name = "whoami"
+
+                [[commands.subcommands]]
+                name = "grant"
+                audience = "owner"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.commands[0].audience, Audience::Public);
+        assert_eq!(
+            manifest.commands[0].subcommands[0].audience,
+            Audience::Public
+        );
+        assert_eq!(
+            manifest.commands[0].subcommands[1].audience,
+            Audience::Owner
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_command_audience() {
+        let error = PluginManifest::from_toml(
+            r#"
+                manifest_version = 1
+                id = "dev.bkm.invalid-audience"
+                version = "0.1.0"
+                protocol = ">=1.0,<2.0"
+
+                [metadata]
+                default_locale = "en"
+
+                [metadata.locales.en]
+                name = "Invalid Audience"
+
+                [[commands]]
+                name = "secret"
+                audience = "superuser"
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, ManifestError::Toml(_)));
+    }
+
+    #[test]
+    fn rejects_command_tokens_with_whitespace_or_control_characters() {
+        for (field, name) in [
+            ("command", "bad command"),
+            ("command", "bad\ncommand"),
+            ("subcommand", "bad subcommand"),
+            ("subcommand", "bad\nsubcommand"),
+        ] {
+            let command_name = if field == "command" { name } else { "valid" };
+            let manifest = format!(
+                r#"
+                    manifest_version = 1
+                    id = "dev.bkm.invalid-token"
+                    version = "0.1.0"
+                    protocol = ">=1.0,<2.0"
+
+                    [metadata]
+                    default_locale = "en"
+
+                    [metadata.locales.en]
+                    name = "Invalid Token"
+
+                    [[commands]]
+                    name = {command_name:?}
+
+                    {}
+                "#,
+                if field == "subcommand" {
+                    format!("[[commands.subcommands]]\nname = {name:?}")
+                } else {
+                    String::new()
+                }
+            );
+            let error = PluginManifest::from_toml(&manifest).unwrap_err();
+            assert!(
+                matches!(
+                    (field, error),
+                    ("command", ManifestError::InvalidCommand(_))
+                        | ("subcommand", ManifestError::InvalidSubcommand { .. })
+                ),
+                "unexpected result for {name:?}"
+            );
+        }
     }
 
     #[test]

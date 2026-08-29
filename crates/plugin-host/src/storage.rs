@@ -312,6 +312,27 @@ impl PluginStore {
             .map_err(StoreError::from)
     }
 
+    pub fn state_get(
+        &self,
+        instance_id: &str,
+        key: &str,
+    ) -> Result<Option<StateValue>, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
+        connection
+            .query_row(
+                "SELECT value, revision FROM plugin_state WHERE instance_id = ? AND key = ?",
+                params![instance_id, key],
+                |row| {
+                    Ok(StateValue {
+                        value: row.get(0)?,
+                        revision: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub(crate) fn replace_state(
         &self,
         instance_id: &str,
@@ -1597,6 +1618,7 @@ mod tests {
 
     use plugin_api::{
         ActionCompleted, ActionStatus, PluginCommand, PluginEventEnvelope, PluginMetadata, StateOp,
+        StateValue,
     };
     use rusqlite::params;
     use serde_json::json;
@@ -2210,6 +2232,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.snapshot("instance").unwrap()["counter"].revision, 1);
+        assert_eq!(
+            store.state_get("instance", "counter").unwrap(),
+            Some(StateValue {
+                value: b"1".to_vec(),
+                revision: 1,
+            })
+        );
+        assert_eq!(store.state_get("instance", "missing").unwrap(), None);
 
         let error = store
             .commit(

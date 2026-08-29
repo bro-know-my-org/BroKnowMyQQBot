@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, Duration, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope,
-    PluginManifest, StaticPlugin, Value, async_trait, ignored, is_command, json,
-    message_plugin_manifest, message_text, reply, sleep,
+    PluginManifest, StaticPlugin, Value, async_trait, diagnostic_plugin_manifest, ignored,
+    is_command, json, message_text, reply, sleep,
 };
 
 #[derive(Debug)]
@@ -13,7 +13,7 @@ pub struct ConfigProbePlugin {
 impl Default for ConfigProbePlugin {
     fn default() -> Self {
         Self {
-            manifest: message_plugin_manifest(
+            manifest: diagnostic_plugin_manifest(
                 "dev.bkm.config-probe",
                 "Config Probe",
                 "config-probe",

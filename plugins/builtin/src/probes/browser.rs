@@ -3,7 +3,7 @@ use super::{
     BrowserRunResult, BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil,
     Disposition, HandlerOutput, HostQueries, MediaReply, PluginCommand, PluginError,
     PluginEventEnvelope, PluginManifest, StaticPlugin, Subscription, async_trait, command_argument,
-    ignored, message_plugin_manifest, message_text,
+    diagnostic_plugin_manifest, ignored, message_text,
 };
 
 #[derive(Debug)]
@@ -28,7 +28,7 @@ fn normalize_screenshot_url(url: &str) -> String {
 
 impl Default for BrowserProbePlugin {
     fn default() -> Self {
-        let mut manifest = message_plugin_manifest(
+        let mut manifest = diagnostic_plugin_manifest(
             "dev.bkm.browser-probe",
             "Browser Probe",
             "screenshot",

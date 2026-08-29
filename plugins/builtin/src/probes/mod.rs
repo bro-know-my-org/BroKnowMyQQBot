@@ -1,13 +1,13 @@
 //! Explicit functional and Host capability probes.
 
 use super::{
-    ActionCompleted, ActionStatus, BTreeMap, BTreeSet, BrowserPermission, BrowserRun,
+    ActionCompleted, ActionStatus, Audience, BTreeMap, BTreeSet, BrowserPermission, BrowserRun,
     BrowserRunResult, BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil,
     CommandDeclaration, Disposition, Duration, HandlerOutput, HostQueries, HttpPermission,
     HttpRequest, HttpResponse, MediaReply, PluginCommand, PluginError, PluginEventEnvelope,
     PluginManifest, ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin,
-    Subscription, Value, async_trait, command_argument, command_tail, hex_bytes, ignored,
-    is_command, json, message_plugin_manifest, message_text, plugin_command, reply, sleep,
+    Subscription, Value, async_trait, command_argument, command_tail, diagnostic_plugin_manifest,
+    hex_bytes, ignored, is_command, json, message_text, plugin_command, reply, sleep,
 };
 
 mod action_result;

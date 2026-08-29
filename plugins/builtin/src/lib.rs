@@ -6,12 +6,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use plugin_api::{
-    ActionCompleted, ActionStatus, BrowserPermission, BrowserRun, BrowserRunResult,
-    BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil, CommandDeclaration,
-    Disposition, HandlerOutput, HostQueries, HttpPermission, HttpRequest, HttpResponse, MediaReply,
-    PluginCommand, PluginError, PluginEventEnvelope, PluginId, PluginManifest, PluginMetadata,
-    PluginPermissions, PluginRuntimeConfig, ScheduleCancel, ScheduleCreate, ScheduleTriggered,
-    StateOp, StaticPlugin, StoragePermission, Subscription,
+    ActionCompleted, ActionStatus, Audience, BrowserPermission, BrowserRun, BrowserRunResult,
+    BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil, CallerAuthority,
+    CallerRole, CommandDeclaration, Disposition, HandlerOutput, HostQueries, HttpPermission,
+    HttpRequest, HttpResponse, MediaReply, PluginCommand, PluginError, PluginEventEnvelope,
+    PluginId, PluginManifest, PluginMetadata, PluginPermissions, PluginRuntimeConfig,
+    ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin, StoragePermission,
+    SubcommandDeclaration, Subscription,
 };
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
@@ -59,7 +60,9 @@ fn message_plugin_manifest(
         commands: vec![CommandDeclaration {
             name: command.to_owned(),
             aliases: Vec::new(),
-            description: format!("Run /{command}"),
+            description: command_description(command),
+            audience: Audience::Public,
+            subcommands: Vec::new(),
         }],
         permissions: PluginPermissions {
             actions,
@@ -78,11 +81,36 @@ fn message_plugin_manifest(
     }
 }
 
+fn diagnostic_plugin_manifest(
+    id: &str,
+    name: &str,
+    command: &str,
+    action: &str,
+    storage: bool,
+) -> PluginManifest {
+    let mut manifest = message_plugin_manifest(id, name, command, action, storage);
+    manifest.commands[0].audience = Audience::DevDiagnostic;
+    manifest
+}
+
 fn command_declaration(name: &str, description: &str) -> CommandDeclaration {
     CommandDeclaration {
         name: name.to_owned(),
         aliases: Vec::new(),
         description: description.to_owned(),
+        audience: Audience::Public,
+        subcommands: Vec::new(),
+    }
+}
+
+fn command_description(command: &str) -> String {
+    match command {
+        "ping" => "测试机器人".to_owned(),
+        "count" => "查看计数".to_owned(),
+        "echo" => "原样回显".to_owned(),
+        "help" => "查看本帮助".to_owned(),
+        "remind" => "创建提醒".to_owned(),
+        _ => format!("Run /{command}"),
     }
 }
 
@@ -170,15 +198,15 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use plugin_api::{
-        ActionCompleted, ActionStatus, HostQueries, PluginEventEnvelope, StateOp, StateValue,
-        StaticPlugin,
+        ActionCompleted, ActionStatus, Audience, CallerAuthority, CallerRole, CommandDeclaration,
+        HostQueries, PluginEventEnvelope, StateOp, StateValue, StaticPlugin,
     };
     use serde_json::{Value, json};
 
     use super::{
-        ActionResultProbePlugin, ActiveSendProbePlugin, AdminPlugin, ConfigProbePlugin,
-        CounterPlugin, EchoPlugin, HelpPlugin, HttpProbePlugin, PingPlugin, ReminderPlugin,
-        SchedulerProbePlugin,
+        ActionResultProbePlugin, ActiveSendProbePlugin, AdminPlugin, BrowserProbePlugin,
+        ConfigProbePlugin, CounterPlugin, DevToolsPlugin, EchoPlugin, HelpPlugin, HttpProbePlugin,
+        PingPlugin, QqExtensionProbePlugin, ReminderPlugin, SchedulerProbePlugin,
     };
 
     struct Queries {
@@ -210,6 +238,10 @@ mod tests {
 
         fn invocation_time_ms(&self) -> i64 {
             0
+        }
+
+        fn caller_authority(&self) -> CallerAuthority {
+            CallerAuthority::default()
         }
     }
 
@@ -272,6 +304,235 @@ mod tests {
         assert!(content.contains("/http-probe"));
         assert!(content.contains("/ping"));
         assert!(content.find("/help").unwrap() < content.find("/ping").unwrap());
+        assert!(content.contains("当前身份：普通用户"));
+        assert!(content.contains("[公开]"));
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers the complete help role matrix"
+    )]
+    async fn help_partitions_admin_subcommands_and_filters_diagnostics() {
+        struct AuthorityQueries {
+            role: CallerRole,
+            platform: String,
+            capabilities: BTreeSet<String>,
+        }
+        impl HostQueries for AuthorityQueries {
+            fn config_get(&self, _key: &str) -> Option<&Value> {
+                None
+            }
+            fn state_get(&self, _key: &str) -> Option<&StateValue> {
+                None
+            }
+            fn state_scan(&self, _prefix: &str, _limit: usize) -> Vec<(&str, &StateValue)> {
+                Vec::new()
+            }
+            fn granted_capabilities(&self) -> &BTreeSet<String> {
+                &self.capabilities
+            }
+            fn invocation_time_ms(&self) -> i64 {
+                0
+            }
+            fn caller_authority(&self) -> CallerAuthority {
+                CallerAuthority {
+                    role: self.role,
+                    platform: self.platform.clone(),
+                    subject_hint: None,
+                }
+            }
+        }
+        let mut admin = super::command_declaration("admin", "管理员功能");
+        admin.subcommands = vec![
+            plugin_api::SubcommandDeclaration {
+                name: "whoami".to_owned(),
+                description: "查询自己的身份".to_owned(),
+                audience: Audience::Public,
+            },
+            plugin_api::SubcommandDeclaration {
+                name: "list".to_owned(),
+                description: "查看管理员列表".to_owned(),
+                audience: Audience::Admin,
+            },
+            plugin_api::SubcommandDeclaration {
+                name: "grant".to_owned(),
+                description: "委派管理员".to_owned(),
+                audience: Audience::Owner,
+            },
+        ];
+        let diagnostic = CommandDeclaration {
+            name: "probe".to_owned(),
+            aliases: vec!["p".to_owned()],
+            description: "探针".to_owned(),
+            audience: Audience::DevDiagnostic,
+            subcommands: Vec::new(),
+        };
+        let hidden = CommandDeclaration {
+            name: "secret".to_owned(),
+            aliases: Vec::new(),
+            description: "隐藏".to_owned(),
+            audience: Audience::Hidden,
+            subcommands: Vec::new(),
+        };
+        let plugin = HelpPlugin::with_commands([admin, diagnostic, hidden]);
+
+        let output = plugin
+            .on_event(
+                &event("/help"),
+                &AuthorityQueries {
+                    role: CallerRole::User,
+                    platform: "qq.official".to_owned(),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let content = output.commands[0].payload["content"].as_str().unwrap();
+        assert!(content.contains("当前平台：QQ 官方"));
+        assert!(content.contains("/admin whoami"));
+        assert!(content.contains("需要更高权限"));
+        assert!(content.contains("/admin list"));
+        assert!(content.contains("/admin grant"));
+        assert!(!content.contains("/probe"));
+        assert!(!content.contains("/secret"));
+        assert!(!content.contains("/p "));
+
+        let administrator = plugin
+            .on_event(
+                &event("/help"),
+                &AuthorityQueries {
+                    role: CallerRole::Admin,
+                    platform: "qq.official".to_owned(),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let administrator_content = administrator.commands[0].payload["content"]
+            .as_str()
+            .unwrap();
+        assert!(administrator_content.contains("/probe"));
+        assert!(
+            administrator_content.find("/admin list").unwrap()
+                < administrator_content.find("需要更高权限").unwrap()
+        );
+        assert!(
+            administrator_content.find("需要更高权限").unwrap()
+                < administrator_content.find("/admin grant").unwrap()
+        );
+
+        let owner = plugin
+            .on_event(
+                &event("/help"),
+                &AuthorityQueries {
+                    role: CallerRole::Owner,
+                    platform: "qq.official".to_owned(),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let owner_content = owner.commands[0].payload["content"].as_str().unwrap();
+        assert!(owner_content.contains("/probe"));
+        assert!(!owner_content.contains("需要更高权限"));
+
+        let malicious_platform = plugin
+            .on_event(
+                &event("/help"),
+                &AuthorityQueries {
+                    role: CallerRole::User,
+                    platform: format!("custom\n/fake{}", "界".repeat(10_000)),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let malicious_content = malicious_platform.commands[0].payload["content"]
+            .as_str()
+            .unwrap();
+        assert!(malicious_content.contains("custom\\n/fake"));
+        assert!(!malicious_content.contains("custom\n/fake"));
+        assert!(malicious_content.len() <= 4_096);
+    }
+
+    #[test]
+    fn every_bundled_diagnostic_command_declares_diagnostic_audience() {
+        let manifests = [
+            ActionResultProbePlugin::default().manifest().clone(),
+            ActiveSendProbePlugin::default().manifest().clone(),
+            BrowserProbePlugin::default().manifest().clone(),
+            ConfigProbePlugin::default().manifest().clone(),
+            DevToolsPlugin::default().manifest().clone(),
+            HttpProbePlugin::default().manifest().clone(),
+            QqExtensionProbePlugin::default().manifest().clone(),
+            SchedulerProbePlugin::default().manifest().clone(),
+        ];
+
+        for manifest in manifests {
+            assert!(
+                manifest
+                    .commands
+                    .iter()
+                    .all(|command| command.audience == Audience::DevDiagnostic),
+                "{} has a non-diagnostic command declaration",
+                manifest.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn help_escapes_manifest_control_characters() {
+        let plugin = HelpPlugin::with_commands([CommandDeclaration {
+            name: "safe\nforged".to_owned(),
+            aliases: Vec::new(),
+            description: "description\n需要更高权限\n/fake".to_owned(),
+            audience: Audience::Public,
+            subcommands: Vec::new(),
+        }]);
+        let output = plugin
+            .on_event(
+                &event("/help"),
+                &Queries {
+                    state: BTreeMap::new(),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let content = output.commands[0].payload["content"].as_str().unwrap();
+
+        assert!(content.contains("/safe\\nforged"));
+        assert!(content.contains("description\\n需要更高权限\\n/fake"));
+        assert_eq!(content.matches("需要更高权限").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn help_caps_alignment_for_long_command_names() {
+        let plugin = HelpPlugin::with_commands([
+            super::command_declaration("short", "Short command"),
+            super::command_declaration(&"x".repeat(10_000), "Long command"),
+        ]);
+        let output = plugin
+            .on_event(
+                &event("/help"),
+                &Queries {
+                    state: BTreeMap::new(),
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let content = output.commands[0].payload["content"].as_str().unwrap();
+        let short = content.find("/short").unwrap();
+        let label = content[short..].find("[公开]").unwrap();
+
+        assert!(
+            label <= 40,
+            "short command alignment was unbounded: {label}"
+        );
+        assert!(content.len() <= 4_096);
+        assert!(content.contains("另有 1 条命令未显示"));
     }
 
     #[tokio::test]
@@ -519,11 +780,16 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "covers authorization, parsing, state, and audit behavior together"
+    )]
     async fn admin_plugin_enforces_owner_and_persists_delegation_with_audit() {
         struct AdminQueries {
             owners: Value,
             state: BTreeMap<String, StateValue>,
             capabilities: BTreeSet<String>,
+            role: CallerRole,
         }
         impl HostQueries for AdminQueries {
             fn config_get(&self, key: &str) -> Option<&Value> {
@@ -546,11 +812,19 @@ mod tests {
             fn invocation_time_ms(&self) -> i64 {
                 0
             }
+            fn caller_authority(&self) -> CallerAuthority {
+                CallerAuthority {
+                    role: self.role,
+                    platform: "qq.official".to_owned(),
+                    subject_hint: None,
+                }
+            }
         }
         let queries = AdminQueries {
             owners: json!(["owner-id"]),
             state: BTreeMap::new(),
             capabilities: BTreeSet::new(),
+            role: CallerRole::Owner,
         };
         let output = AdminPlugin::default()
             .on_event(&event("/admin grant user-2"), &queries)
@@ -561,6 +835,50 @@ mod tests {
             "administrator granted"
         );
         assert_eq!(output.state_ops.len(), 2);
+
+        let administrator_queries = AdminQueries {
+            owners: json!(["owner-id"]),
+            state: BTreeMap::new(),
+            capabilities: BTreeSet::new(),
+            role: CallerRole::Admin,
+        };
+        let listed = AdminPlugin::default()
+            .on_event(&event("/admin list"), &administrator_queries)
+            .await
+            .unwrap();
+        assert!(
+            listed.commands[0].payload["content"]
+                .as_str()
+                .unwrap()
+                .contains("owner-id")
+        );
+        let administrator_grant = AdminPlugin::default()
+            .on_event(&event("/admin grant user-3"), &administrator_queries)
+            .await
+            .unwrap();
+        assert_eq!(
+            administrator_grant.commands[0].payload["content"],
+            "owner permission required"
+        );
+
+        let mut anonymous_whoami = event("/admin whoami");
+        anonymous_whoami.payload["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sender");
+        let anonymous = AdminPlugin::default()
+            .on_event(
+                &anonymous_whoami,
+                &AdminQueries {
+                    owners: json!(["owner-id"]),
+                    state: BTreeMap::new(),
+                    capabilities: BTreeSet::new(),
+                    role: CallerRole::User,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(anonymous.commands[0].payload["content"], "ordinary user");
 
         let denied = AdminPlugin::default()
             .on_event(
@@ -575,14 +893,35 @@ mod tests {
                     }),
                     ..event("ignored")
                 },
-                &queries,
+                &AdminQueries {
+                    role: CallerRole::User,
+                    ..queries
+                },
             )
             .await
             .unwrap();
         assert_eq!(
             denied.commands[0].payload["content"],
-            "administrator permission required"
+            "owner permission required"
         );
+
+        for malformed in [
+            "/admin",
+            "/admin whoami extra",
+            "/admin list extra",
+            "/admin grant",
+            "/admin revoke user-3 extra",
+        ] {
+            let output = AdminPlugin::default()
+                .on_event(&event(malformed), &administrator_queries)
+                .await
+                .unwrap();
+            assert_eq!(
+                output.commands[0].payload["content"],
+                "usage: /admin whoami|list|grant <sender-id>|revoke <sender-id>",
+                "malformed command was not handled as usage: {malformed}"
+            );
+        }
     }
 
     #[tokio::test]
