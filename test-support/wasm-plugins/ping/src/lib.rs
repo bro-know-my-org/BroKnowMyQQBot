@@ -3,9 +3,10 @@ wit_bindgen::generate!({
     world: "plugin",
 });
 
+use bkm::plugin::queries;
 use bkm::plugin::types::{
-    Command, CommandPayload, Disposition, EventEnvelope, EventPayload, HandlerOutput, HealthStatus,
-    InitContext, MessageReplyCommand, MigrationOutput, PluginError, StateEntry,
+    CallerRole, Command, CommandPayload, Disposition, EventEnvelope, EventPayload, HandlerOutput,
+    HealthStatus, InitContext, MessageReplyCommand, MigrationOutput, PluginError, StateEntry,
 };
 use exports::bkm::plugin::{handler::Guest as HandlerGuest, lifecycle::Guest as LifecycleGuest};
 
@@ -21,6 +22,7 @@ impl LifecycleGuest for WasmPing {
     }
 
     fn health() -> Result<HealthStatus, PluginError> {
+        assert!(matches!(queries::caller_authority().role, CallerRole::User));
         Ok(HealthStatus::Healthy)
     }
 
@@ -46,6 +48,16 @@ impl HandlerGuest for WasmPing {
         };
         match message.text.trim() {
             "/ping" => Ok(reply(&event.event_id, "pong".to_owned())),
+            "/caller-authority" => {
+                let authority = queries::caller_authority();
+                Ok(reply(
+                    &event.event_id,
+                    format!(
+                        "{:?}:{}:{:?}",
+                        authority.role, authority.platform, authority.subject_hint
+                    ),
+                ))
+            }
             "/wasm-trap" => panic!("intentional WASM fixture trap"),
             "/wasm-fuel" | "/wasm-timeout" => loop {
                 std::hint::black_box(());

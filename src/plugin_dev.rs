@@ -3080,8 +3080,9 @@ fn manifest_template(
     description: &str,
     command: &str,
 ) -> String {
+    let protocol = toml_string(&format!(">={},<2.0", plugin_api::BPP_VERSION));
     format!(
-        "manifest_version = 1\nid = {}\nversion = \"0.1.0\"\nprotocol = \">=1.1,<2.0\"\nentry = \"component.wasm\"\n\n[metadata]\ndefault_locale = {}\n\n[metadata.locales.{}]\nname = {}\ndescription = {}\n\n[[subscriptions]]\nid = \"message-handler\"\nevent = \"message.created\"\npriority = 0\nscopes = [\"group\", \"private\", \"channel\"]\n\n[[commands]]\nname = {}\naliases = []\ndescription = {}\n\n[permissions]\nactions = [\"message.reply\"]\n",
+        "manifest_version = 1\nid = {}\nversion = \"0.1.0\"\nprotocol = {protocol}\nentry = \"component.wasm\"\n\n[metadata]\ndefault_locale = {}\n\n[metadata.locales.{}]\nname = {}\ndescription = {}\n\n[[subscriptions]]\nid = \"message-handler\"\nevent = \"message.created\"\npriority = 0\nscopes = [\"group\", \"private\", \"channel\"]\n\n[[commands]]\nname = {}\naliases = []\ndescription = {}\n\n[permissions]\nactions = [\"message.reply\"]\n",
         toml_string(plugin_id),
         toml_string(locale),
         toml_string(locale),
@@ -3108,7 +3109,8 @@ fn source_template(class_name: &str, command: &str) -> String {
 
 fn readme_template(display_name: &str, command: &str) -> String {
     format!(
-        "# {display_name}\n\nGenerated BPP 1.2 plugin.\n\n```bash\nbkmqb plugin check\nbkmqb plugin build\nbkmqb plugin inspect target/bkmqb/*.bkm-plugin\nbkmqb plugin install target/bkmqb/*.bkm-plugin\nbkmqb plugin publish\n```\n\nThe starter command is `/{command}`.\n"
+        "# {display_name}\n\nGenerated BPP {} plugin.\n\n```bash\nbkmqb plugin check\nbkmqb plugin build\nbkmqb plugin inspect target/bkmqb/*.bkm-plugin\nbkmqb plugin install target/bkmqb/*.bkm-plugin\nbkmqb plugin publish\n```\n\nThe starter command is `/{command}`.\n",
+        plugin_api::BPP_VERSION
     )
 }
 
@@ -3269,7 +3271,7 @@ mod tests {
         assert!(
             fs::read_to_string(directory.join("README.md"))
                 .unwrap()
-                .contains("Generated BPP 1.2 plugin")
+                .contains(&format!("Generated BPP {} plugin", plugin_api::BPP_VERSION))
         );
         fs::remove_dir_all(directory).unwrap();
     }

@@ -28,7 +28,6 @@ use plugin_host::{
 };
 
 const MAX_INSTALLATION_FILE_BYTES: usize = 1024 * 1024;
-const MAX_CONFIGURED_OWNERS: usize = 32;
 pub(crate) const DEFAULT_BUNDLED_PLUGINS: &[&str] =
     &["ping", "help", "echo", "counter", "reminder"];
 const COVERAGE_PROBE_NAMES: &[&str] = &[
@@ -111,62 +110,6 @@ impl PluginInstallations {
         })?;
         Ok(installations)
     }
-}
-
-pub(crate) fn global_administrator_ids(
-    installation_file: Option<&Path>,
-) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
-    let installations = installation_file.map_or_else(
-        || Ok(PluginInstallations::default()),
-        PluginInstallations::from_path,
-    )?;
-    let mut administrators = BTreeSet::new();
-    if let Some(owners) = installations
-        .bundled_config
-        .get("admin")
-        .and_then(|config| config.get("owners"))
-    {
-        let owners = owners
-            .as_array()
-            .ok_or("bundled admin `owners` must be an array")?;
-        if owners.is_empty() || owners.len() > MAX_CONFIGURED_OWNERS {
-            return Err(format!(
-                "bundled admin `owners` must contain 1..={MAX_CONFIGURED_OWNERS} identities"
-            )
-            .into());
-        }
-        for owner in owners {
-            let owner = owner
-                .as_str()
-                .ok_or("bundled admin `owners` entries must be strings")?;
-            if !valid_administrator_identity(owner) {
-                return Err("bundled admin `owners` contains an invalid identity".into());
-            }
-            if !administrators.insert(owner.to_owned()) {
-                return Err("bundled admin `owners` contains duplicate identities".into());
-            }
-        }
-    }
-    Ok(administrators)
-}
-
-fn valid_administrator_identity(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 124
-        && !value.chars().any(|character| {
-            character.is_control()
-                || matches!(
-                    character,
-                    '\u{00ad}'
-                        | '\u{061c}'
-                        | '\u{200b}'..='\u{200f}'
-                        | '\u{2028}'
-                        | '\u{2029}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2060}'..='\u{206f}'
-                        | '\u{feff}'
-                )
-        })
 }
 
 pub(crate) fn is_reserved_bundled_instance_id(instance_id: &str) -> bool {
@@ -577,26 +520,6 @@ mod tests {
     }
 
     #[test]
-    fn global_administrators_include_configured_owners() {
-        let directory = TestDirectory::new();
-        let installation_file = directory.0.join("plugins.toml");
-        fs::write(
-            &installation_file,
-            r#"
-                bundled = ["ping"]
-
-                [bundled_config.admin]
-                owners = ["owner-1", "owner-2"]
-            "#,
-        )
-        .unwrap();
-        assert_eq!(
-            global_administrator_ids(Some(&installation_file)).unwrap(),
-            BTreeSet::from(["owner-1".to_owned(), "owner-2".to_owned()])
-        );
-    }
-
-    #[test]
     fn default_bundled_plugin_order_is_stable() {
         assert_eq!(
             DEFAULT_BUNDLED_PLUGINS,
@@ -729,38 +652,6 @@ mod tests {
                 "ordinary build did not reject {name} with an actionable error"
             );
         }
-    }
-
-    #[test]
-    fn global_administrators_reject_malformed_configured_owners() {
-        let directory = TestDirectory::new();
-        let installation_file = directory.0.join("plugins.toml");
-        fs::write(
-            &installation_file,
-            r#"
-                [bundled_config.admin]
-                owners = "owner-1"
-            "#,
-        )
-        .unwrap();
-        assert!(global_administrator_ids(Some(&installation_file)).is_err());
-
-        fs::write(
-            &installation_file,
-            r#"
-                [bundled_config.admin]
-                owners = ["owner-1", "owner-1"]
-            "#,
-        )
-        .unwrap();
-        assert!(global_administrator_ids(Some(&installation_file)).is_err());
-
-        fs::write(
-            &installation_file,
-            "[bundled_config.admin]\nowners = [\"owner\\u{202e}spoof\"]\n",
-        )
-        .unwrap();
-        assert!(global_administrator_ids(Some(&installation_file)).is_err());
     }
 
     #[tokio::test]
@@ -942,7 +833,6 @@ mod tests {
                 requested_permissions: vec!["message.reply".to_owned()],
                 granted_permissions: vec!["message.reply".to_owned()],
                 config: BTreeMap::new(),
-                admins_explicit: false,
                 enabled: true,
                 installed_at_ms: 1,
                 updated_at_ms: 1,
@@ -974,7 +864,6 @@ mod tests {
                 requested_permissions: vec!["message.reply".to_owned()],
                 granted_permissions: Vec::new(),
                 config: BTreeMap::new(),
-                admins_explicit: false,
                 enabled: false,
                 installed_at_ms: 1,
                 updated_at_ms: 1,
@@ -1010,7 +899,6 @@ mod tests {
                 requested_permissions: Vec::new(),
                 granted_permissions: Vec::new(),
                 config: BTreeMap::new(),
-                admins_explicit: false,
                 enabled: true,
                 installed_at_ms: 1,
                 updated_at_ms: 1,
@@ -1053,7 +941,6 @@ mod tests {
                 requested_permissions: vec!["message.reply".to_owned()],
                 granted_permissions: vec!["message.reply".to_owned()],
                 config: BTreeMap::new(),
-                admins_explicit: false,
                 enabled: true,
                 installed_at_ms: 1,
                 updated_at_ms: 1,

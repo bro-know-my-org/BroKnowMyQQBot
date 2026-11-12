@@ -18,10 +18,10 @@ use async_trait::async_trait;
 use bot_core::{Event, MessageSegment, MessageTarget};
 use plugin_api::{
     ActionCompleted, BrowserColorScheme, BrowserRun, BrowserScreenshotFormat, BrowserStep,
-    BrowserViewport, BrowserWaitUntil, HandlerOutput, HealthStatus, HostQueries, HttpRequest,
-    InitContext, MediaReply, MediaSend, PluginCommand, PluginDiagnostic, PluginError,
-    PluginEventEnvelope, PluginManifest, PluginMessageTarget, ScheduleCancel, ScheduleCreate,
-    ScheduleTriggered, StateOp, StateValue, StaticPlugin,
+    BrowserViewport, BrowserWaitUntil, CallerAuthority, CallerRole, HandlerOutput, HealthStatus,
+    HostQueries, HttpRequest, InitContext, MediaReply, MediaSend, PluginCommand, PluginDiagnostic,
+    PluginError, PluginEventEnvelope, PluginManifest, PluginMessageTarget, ScheduleCancel,
+    ScheduleCreate, ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -44,6 +44,7 @@ struct StoreData {
     assets: BTreeMap<String, Vec<u8>>,
     granted_capabilities: BTreeSet<String>,
     invocation_time_ms: i64,
+    caller_authority: CallerAuthority,
     limits: PluginResourceLimits,
 }
 
@@ -162,6 +163,19 @@ impl queries::Host for StoreData {
     fn invocation_time_ms(&mut self) -> impl Future<Output = i64> {
         std::future::ready(self.invocation_time_ms)
     }
+
+    fn caller_authority(&mut self) -> impl Future<Output = types::CallerAuthority> {
+        let authority = &self.caller_authority;
+        std::future::ready(types::CallerAuthority {
+            role: match authority.role {
+                CallerRole::User => types::CallerRole::User,
+                CallerRole::Admin => types::CallerRole::Admin,
+                CallerRole::Owner => types::CallerRole::Owner,
+            },
+            platform: authority.platform.clone(),
+            subject_hint: authority.subject_hint.clone(),
+        })
+    }
 }
 
 struct WasmInstance {
@@ -233,6 +247,7 @@ impl WasmPlugin {
                 assets,
                 granted_capabilities: BTreeSet::new(),
                 invocation_time_ms: 0,
+                caller_authority: CallerAuthority::default(),
                 limits: PluginResourceLimits {
                     inner: limits,
                     memory_bytes,
@@ -268,6 +283,7 @@ impl WasmPlugin {
         &self,
         store: &mut Store<StoreData>,
     ) -> Result<EpochDeadline, PluginError> {
+        store.data_mut().caller_authority = CallerAuthority::default();
         reset_fuel(store, self.fuel)?;
         store.set_epoch_deadline(1);
         let engine = self.engine.clone();
@@ -382,6 +398,7 @@ impl StaticPlugin for WasmPlugin {
             .granted_capabilities
             .clone_from(queries.granted_capabilities());
         instance.store.data_mut().invocation_time_ms = queries.invocation_time_ms();
+        instance.store.data_mut().caller_authority = queries.caller_authority();
         let WasmInstance { store, bindings } = &mut *instance;
         let output = bindings
             .bkm_plugin_handler()

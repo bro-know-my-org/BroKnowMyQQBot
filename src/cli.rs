@@ -344,15 +344,7 @@ async fn install_or_update(
 
     let requested = manifest.requested_capabilities();
     let granted = resolve_grants(&requested, existing.as_ref(), &options, interactive)?;
-    let mut instance_config = merged_installation_config(existing.as_ref(), &options, update);
-    let admins_explicit = options.explicit_config_keys.contains("admins")
-        || existing.as_ref().is_some_and(|item| item.admins_explicit);
-    inherit_global_administrators(
-        &package,
-        &mut instance_config,
-        admins_explicit,
-        bot_config.plugins.installations.as_deref(),
-    )?;
+    let instance_config = merged_installation_config(existing.as_ref(), &options, update);
     let permissions_complete = requested.is_subset(&granted);
     print_install_summary(&InstallSummary {
         operation: if update { "Update" } else { "Install" },
@@ -378,7 +370,6 @@ async fn install_or_update(
         requested,
         granted,
         config: instance_config,
-        admins_explicit,
         permissions_complete,
         config_error,
         update,
@@ -413,7 +404,6 @@ struct PendingInstallation {
     requested: BTreeSet<String>,
     granted: BTreeSet<String>,
     config: BTreeMap<String, Value>,
-    admins_explicit: bool,
     permissions_complete: bool,
     config_error: Option<String>,
     update: bool,
@@ -447,7 +437,6 @@ fn finish_installation(
         requested_permissions: pending.requested.iter().cloned().collect(),
         granted_permissions: pending.granted.iter().cloned().collect(),
         config: pending.config.clone(),
-        admins_explicit: pending.admins_explicit,
         enabled: existing.is_none_or(|item| item.enabled) && requirements_complete,
         installed_at_ms: existing.map_or(now, |item| item.installed_at_ms),
         updated_at_ms: now,
@@ -600,83 +589,6 @@ fn merged_installation_config(
     };
     config.extend(options.config.clone());
     config
-}
-
-fn inherit_global_administrators(
-    package: &ValidatedPluginPackage,
-    config: &mut BTreeMap<String, Value>,
-    admins_explicit: bool,
-    installation_file: Option<&Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !schema_declares_property(package.config_schema(), "admins") {
-        if !admins_explicit {
-            config.remove("admins");
-        }
-        return Ok(());
-    }
-    if admins_explicit {
-        return Ok(());
-    }
-    let administrators = plugins::global_administrator_ids(installation_file)?;
-    apply_inherited_administrators(config, admins_explicit, administrators);
-    Ok(())
-}
-
-fn apply_inherited_administrators(
-    config: &mut BTreeMap<String, Value>,
-    admins_explicit: bool,
-    administrators: BTreeSet<String>,
-) {
-    if admins_explicit {
-        return;
-    }
-    if administrators.is_empty() {
-        config.remove("admins");
-    } else {
-        config.insert(
-            "admins".to_owned(),
-            Value::Array(administrators.into_iter().map(Value::String).collect()),
-        );
-    }
-}
-
-fn schema_declares_property(schema: Option<&Value>, property: &str) -> bool {
-    let Some(root) = schema else {
-        return false;
-    };
-    schema_node_declares_property(root, root, property, &mut BTreeSet::new())
-}
-
-fn schema_node_declares_property(
-    root: &Value,
-    node: &Value,
-    property: &str,
-    visited_references: &mut BTreeSet<String>,
-) -> bool {
-    if node
-        .get("properties")
-        .and_then(Value::as_object)
-        .is_some_and(|properties| properties.contains_key(property))
-    {
-        return true;
-    }
-    if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
-        if reference.starts_with('#')
-            && visited_references.insert(reference.to_owned())
-            && root
-                .pointer(reference.strip_prefix('#').unwrap_or_default())
-                .is_some_and(|target| {
-                    schema_node_declares_property(root, target, property, visited_references)
-                })
-        {
-            return true;
-        }
-    }
-    ["allOf", "anyOf", "oneOf"]
-        .into_iter()
-        .filter_map(|keyword| node.get(keyword).and_then(Value::as_array))
-        .flatten()
-        .any(|child| schema_node_declares_property(root, child, property, visited_references))
 }
 
 fn next_installation_timestamp(existing: Option<&PluginInstallation>) -> i64 {
@@ -1042,7 +954,6 @@ struct InstallOptions {
     instance_id: Option<String>,
     grants: BTreeSet<String>,
     config: BTreeMap<String, Value>,
-    explicit_config_keys: BTreeSet<String>,
     config_file_provided: bool,
     accept_permissions: bool,
     yes: bool,
@@ -1082,7 +993,6 @@ impl InstallOptions {
                         return Err("configuration key cannot be empty".into());
                     }
                     inline_config.insert(key.to_owned(), serde_json::from_str(value)?);
-                    options.explicit_config_keys.insert(key.to_owned());
                 }
                 "--config-file" => {
                     index += 1;
@@ -1104,9 +1014,6 @@ impl InstallOptions {
         if let Some(path) = config_file {
             options.config = read_plugin_config_file(&path)?;
             options.config_file_provided = true;
-            options
-                .explicit_config_keys
-                .extend(options.config.keys().cloned());
         }
         if let Some(duplicate) = inline_config
             .keys()
@@ -1637,7 +1544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_persists_administrator_provenance_across_schema_changes() {
+    async fn installation_preserves_plugin_config_without_inheriting_owners() {
         let directory = TestDirectory::new();
         let package_path = directory.0.join("with-admins.bkm-plugin");
         let package_without_admins = directory.0.join("without-admins.bkm-plugin");
@@ -1648,7 +1555,13 @@ mod tests {
             )),
         )
         .unwrap();
-        fs::write(&package_without_admins, ping_package_with_schema(None)).unwrap();
+        fs::write(
+            &package_without_admins,
+            ping_package_with_schema(Some(
+                br#"{"type":"object","properties":{},"additionalProperties":false}"#,
+            )),
+        )
+        .unwrap();
         let database = directory.0.join("plugins.db");
         let empty_config = directory.0.join("empty.json");
         let explicit_config = directory.0.join("explicit.json");
@@ -1670,9 +1583,9 @@ mod tests {
             &empty_config,
         )
         .await;
-        let inherited = store.installation(default_instance).unwrap().unwrap();
-        assert_eq!(inherited.config["admins"], serde_json::json!(["old-owner"]));
-        assert!(!inherited.admins_explicit);
+        let installed = store.installation(default_instance).unwrap().unwrap();
+        assert!(installed.config.is_empty());
+        assert!(installed.enabled);
 
         write_test_owners(&installations, "new-owner");
         manage_test_plugin(
@@ -1685,8 +1598,8 @@ mod tests {
         )
         .await;
         let refreshed = store.installation(default_instance).unwrap().unwrap();
-        assert_eq!(refreshed.config["admins"], serde_json::json!(["new-owner"]));
-        assert!(!refreshed.admins_explicit);
+        assert!(refreshed.config.is_empty());
+        assert!(refreshed.enabled);
 
         manage_test_plugin(
             &store,
@@ -1712,33 +1625,27 @@ mod tests {
             explicit.config["admins"],
             serde_json::json!(["plugin-admin"])
         );
-        assert!(explicit.admins_explicit);
-
-        let schema_removed_instance = "dev.bkm.wasm-ping/schema-removed";
-        manage_test_plugin(
-            &store,
-            &config,
-            "install",
-            &package_path,
-            schema_removed_instance,
-            &empty_config,
-        )
-        .await;
+        assert!(explicit.enabled);
         manage_test_plugin(
             &store,
             &config,
             "update",
             &package_without_admins,
-            schema_removed_instance,
+            default_instance,
             &empty_config,
         )
         .await;
-        let schema_removed = store
-            .installation(schema_removed_instance)
-            .unwrap()
-            .unwrap();
-        assert!(!schema_removed.config.contains_key("admins"));
-        assert!(!schema_removed.admins_explicit);
+        let schema_removed = store.installation(default_instance).unwrap().unwrap();
+        assert_eq!(schema_removed.config, explicit.config);
+        assert!(!schema_removed.enabled);
+        let config_error = validate_install_candidate(
+            ValidatedPluginPackage::from_path(&package_without_admins).unwrap(),
+            &schema_removed.config,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(config_error.contains("admins"), "{config_error}");
     }
 
     #[test]
@@ -1757,7 +1664,6 @@ mod tests {
             requested_permissions: vec!["message.reply".to_owned()],
             granted_permissions: vec!["message.reply".to_owned()],
             config: BTreeMap::new(),
-            admins_explicit: false,
             enabled: true,
             installed_at_ms: 1,
             updated_at_ms: 1,
@@ -1792,7 +1698,6 @@ mod tests {
                 ("kept".to_owned(), serde_json::json!(1)),
                 ("changed".to_owned(), serde_json::json!("old")),
             ]),
-            admins_explicit: false,
             enabled: true,
             installed_at_ms: 1,
             updated_at_ms: 1,
@@ -1827,7 +1732,6 @@ mod tests {
             requested_permissions: vec!["message.reply".to_owned()],
             granted_permissions: vec!["message.reply".to_owned()],
             config: BTreeMap::new(),
-            admins_explicit: false,
             enabled: true,
             installed_at_ms: 1,
             updated_at_ms: 1,
@@ -1862,7 +1766,6 @@ mod tests {
             requested_permissions: vec!["message.reply".to_owned()],
             granted_permissions: vec!["message.reply".to_owned()],
             config: BTreeMap::new(),
-            admins_explicit: false,
             enabled: true,
             installed_at_ms: 1,
             updated_at_ms: 1,
@@ -1931,44 +1834,6 @@ mod tests {
                 .to_string()
                 .contains("usage:")
         );
-    }
-
-    #[test]
-    fn administrator_property_detection_follows_local_references() {
-        let schema = serde_json::json!({
-            "$defs": {
-                "authorization": {
-                    "type": "object",
-                    "properties": { "admins": { "type": "array" } }
-                }
-            },
-            "allOf": [{ "$ref": "#/$defs/authorization" }]
-        });
-        assert!(schema_declares_property(Some(&schema), "admins"));
-        assert!(!schema_declares_property(Some(&schema), "owners"));
-    }
-
-    #[test]
-    fn inherited_administrators_refresh_unless_explicitly_overridden() {
-        let mut inherited =
-            BTreeMap::from([("admins".to_owned(), serde_json::json!(["old-owner"]))]);
-        apply_inherited_administrators(
-            &mut inherited,
-            false,
-            BTreeSet::from(["new-owner".to_owned()]),
-        );
-        assert_eq!(inherited["admins"], serde_json::json!(["new-owner"]));
-        apply_inherited_administrators(&mut inherited, false, BTreeSet::new());
-        assert!(!inherited.contains_key("admins"));
-
-        let mut explicit =
-            BTreeMap::from([("admins".to_owned(), serde_json::json!(["plugin-admin"]))]);
-        apply_inherited_administrators(
-            &mut explicit,
-            true,
-            BTreeSet::from(["global-owner".to_owned()]),
-        );
-        assert_eq!(explicit["admins"], serde_json::json!(["plugin-admin"]));
     }
 
     #[test]

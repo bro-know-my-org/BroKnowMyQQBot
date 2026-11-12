@@ -372,8 +372,8 @@ pub trait HostQueries: Send + Sync {
     fn state_scan(&self, prefix: &str, limit: usize) -> Vec<(&str, &StateValue)>;
     fn granted_capabilities(&self) -> &BTreeSet<String>;
     fn invocation_time_ms(&self) -> i64;
-    /// Host-derived caller context for bundled static plugins. This is not a
-    /// BPP 1.2 WIT query; exposing it to WASM requires a future protocol minor.
+    /// Host-derived caller context shared by static plugins and the BPP 1.3
+    /// `caller-authority` WIT query. It is stable within one invocation.
     fn caller_authority(&self) -> CallerAuthority {
         CallerAuthority::default()
     }

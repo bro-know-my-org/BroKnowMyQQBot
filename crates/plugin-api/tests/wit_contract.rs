@@ -17,7 +17,7 @@ fn formal_wit_contract_parses_with_expected_identity() {
     assert_eq!(package.name.name, "plugin");
     assert_eq!(
         package.name.version.as_ref().map(ToString::to_string),
-        Some("1.2.0".to_owned())
+        Some(plugin_api::BPP_VERSION.to_owned())
     );
     assert!(package.worlds.contains_key("plugin"));
     assert!(package.interfaces.contains_key("types"));
@@ -26,6 +26,19 @@ fn formal_wit_contract_parses_with_expected_identity() {
     assert!(package.interfaces.contains_key("handler"));
     let types_id = package.interfaces["types"];
     let types = &resolve.interfaces[types_id];
+    let queries = &resolve.interfaces[package.interfaces["queries"]];
+    assert!(queries.functions.contains_key("caller-authority"));
+    let TypeDefKind::Enum(roles) = &resolve.types[types.types["caller-role"]].kind else {
+        panic!("BPP caller-role must be an enum");
+    };
+    assert_eq!(
+        roles
+            .cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect::<Vec<_>>(),
+        ["user", "admin", "owner"]
+    );
     let message_target_id = types.types["message-target"];
     let TypeDefKind::Variant(message_target) = &resolve.types[message_target_id].kind else {
         panic!("BPP message-target must be a variant");

@@ -22,4 +22,4 @@ pub use protocol::{
     ScheduleCreate, ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 
-pub const BPP_VERSION: &str = "1.2.0";
+pub const BPP_VERSION: &str = "1.3.0";

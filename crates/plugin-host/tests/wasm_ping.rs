@@ -7,15 +7,19 @@ use bot_core::{
     EventId, MessageSegment, MessageTarget, RuntimeBuilder, Sender, ShutdownHandle, ShutdownSignal,
     shutdown_channel,
 };
-use builtin_plugins::PingPlugin;
-use plugin_api::StaticPlugin;
-use plugin_host::{PluginStore, StaticPluginHost, ValidatedPluginPackage, WasmPlugin};
-use serde_json::Value;
+use builtin_plugins::{AdminPlugin, PingPlugin};
+use plugin_api::{StateOp, StaticPlugin};
+use plugin_host::{
+    CommitOptions, PluginStore, StaticPluginHost, TrustedAuthorityProvider,
+    TrustedPluginCapabilities, ValidatedPluginPackage, WasmPlugin,
+};
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug)]
 struct MockAdapter {
     id: AdapterId,
+    platform: &'static str,
     event: Mutex<Option<EventEnvelope>>,
     actions: mpsc::Sender<Action>,
     shutdown: ShutdownHandle,
@@ -28,7 +32,7 @@ impl Adapter for MockAdapter {
     }
 
     fn platform(&self) -> &'static str {
-        "mock"
+        self.platform
     }
 
     async fn run(
@@ -92,14 +96,24 @@ async fn run_ping(plugin: Arc<dyn StaticPlugin>) -> Action {
         .register_trusted(plugin, instance_id, BTreeMap::new())
         .await
         .unwrap();
+    run_plugin(plugins, ping_event(), "mock").await
+}
+
+async fn run_plugin(
+    plugins: StaticPluginHost,
+    event: EventEnvelope,
+    platform: &'static str,
+) -> Action {
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(1);
     let adapter = Arc::new(MockAdapter {
-        id: AdapterId::new("mock"),
-        event: Mutex::new(Some(ping_event())),
+        id: event.adapter.clone(),
+        platform,
+        event: Mutex::new(Some(event)),
         actions: action_sender,
         shutdown: shutdown_handle,
     });
+    let plugins = plugins.with_adapter(adapter.clone());
     let runtime = RuntimeBuilder::new()
         .adapter(adapter)
         .handler(Arc::new(plugins))
@@ -117,6 +131,7 @@ async fn run_ping(plugin: Arc<dyn StaticPlugin>) -> Action {
 
 #[tokio::test]
 async fn wasm_ping_matches_static_ping_through_bpp_host_and_adapter() {
+    // This unchanged package imports BPP 1.2; the current Host also serves it.
     let package_bytes = base64::engine::general_purpose::STANDARD
         .decode(
             include_str!("../../../test-support/wasm-plugins/ping/component.bkm-plugin.b64").trim(),
@@ -128,4 +143,75 @@ async fn wasm_ping_matches_static_ping_through_bpp_host_and_adapter() {
     let static_action = run_ping(Arc::new(PingPlugin::default())).await;
     let wasm_action = run_ping(wasm).await;
     assert_eq!(static_action, wasm_action);
+}
+
+#[tokio::test]
+async fn wasm_receives_current_platform_bound_authority_and_lifecycle_does_not_keep_it() {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            include_str!("../../../test-support/wasm-plugins/ping/authority.bkm-plugin.b64").trim(),
+        )
+        .unwrap();
+    let wasm = Arc::new(
+        WasmPlugin::from_package(ValidatedPluginPackage::from_bytes(&bytes).unwrap())
+            .await
+            .unwrap(),
+    );
+    for (platform, sender, delegated, expected) in [
+        ("qq.official", "owner-id", false, "Owner"),
+        ("qq.official", "admin-id", true, "Admin"),
+        ("qq.official", "admin-id", false, "User"),
+        ("qq.official", "ordinary-id", false, "User"),
+        ("onebot11", "owner-id", false, "User"),
+        ("onebot11", "admin-id", true, "User"),
+    ] {
+        let store = PluginStore::in_memory().unwrap();
+        let mut host = StaticPluginHost::new(store.clone());
+        host.register_trusted_with_capabilities(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/test",
+            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::Administration),
+        )
+        .await
+        .unwrap();
+        if delegated {
+            store
+                .commit(
+                    "dev.bkm.admin/test",
+                    "delegate",
+                    &[StateOp::Put {
+                        key: "admins/61646d696e2d6964".to_owned(),
+                        value: b"admin-id".to_vec(),
+                        expected_revision: None,
+                    }],
+                    &[],
+                    CommitOptions::new(1024 * 1024),
+                )
+                .unwrap();
+        }
+        host.register_trusted(wasm.clone(), "dev.bkm.wasm-ping/test", BTreeMap::new())
+            .await
+            .unwrap();
+        let mut event = ping_event();
+        event.adapter = AdapterId::new("reusable-adapter-id");
+        let Event::Message(message) = &mut event.event else {
+            unreachable!()
+        };
+        message.sender.id = sender.to_owned();
+        message.text = "/caller-authority".to_owned();
+        message.segments = vec![MessageSegment::Text {
+            text: message.text.clone(),
+        }];
+        let Action::Reply(reply) = run_plugin(host, event, platform).await else {
+            panic!("expected authority reply")
+        };
+        assert_eq!(
+            reply.content,
+            format!("CallerRole::{expected}:{platform}:None")
+        );
+        // The fixture rejects any privileged role retained by the next lifecycle call.
+        wasm.health().await.unwrap();
+    }
 }
