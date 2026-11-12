@@ -166,11 +166,17 @@ const fn enabled_by_default() -> bool {
     true
 }
 
+#[derive(Debug)]
+pub(crate) struct LoadedPlugins {
+    pub(crate) packages: BTreeMap<String, String>,
+    pub(crate) file_instances: BTreeSet<String>,
+}
+
 pub(crate) async fn load_plugins(
     plugins: &mut StaticPluginHost,
     store: &PluginStore,
     installation_file: Option<&Path>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<LoadedPlugins, Box<dyn std::error::Error>> {
     let installations = installation_file.map_or_else(
         || Ok(PluginInstallations::default()),
         PluginInstallations::from_path,
@@ -181,6 +187,11 @@ pub(crate) async fn load_plugins(
         &installations.bundled_config,
     )
     .await?;
+    let file_instances: BTreeSet<_> = installations
+        .wasm
+        .iter()
+        .map(|item| item.instance_id.clone())
+        .collect();
     for installation in installations.wasm {
         if !installation.enabled {
             info!(
@@ -225,32 +236,26 @@ pub(crate) async fn load_plugins(
     let installation_store = store.clone();
     let managed_installations =
         tokio::task::spawn_blocking(move || installation_store.enabled_installations()).await??;
+    let mut loaded_packages = BTreeMap::new();
     for installation in managed_installations {
         if is_reserved_bundled_instance_id(&installation.instance_id) {
             return Err(Box::new(PluginConfigError::ReservedInstance(
                 installation.instance_id,
             )));
         }
-        if !declared_instances.insert(installation.instance_id.clone()) {
+        if file_instances.contains(&installation.instance_id)
+            || !declared_instances.insert(installation.instance_id.clone())
+        {
             return Err(Box::new(PluginConfigError::DuplicateInstance(
                 installation.instance_id,
             )));
         }
         let package_path = PathBuf::from(&installation.package_path);
         let package = load_validated_package(package_path.clone()).await?;
-        if package.package_sha256() != installation.package_sha256 {
-            return Err(Box::new(PluginConfigError::PackageHashChanged {
-                path: package_path,
-                expected: installation.package_sha256,
-                actual: package.package_sha256().to_owned(),
-            }));
-        }
-        if package.manifest().id.as_str() != installation.plugin_id {
-            return Err(Box::new(PluginConfigError::PackageIdentityChanged {
-                instance_id: installation.instance_id,
-            }));
-        }
+        validate_managed_package(&installation, &package)?;
         let plugin = std::sync::Arc::new(WasmPlugin::from_package(package).await?);
+        let loaded_id = installation.instance_id.clone();
+        let loaded_hash = installation.package_sha256.clone();
         plugins
             .register(
                 plugin,
@@ -259,9 +264,34 @@ pub(crate) async fn load_plugins(
                 installation.granted_permissions.into_iter().collect(),
             )
             .await?;
+        loaded_packages.insert(loaded_id, loaded_hash);
     }
     if include_help {
         register_help_plugin(plugins).await?;
+    }
+    Ok(LoadedPlugins {
+        packages: loaded_packages,
+        file_instances,
+    })
+}
+
+fn validate_managed_package(
+    installation: &plugin_host::PluginInstallation,
+    package: &ValidatedPluginPackage,
+) -> Result<(), PluginConfigError> {
+    if package.package_sha256() != installation.package_sha256 {
+        return Err(PluginConfigError::PackageHashChanged {
+            path: PathBuf::from(&installation.package_path),
+            expected: installation.package_sha256.clone(),
+            actual: package.package_sha256().to_owned(),
+        });
+    }
+    if package.manifest().id.as_str() != installation.plugin_id
+        || package.manifest().version != installation.version
+    {
+        return Err(PluginConfigError::PackageIdentityChanged {
+            instance_id: installation.instance_id.clone(),
+        });
     }
     Ok(())
 }
