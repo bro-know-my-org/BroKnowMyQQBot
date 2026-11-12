@@ -330,3 +330,459 @@ async fn cancelling_shutdown_preserves_schedules_for_instances_not_yet_drained()
         assert!(host.schedule_handles().unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn cancelling_management_while_waiting_for_execution_allows_shutdown() {
+    for operation in 0..4 {
+        let (host, probe) = fixture().await;
+        let mut upgrading_host = host.clone();
+        let plugin = &host.plugins[0];
+        let active = plugin.execution.acquire("active".to_owned()).await.unwrap();
+        {
+            let management = async {
+                match operation {
+                    0 => host.set_instance_enabled("fixture", false).await,
+                    1 => host.update_config("fixture", BTreeMap::new()).await,
+                    2 => host.shutdown().await,
+                    _ => {
+                        upgrading_host
+                            .upgrade_trusted("fixture", probe.clone(), BTreeMap::new())
+                            .await
+                    }
+                }
+            };
+            tokio::pin!(management);
+            assert!(futures_util::poll!(&mut management).is_pending());
+            assert_eq!(plugin.state().unwrap(), PluginInstanceState::Draining);
+        }
+        assert_eq!(plugin.state().unwrap(), PluginInstanceState::Ready);
+        drop(active);
+        host.shutdown().await.unwrap();
+        assert_eq!(plugin.state().unwrap(), PluginInstanceState::Stopped);
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancelling_resume_during_init_permanently_disables_the_guest() {
+    let (host, probe) = fixture().await;
+    host.set_instance_enabled("fixture", false).await.unwrap();
+    probe.block_init.store(true, Ordering::SeqCst);
+    {
+        let resume = host.set_instance_enabled("fixture", true);
+        tokio::pin!(resume);
+        assert!(futures_util::poll!(&mut resume).is_pending());
+        assert_eq!(probe.starts.load(Ordering::SeqCst), 2);
+    }
+    assert_eq!(
+        host.plugins[0].state().unwrap(),
+        PluginInstanceState::Disabled
+    );
+    assert!(host.set_instance_enabled("fixture", true).await.is_err());
+    host.shutdown().await.unwrap();
+    assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cancelling_configuration_or_upgrade_hooks_never_reuses_the_guest() {
+    for operation in 0..4 {
+        let (host, probe) = fixture().await;
+        let mut upgrading_host = host.clone();
+        if operation == 0 {
+            host.set_instance_enabled("fixture", false).await.unwrap();
+        }
+        if operation < 2 {
+            probe.block_validation.store(true, Ordering::SeqCst);
+        } else {
+            probe.block_init.store(true, Ordering::SeqCst);
+        }
+        {
+            let management = async {
+                match operation {
+                    0 => {
+                        host.configure_stopped_instance("fixture", BTreeMap::new())
+                            .await
+                    }
+                    1 | 2 => host.update_config("fixture", BTreeMap::new()).await,
+                    _ => {
+                        upgrading_host
+                            .upgrade_trusted("fixture", probe.clone(), BTreeMap::new())
+                            .await
+                    }
+                }
+            };
+            tokio::pin!(management);
+            assert!(futures_util::poll!(&mut management).is_pending());
+        }
+        assert_eq!(
+            host.plugins[0].state().unwrap(),
+            PluginInstanceState::Disabled
+        );
+        assert!(host.set_instance_enabled("fixture", true).await.is_err());
+        let stops = probe.stops.load(Ordering::SeqCst);
+        host.shutdown().await.unwrap();
+        assert_eq!(probe.stops.load(Ordering::SeqCst), stops);
+        assert_eq!(host.plugins[0].config_snapshot().unwrap(), BTreeMap::new());
+    }
+}
+
+#[tokio::test]
+async fn cancelling_shutdown_hook_disables_instead_of_retrying_the_hook() {
+    let (host, probe) = fixture().await;
+    probe.block_shutdown.store(true, Ordering::SeqCst);
+    {
+        let stop = host.set_instance_enabled("fixture", false);
+        tokio::pin!(stop);
+        assert!(futures_util::poll!(&mut stop).is_pending());
+    }
+    assert_eq!(
+        host.plugins[0].state().unwrap(),
+        PluginInstanceState::Disabled
+    );
+    host.shutdown().await.unwrap();
+    assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn resume_recovery_errors_do_not_leave_a_successful_ready_instance() {
+    for table in ["command_ledger", "plugin_deliveries", "scheduled_tasks"] {
+        let (mut host, probe) = fixture().await;
+        let uri = format!(
+            "file:management-{}?mode=memory&cache=shared",
+            Uuid::new_v4()
+        );
+        host.store = PluginStore::open(&uri).unwrap();
+        host.set_instance_enabled("fixture", false).await.unwrap();
+        let connection = rusqlite::Connection::open(&uri).unwrap();
+        connection
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+        assert!(host.set_instance_enabled("fixture", true).await.is_err());
+        assert_eq!(
+            host.plugins[0].state().unwrap(),
+            PluginInstanceState::Disabled
+        );
+        assert!(host.set_instance_enabled("fixture", true).await.is_err());
+        assert_eq!(probe.starts.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn resume_recovery_that_poisons_the_guest_cannot_report_success() {
+    let (host, probe) = fixture().await;
+    host.set_instance_enabled("fixture", false).await.unwrap();
+    let envelope = PluginEventEnvelope {
+        protocol_version: BPP_VERSION.to_owned(),
+        event_id: "recovered".to_owned(),
+        delivery_id: "delivery".to_owned(),
+        invocation_id: "invocation".to_owned(),
+        occurred_at_ms: None,
+        received_at_ms: now_ms(),
+        adapter_id: "test".to_owned(),
+        event_type: "message".to_owned(),
+        trace_id: None,
+        payload: Value::Null,
+        extensions: Vec::new(),
+    };
+    host.store
+        .enqueue_delivery(
+            "fixture",
+            &envelope,
+            &ExecutionOrigin::Scheduled { adapter_id: "test" }.outbox_origin("recovered"),
+            now_ms(),
+        )
+        .unwrap();
+    let resume = host.set_instance_enabled("fixture", true);
+    tokio::pin!(resume);
+    assert!(futures_util::poll!(&mut resume).is_pending());
+    // Recovery may invoke the guest, but ordinary dispatch must stay gated.
+    assert_eq!(
+        host.plugins[0].state().unwrap(),
+        PluginInstanceState::Draining
+    );
+    probe.release.notify_one();
+    assert!(resume.await.is_err());
+    assert_eq!(
+        host.plugins[0].state().unwrap(),
+        PluginInstanceState::Disabled
+    );
+    assert!(host.set_instance_enabled("fixture", true).await.is_err());
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_stop_restarts_due_work_that_requeued_during_draining() {
+    let (host, probe) = fixture().await;
+    let plugin = &host.plugins[0];
+    let task = ScheduledTask {
+        instance_id: "fixture".to_owned(),
+        task_id: "due".to_owned(),
+        adapter_id: "test".to_owned(),
+        run_at_ms: 0,
+        payload: Value::Null,
+    };
+    host.store.create_schedule(&task, 100_000).unwrap();
+    let active = plugin.execution.acquire("active".to_owned()).await.unwrap();
+    {
+        let stop = host.set_instance_enabled("fixture", false);
+        tokio::pin!(stop);
+        assert!(futures_util::poll!(&mut stop).is_pending());
+        host.run_schedule(plugin, &task).await.unwrap();
+    }
+    assert_eq!(plugin.state().unwrap(), PluginInstanceState::Ready);
+    assert!(
+        host.scheduled_tasks
+            .lock()
+            .unwrap()
+            .contains_key(&("fixture".to_owned(), "due".to_owned()))
+    );
+    drop(active);
+    timeout(Duration::from_secs(2), probe.fired.notified())
+        .await
+        .unwrap();
+    host.shutdown().await.unwrap();
+    assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn recovered_immediate_schedule_waits_for_ready_before_starting_a_worker() {
+    let (host, probe) = fixture().await;
+    host.set_instance_enabled("fixture", false).await.unwrap();
+    for (id, event_type) in [("a-create", "recovery.create"), ("b-wait", "recovery.wait")] {
+        let envelope = PluginEventEnvelope {
+            protocol_version: BPP_VERSION.to_owned(),
+            event_id: id.to_owned(),
+            delivery_id: "delivery".to_owned(),
+            invocation_id: "invocation".to_owned(),
+            occurred_at_ms: None,
+            received_at_ms: now_ms(),
+            adapter_id: "test".to_owned(),
+            event_type: event_type.to_owned(),
+            trace_id: None,
+            payload: Value::Null,
+            extensions: Vec::new(),
+        };
+        host.store
+            .enqueue_delivery(
+                "fixture",
+                &envelope,
+                &ExecutionOrigin::Scheduled { adapter_id: "test" }.outbox_origin(id),
+                0,
+            )
+            .unwrap();
+    }
+    let resume = host.set_instance_enabled("fixture", true);
+    tokio::pin!(resume);
+    assert!(futures_util::poll!(&mut resume).is_pending());
+    assert_eq!(
+        host.plugins[0].state().unwrap(),
+        PluginInstanceState::Draining
+    );
+    assert!(
+        host.store
+            .pending_schedule("fixture", "replayed-immediate")
+            .unwrap()
+            .is_some()
+    );
+    assert!(host.scheduled_tasks.lock().unwrap().is_empty());
+    probe.release.notify_one();
+    resume.await.unwrap();
+    timeout(Duration::from_secs(2), probe.fired.notified())
+        .await
+        .unwrap();
+    host.shutdown().await.unwrap();
+    assert_eq!(probe.schedules.load(Ordering::SeqCst), 1);
+    assert!(host.store.recover_schedules("fixture").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn schedule_storage_failures_retire_without_respawning_and_allow_explicit_recovery() {
+    for fail_claim in [true, false] {
+        let (mut host, probe) = fixture().await;
+        let uri = format!(
+            "file:schedule-failure-{}?mode=memory&cache=shared",
+            Uuid::new_v4()
+        );
+        host.store = PluginStore::open(&uri).unwrap();
+        let connection = rusqlite::Connection::open(&uri).unwrap();
+        let task = ScheduledTask {
+            instance_id: "fixture".to_owned(),
+            task_id: "storage-failure".to_owned(),
+            adapter_id: "test".to_owned(),
+            run_at_ms: 0,
+            payload: Value::Null,
+        };
+        host.store.create_schedule(&task, 100_000).unwrap();
+        // Exhaust writes deterministically while leaving pending-row reads usable.
+        let fault_target = if fail_claim {
+            "UPDATE OF status ON scheduled_tasks WHEN NEW.status = 'firing'"
+        } else {
+            "INSERT ON plugin_deliveries"
+        };
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE fault_pages (payload BLOB);
+                 CREATE TRIGGER fail_schedule_write BEFORE {fault_target}
+                 BEGIN INSERT INTO fault_pages VALUES (zeroblob(1048576)); END;"
+            ))
+            .unwrap();
+        let pages: u32 = connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .pragma_update(None, "max_page_count", pages)
+            .unwrap();
+        if fail_claim {
+            assert!(matches!(
+                host.store.claim_schedule("fixture", &task.task_id),
+                Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(error, _)))
+                    if error.code == rusqlite::ErrorCode::DiskFull
+            ));
+        }
+        let plugin = &host.plugins[0];
+        host.launch_schedule(plugin, &task).unwrap();
+        let worker = host
+            .schedule_handles()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        timeout(Duration::from_secs(2), async {
+            while !worker.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            host.schedule_handles().unwrap().is_empty(),
+            "failed worker respawned"
+        );
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM scheduled_tasks WHERE instance_id = 'fixture' AND task_id = ?",
+                [&task.task_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, if fail_claim { "pending" } else { "firing" });
+        assert_eq!(probe.schedules.load(Ordering::SeqCst), 0);
+
+        connection
+            .execute_batch("DROP TRIGGER fail_schedule_write")
+            .unwrap();
+        host.store.recover_schedules("fixture").unwrap();
+        host.resume_pending_schedules(plugin).unwrap();
+        timeout(Duration::from_secs(2), probe.fired.notified())
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
+        assert_eq!(probe.schedules.load(Ordering::SeqCst), 1);
+        assert!(host.store.recover_schedules("fixture").unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn cancelled_management_rearms_workers_retiring_before_or_after_rollback() {
+    for operation in 0..3 {
+        for retire_due_first in [true, false] {
+            let (host, probe) = fixture().await;
+            let mut upgrading_host = host.clone();
+            let plugin = &host.plugins[0];
+            let generation = plugin.ready_generation().unwrap().unwrap();
+            let task = |id: &str| ScheduledTask {
+                instance_id: "fixture".to_owned(),
+                task_id: id.to_owned(),
+                adapter_id: "test".to_owned(),
+                run_at_ms: 0,
+                payload: Value::Null,
+            };
+            let queued_task = task("queued-late");
+            let due_task = task("due-retiring");
+            for task in [&queued_task, &due_task] {
+                host.store.create_schedule(task, 100_000).unwrap();
+            }
+            // Drive the real worker body/retirement separately. These inert
+            // tasks reserve their worker IDs so each interleaving is explicit.
+            let queued_slot = tokio::spawn(std::future::pending::<()>());
+            let due_slot = tokio::spawn(std::future::pending::<()>());
+            {
+                let mut handles = host.scheduled_tasks.lock().unwrap();
+                handles.insert(
+                    ("fixture".to_owned(), queued_task.task_id.clone()),
+                    queued_slot.abort_handle(),
+                );
+                handles.insert(
+                    ("fixture".to_owned(), due_task.task_id.clone()),
+                    due_slot.abort_handle(),
+                );
+            }
+            let active = plugin.execution.acquire("active".to_owned()).await.unwrap();
+            let queued = host.run_schedule_owned(plugin, &queued_task, Some(queued_slot.id()));
+            tokio::pin!(queued);
+            assert!(futures_util::poll!(&mut queued).is_pending());
+            {
+                let management = async {
+                    match operation {
+                        0 => host.set_instance_enabled("fixture", false).await,
+                        1 => host.update_config("fixture", BTreeMap::new()).await,
+                        _ => {
+                            upgrading_host
+                                .upgrade_trusted("fixture", probe.clone(), BTreeMap::new())
+                                .await
+                        }
+                    }
+                };
+                tokio::pin!(management);
+                assert!(futures_util::poll!(&mut management).is_pending());
+                host.run_schedule_owned(plugin, &due_task, Some(due_slot.id()))
+                    .await
+                    .unwrap();
+                if retire_due_first {
+                    host.retire_schedule(plugin, &due_task, due_slot.id(), true)
+                        .unwrap();
+                }
+            }
+            assert_eq!(plugin.state().unwrap(), PluginInstanceState::Ready);
+            assert!(!plugin.is_ready_generation(generation).unwrap());
+            // No lifecycle hook ran. In particular, the rollback sweep must
+            // leave the old queued worker's firing row/claim alone.
+            assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.stops.load(Ordering::SeqCst), 0);
+            assert!(
+                !host
+                    .store
+                    .claim_schedule("fixture", &queued_task.task_id)
+                    .unwrap()
+            );
+            if !retire_due_first {
+                host.retire_schedule(plugin, &due_task, due_slot.id(), true)
+                    .unwrap();
+            }
+            due_slot.abort();
+            drop(active);
+            queued.await.unwrap();
+            // This old-generation worker only requeued AFTER rollback's sweep.
+            assert!(
+                host.store
+                    .pending_schedule("fixture", &queued_task.task_id)
+                    .unwrap()
+                    .is_some()
+            );
+            host.retire_schedule(plugin, &queued_task, queued_slot.id(), true)
+                .unwrap();
+            queued_slot.abort();
+            timeout(Duration::from_secs(2), async {
+                while probe.schedules.load(Ordering::SeqCst) < 2 {
+                    probe.fired.notified().await;
+                }
+            })
+            .await
+            .unwrap();
+            host.shutdown().await.unwrap();
+            assert_eq!(probe.schedules.load(Ordering::SeqCst), 2);
+            assert!(host.store.recover_schedules("fixture").unwrap().is_empty());
+        }
+    }
+}
