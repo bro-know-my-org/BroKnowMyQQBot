@@ -3,6 +3,8 @@
 mod command;
 mod management;
 #[cfg(test)]
+mod management_tests;
+#[cfg(test)]
 mod upgrade_tests;
 mod validation;
 
@@ -1661,6 +1663,15 @@ impl StaticPluginHost {
         Ok(())
     }
 
+    #[cfg(test)]
+    async fn run_schedule(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        task: &ScheduledTask,
+    ) -> Result<(), PluginHostError> {
+        self.run_schedule_owned(plugin, task, None).await
+    }
+
     async fn run_schedule_owned(
         &self,
         plugin: &Arc<RegisteredPlugin>,
@@ -2867,6 +2878,47 @@ mod tests {
         }
         wasm.health().await.unwrap();
         host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn help_discovers_commands_registered_and_stopped_after_initialization() {
+        let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap())
+            .with_command_prefix("喵!")
+            .unwrap();
+        host.register_trusted(
+            Arc::new(builtin_plugins::HelpPlugin::with_commands([])),
+            "help",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        host.register_trusted(Arc::new(PingPlugin::default()), "ping", BTreeMap::new())
+            .await
+            .unwrap();
+        let envelope = PluginEventEnvelope {
+            protocol_version: BPP_VERSION.to_owned(),
+            event_id: "help-test".to_owned(),
+            delivery_id: "delivery".to_owned(),
+            invocation_id: "invocation".to_owned(),
+            occurred_at_ms: None,
+            received_at_ms: 0,
+            adapter_id: "mock".to_owned(),
+            event_type: "message.created".to_owned(),
+            trace_id: None,
+            payload: json!({"type":"message", "data":{"text":"喵!help"}}),
+            extensions: Vec::new(),
+        };
+        for enabled in [true, false, true] {
+            host.set_instance_enabled("ping", enabled).await.unwrap();
+            let output = host
+                .invoke_envelope(&host.plugins[0], &envelope, &CallerAuthority::default())
+                .await
+                .unwrap();
+            let content = output.commands[0].payload["content"].as_str().unwrap();
+            assert!(content.contains("喵!help"));
+            assert_eq!(content.contains("喵!ping"), enabled);
+            assert!(!content.contains("/ping"));
+        }
     }
 
     #[test]
