@@ -5,9 +5,9 @@ use std::{env, fs, io::IsTerminal as _, path::Path};
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use fs2::FileExt as _;
 
-use crate::config::{
-    BotConfig, atomic_write, ensure_smoke_plugin_config, write_secret_environment,
-};
+#[cfg(feature = "coverage-probes")]
+use crate::config::ensure_smoke_plugin_config;
+use crate::config::{BotConfig, atomic_write, write_secret_environment};
 
 pub(crate) fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
@@ -22,7 +22,10 @@ pub(crate) fn run(
     let languages = ["English (default)", "简体中文"];
     let language_default = usize::from(config.logging.console.language == "zh-CN");
     let language = Select::with_theme(&theme)
-        .with_prompt("1/10 Language / 语言")
+        .with_prompt(setup_progress(
+            "1/10 Language / 语言",
+            "1/9 Language / 语言",
+        ))
         .items(&languages)
         .default(language_default)
         .interact()?;
@@ -89,17 +92,20 @@ pub(crate) fn run(
         .default(config.qq.check_only)
         .interact()?;
 
-    let current_installations = config.plugins.installations.clone();
-    let profile = Select::with_theme(&theme)
-        .with_prompt(text.profile_prompt)
-        .items(&text.profiles)
-        .default(0)
-        .interact()?;
-    config.plugins.installations = if profile == 1 {
-        Some(ensure_smoke_plugin_config()?)
-    } else {
-        current_installations
-    };
+    #[cfg(feature = "coverage-probes")]
+    {
+        let current_installations = config.plugins.installations.clone();
+        let profile = Select::with_theme(&theme)
+            .with_prompt(text.profile_prompt)
+            .items(text.profiles)
+            .default(0)
+            .interact()?;
+        config.plugins.installations = if profile == 1 {
+            Some(ensure_smoke_plugin_config()?)
+        } else {
+            current_installations
+        };
+    }
     let log_message_content = Confirm::with_theme(&theme)
         .with_prompt(text.message_content_prompt)
         .default(false)
@@ -190,7 +196,9 @@ struct SetupText {
     direct_messages_prompt: &'static str,
     direct_messages_disabled: &'static str,
     check_only_prompt: &'static str,
-    profiles: [&'static str; 2],
+    #[cfg(feature = "coverage-probes")]
+    profiles: &'static [&'static str],
+    #[cfg(feature = "coverage-probes")]
     profile_prompt: &'static str,
     message_content_prompt: &'static str,
     completed: &'static str,
@@ -204,17 +212,43 @@ impl SetupText {
             Self {
                 title: "BroKnowMyQQBot 单 Bot 首次启动配置",
                 environments: ["production（正式环境）", "sandbox（沙箱环境）"],
-                environment_prompt: "2/10 选择 QQ Bot 环境",
-                app_id_prompt: "3/10 输入 QQ AppID",
-                app_secret_prompt: "4/10 输入 QQ AppSecret（输入内容不会显示）",
-                public_guild_prompt: "5/10 是否启用公域频道消息 Intent？没有权限请选择否",
-                private_guild_prompt: "6/10 是否启用私域全部频道消息 Intent？仅已获特殊权限时启用",
-                direct_messages_prompt: "7/10 是否启用频道私信 Intent？仅正式环境私域机器人可用",
-                direct_messages_disabled: "7/10 频道私信 Intent 不支持沙箱环境，已保持关闭",
-                check_only_prompt: "8/10 首次启动是否只做凭据、Gateway 与插件预检？",
-                profiles: ["基础插件（Ping/Help/Counter/Echo）", "完整功能测试插件"],
+                environment_prompt: setup_progress("2/10 选择 QQ Bot 环境", "2/9 选择 QQ Bot 环境"),
+                app_id_prompt: setup_progress("3/10 输入 QQ AppID", "3/9 输入 QQ AppID"),
+                app_secret_prompt: setup_progress(
+                    "4/10 输入 QQ AppSecret（输入内容不会显示）",
+                    "4/9 输入 QQ AppSecret（输入内容不会显示）",
+                ),
+                public_guild_prompt: setup_progress(
+                    "5/10 是否启用公域频道消息 Intent？没有权限请选择否",
+                    "5/9 是否启用公域频道消息 Intent？没有权限请选择否",
+                ),
+                private_guild_prompt: setup_progress(
+                    "6/10 是否启用私域全部频道消息 Intent？仅已获特殊权限时启用",
+                    "6/9 是否启用私域全部频道消息 Intent？仅已获特殊权限时启用",
+                ),
+                direct_messages_prompt: setup_progress(
+                    "7/10 是否启用频道私信 Intent？仅正式环境私域机器人可用",
+                    "7/9 是否启用频道私信 Intent？仅正式环境私域机器人可用",
+                ),
+                direct_messages_disabled: setup_progress(
+                    "7/10 频道私信 Intent 不支持沙箱环境，已保持关闭",
+                    "7/9 频道私信 Intent 不支持沙箱环境，已保持关闭",
+                ),
+                check_only_prompt: setup_progress(
+                    "8/10 首次启动是否只做凭据、Gateway 与插件预检？",
+                    "8/9 首次启动是否只做凭据、Gateway 与插件预检？",
+                ),
+                #[cfg(feature = "coverage-probes")]
+                profiles: &[
+                    "保留当前插件配置（未配置时使用默认产品插件）",
+                    "完整功能测试插件",
+                ],
+                #[cfg(feature = "coverage-probes")]
                 profile_prompt: "9/10 选择插件组合",
-                message_content_prompt: "10/10 是否在控制台和消息日志中完整记录消息正文？",
+                message_content_prompt: setup_progress(
+                    "10/10 是否在控制台和消息日志中完整记录消息正文？",
+                    "9/9 是否在控制台和消息日志中完整记录消息正文？",
+                ),
                 completed: "配置完成",
                 configuration: "普通配置",
                 credentials: "登录凭据",
@@ -223,25 +257,59 @@ impl SetupText {
             Self {
                 title: "BroKnowMyQQBot first-run setup",
                 environments: ["production", "sandbox"],
-                environment_prompt: "2/10 Select the QQ Bot environment",
-                app_id_prompt: "3/10 Enter the QQ AppID",
-                app_secret_prompt: "4/10 Enter the QQ AppSecret (input is hidden)",
-                public_guild_prompt: "5/10 Enable the public guild message intent?",
-                private_guild_prompt: "6/10 Enable all private-domain guild messages? Special permission required.",
-                direct_messages_prompt: "7/10 Enable the guild direct-message intent? Production private-domain bots only.",
-                direct_messages_disabled: "7/10 Guild direct-message intent is unavailable in sandbox and remains disabled.",
-                check_only_prompt: "8/10 Run credential, Gateway, and plugin checks only?",
-                profiles: [
-                    "Basic plugins (Ping/Help/Counter/Echo)",
+                environment_prompt: setup_progress(
+                    "2/10 Select the QQ Bot environment",
+                    "2/9 Select the QQ Bot environment",
+                ),
+                app_id_prompt: setup_progress("3/10 Enter the QQ AppID", "3/9 Enter the QQ AppID"),
+                app_secret_prompt: setup_progress(
+                    "4/10 Enter the QQ AppSecret (input is hidden)",
+                    "4/9 Enter the QQ AppSecret (input is hidden)",
+                ),
+                public_guild_prompt: setup_progress(
+                    "5/10 Enable the public guild message intent?",
+                    "5/9 Enable the public guild message intent?",
+                ),
+                private_guild_prompt: setup_progress(
+                    "6/10 Enable all private-domain guild messages? Special permission required.",
+                    "6/9 Enable all private-domain guild messages? Special permission required.",
+                ),
+                direct_messages_prompt: setup_progress(
+                    "7/10 Enable the guild direct-message intent? Production private-domain bots only.",
+                    "7/9 Enable the guild direct-message intent? Production private-domain bots only.",
+                ),
+                direct_messages_disabled: setup_progress(
+                    "7/10 Guild direct-message intent is unavailable in sandbox and remains disabled.",
+                    "7/9 Guild direct-message intent is unavailable in sandbox and remains disabled.",
+                ),
+                check_only_prompt: setup_progress(
+                    "8/10 Run credential, Gateway, and plugin checks only?",
+                    "8/9 Run credential, Gateway, and plugin checks only?",
+                ),
+                #[cfg(feature = "coverage-probes")]
+                profiles: &[
+                    "Keep current plugin configuration (or product defaults)",
                     "Full smoke-test plugins",
                 ],
+                #[cfg(feature = "coverage-probes")]
                 profile_prompt: "9/10 Select the plugin profile",
-                message_content_prompt: "10/10 Record complete message content in console and message logs?",
+                message_content_prompt: setup_progress(
+                    "10/10 Record complete message content in console and message logs?",
+                    "9/9 Record complete message content in console and message logs?",
+                ),
                 completed: "Setup complete",
                 configuration: "Configuration",
                 credentials: "Credentials",
             }
         }
+    }
+}
+
+const fn setup_progress(coverage_probes: &'static str, ordinary: &'static str) -> &'static str {
+    if cfg!(feature = "coverage-probes") {
+        coverage_probes
+    } else {
+        ordinary
     }
 }
 

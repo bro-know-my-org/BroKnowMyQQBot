@@ -1,15 +1,15 @@
-# Bundled Rust plugins enabled by default when no installation file is set.
-bundled = ["ping", "help", "echo", "counter", "reminder"]
+# Omit `bundled` to use the application's ordered default plugin set.
 
 # Enable permissionized administration only after configuring stable sender IDs:
 # bundled = ["ping", "help", "echo", "counter", "reminder", "admin"]
 # [bundled_config.admin]
 # owners = ["your-sender-id"]
 
-# Optional functional coverage plugins can be added explicitly:
-# bundled = ["ping", "help", "echo", "counter", "devtools", "http-probe", "browser-probe", "scheduler-probe", "qq-extension-probe"]
-# [bundled_config.devtools]
-# owners = ["your-sender-id"]
+# Optional functional coverage plugins require a `coverage-probes` build and
+# can then be added explicitly alongside the desired product plugins and admin.
+# Configure owners only in bundled_config.admin as shown above.
+# See `plugins.qq-smoke.toml` for the exact accepted probe names and a complete
+# product-plus-probe selection.
 
 # Add local WebAssembly Component packages explicitly. Relative package paths
 # are resolved from this file. Grants are intersected with plugin.toml and are

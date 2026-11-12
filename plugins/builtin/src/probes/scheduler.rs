@@ -2,8 +2,8 @@ use super::{
     ActionCompleted, ActionStatus, Audience, BTreeSet, CommandDeclaration, Disposition,
     HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest, ScheduleCancel,
     ScheduleCreate, ScheduleTriggered, StaticPlugin, Subscription, Value, async_trait,
-    command_argument, command_tail, diagnostic_plugin_manifest, hex_bytes, ignored, json,
-    message_text, plugin_command, reply,
+    command_argument, command_tail, diagnostic_authorized, diagnostic_plugin_manifest, hex_bytes,
+    ignored, json, message_text, plugin_command, reply, restricted,
 };
 
 const MAX_PENDING_TASKS: usize = 128;
@@ -44,10 +44,6 @@ impl Default for SchedulerProbePlugin {
             },
         ]);
         manifest.permissions.scheduler = true;
-        manifest
-            .permissions
-            .actions
-            .insert("message.send".to_owned());
         Self { manifest }
     }
 }
@@ -78,29 +74,22 @@ impl StaticPlugin for SchedulerProbePlugin {
 
 fn schedule_triggered(
     event: &PluginEventEnvelope,
-    _queries: &dyn HostQueries,
+    queries: &dyn HostQueries,
 ) -> Result<HandlerOutput, PluginError> {
     let trigger: ScheduleTriggered = serde_json::from_value(event.payload.clone())
         .map_err(|error| PluginError::Permanent(error.to_string()))?;
-    let target = trigger
-        .payload
-        .get("target")
-        .cloned()
-        .ok_or_else(|| PluginError::Permanent("schedule target is missing".to_owned()))?;
-    let content = trigger
-        .payload
-        .get("content")
-        .and_then(Value::as_str)
-        .ok_or_else(|| PluginError::Permanent("schedule content is missing".to_owned()))?;
+    let key = task_state_key(&trigger.task_id);
     Ok(HandlerOutput {
         disposition: Disposition::Continue,
-        state_ops: Vec::new(),
-        commands: vec![plugin_command(
-            event,
-            "send",
-            "message.send",
-            json!({"target":target,"content":content}),
-        )],
+        state_ops: queries
+            .state_get(&key)
+            .map(|state| plugin_api::StateOp::Delete {
+                key,
+                expected_revision: Some(state.revision),
+            })
+            .into_iter()
+            .collect(),
+        commands: Vec::new(),
         diagnostics: Vec::new(),
     })
 }
@@ -112,9 +101,6 @@ fn schedule_completed(
     let completion: ActionCompleted = serde_json::from_value(event.payload.clone())
         .map_err(|error| PluginError::Permanent(error.to_string()))?;
     if completion.status != ActionStatus::Succeeded {
-        if completion.kind == "message.send" {
-            return cleanup_delivery_state(queries, &completion.source_event_id);
-        }
         let relevant = matches!(
             completion.kind.as_str(),
             "schedule.create" | "schedule.cancel"
@@ -148,30 +134,8 @@ fn schedule_completed(
     match completion.kind.as_str() {
         "schedule.create" => schedule_created(event, &result),
         "schedule.cancel" => schedule_cancelled(event, queries, &result),
-        "message.send" => cleanup_delivery_state(queries, &completion.source_event_id),
         _ => Ok(ignored()),
     }
-}
-
-fn cleanup_delivery_state(
-    queries: &dyn HostQueries,
-    source_event_id: &str,
-) -> Result<HandlerOutput, PluginError> {
-    let task_id = source_event_id
-        .rsplit('/')
-        .next()
-        .ok_or_else(|| PluginError::Permanent("schedule task ID is missing".to_owned()))?;
-    Ok(HandlerOutput {
-        disposition: Disposition::Continue,
-        state_ops: vec![plugin_api::StateOp::Delete {
-            key: task_state_key(task_id),
-            expected_revision: queries
-                .state_get(&task_state_key(task_id))
-                .map(|state| state.revision),
-        }],
-        commands: Vec::new(),
-        diagnostics: Vec::new(),
-    })
 }
 
 fn schedule_created(
@@ -241,6 +205,11 @@ fn scheduler_message(
     let Some(text) = message_text(event) else {
         return Ok(ignored());
     };
+    let diagnostic_command = command_tail(text, "/schedule").is_some()
+        || command_argument(text, "/schedule-cancel").is_some();
+    if diagnostic_command && !diagnostic_authorized(queries) {
+        return Ok(restricted(event));
+    }
     if let Some(arguments) = command_tail(text, "/schedule") {
         if queries.state_scan("tasks/", MAX_PENDING_TASKS + 1).len() >= MAX_PENDING_TASKS {
             return Ok(reply(
@@ -259,15 +228,10 @@ fn scheduler_message(
             _ => return Ok(schedule_usage(event)),
         };
         let task_id = format!("probe-{}", hex_bytes(event.event_id.as_bytes()));
-        let target = event
-            .payload
-            .pointer("/data/target")
-            .cloned()
-            .ok_or_else(|| PluginError::Permanent("message target is missing".to_owned()))?;
         let create = ScheduleCreate {
             task_id: task_id.clone(),
             run_at_ms: event.received_at_ms.saturating_add(delay_seconds * 1_000),
-            payload: json!({"target":target,"content":"scheduled task fired"}),
+            payload: json!({}),
         };
         return Ok(HandlerOutput {
             disposition: Disposition::Continue,

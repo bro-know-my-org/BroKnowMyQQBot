@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+coverage-probes = ["builtin-plugins/coverage-probes"]
+
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true

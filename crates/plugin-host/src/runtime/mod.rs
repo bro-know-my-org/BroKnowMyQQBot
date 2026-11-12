@@ -149,7 +149,6 @@ impl TrustedPluginCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustedAuthorityProvider {
     Administration,
-    DevToolsLegacy,
 }
 
 /// Closed set of read-only platform Actions exposed to trusted static plugins.
@@ -1046,7 +1045,7 @@ impl StaticPluginHost {
             )?;
         }
         let mut recovered = VecDeque::new();
-        for (_, completion, _) in self
+        for (_pending, completion, _) in self
             .store
             .committed_command_results(&plugin.instance_id)?
             .into_iter()
@@ -1595,6 +1594,25 @@ impl StaticPluginHost {
         Ok(())
     }
 
+    #[cfg(feature = "coverage-probes")]
+    #[doc(hidden)]
+    pub fn diagnostic_active_schedule_count(
+        &self,
+        instance_id: &str,
+    ) -> Result<usize, PluginHostError> {
+        let handles = self
+            .scheduled_tasks
+            .lock()
+            .map_err(|_| PluginHostError::Invocation {
+                plugin_id: instance_id.to_owned(),
+                message: "scheduler lock is poisoned".to_owned(),
+            })?;
+        Ok(handles
+            .keys()
+            .filter(|(scheduled_instance, _)| scheduled_instance == instance_id)
+            .count())
+    }
+
     /// Drains all ready plugin instances, stops scheduled work, and invokes
     /// each plugin's bounded BPP shutdown lifecycle hook.
     pub async fn shutdown(&self) -> Result<(), PluginHostError> {
@@ -1687,6 +1705,13 @@ impl StaticPluginHost {
                 subject_hint: None,
             });
         };
+        if platform != "qq.official" {
+            return Ok(CallerAuthority {
+                role: CallerRole::User,
+                platform,
+                subject_hint: None,
+            });
+        }
         let administration = self
             .plugins
             .iter()
@@ -1699,20 +1724,7 @@ impl StaticPluginHost {
                     plugin.authority_provider == Some(TrustedAuthorityProvider::Administration)
                 })
             });
-        let legacy_devtools = self
-            .plugins
-            .iter()
-            .map(AsRef::as_ref)
-            .find(|plugin| {
-                plugin.authority_provider == Some(TrustedAuthorityProvider::DevToolsLegacy)
-            })
-            .or_else(|| {
-                current_plugin.filter(|plugin| {
-                    plugin.authority_provider == Some(TrustedAuthorityProvider::DevToolsLegacy)
-                })
-            });
-        let owner_provider = administration.or(legacy_devtools);
-        let owner = owner_provider
+        let owner = administration
             .map(RegisteredPlugin::config_snapshot)
             .transpose()?
             .as_ref()
@@ -3017,27 +3029,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn administration_owner_config_precedes_legacy_devtools_owner_config() {
+    #[cfg(feature = "coverage-probes")]
+    async fn devtools_cannot_supply_caller_authority() {
         let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
-        host.register_trusted_with_capabilities(
-            Arc::new(AdminPlugin::default()),
-            "dev.bkm.admin/default",
-            BTreeMap::from([("owners".to_owned(), json!(["admin-owner"]))]),
-            TrustedPluginCapabilities::default()
-                .with_authority_provider(TrustedAuthorityProvider::Administration),
-        )
-        .await
-        .unwrap();
         host.register_trusted_with_capabilities(
             Arc::new(builtin_plugins::DevToolsPlugin::default()),
             "dev.bkm.devtools/default",
-            BTreeMap::from([("owners".to_owned(), json!(["devtools-owner"]))]),
+            BTreeMap::new(),
             TrustedPluginCapabilities::default()
-                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
         )
         .await
         .unwrap();
-        let envelope = |sender: &str| PluginEventEnvelope {
+        let envelope = PluginEventEnvelope {
             protocol_version: "1.2.0".to_owned(),
             event_id: "authority-source".to_owned(),
             delivery_id: "delivery".to_owned(),
@@ -3047,21 +3051,25 @@ mod tests {
             adapter_id: "qq.official".to_owned(),
             event_type: "message.created".to_owned(),
             trace_id: None,
-            payload: json!({"data": {"sender": {"id": sender}}}),
+            payload: json!({"data": {"sender": {"id": "owner-id"}}}),
             extensions: Vec::new(),
         };
-
         assert_eq!(
-            host.resolve_caller_authority(&envelope("admin-owner"), None)
-                .unwrap()
-                .role,
-            CallerRole::Owner
-        );
-        assert_eq!(
-            host.resolve_caller_authority(&envelope("devtools-owner"), None)
-                .unwrap()
-                .role,
+            host.resolve_caller_authority(&envelope, None).unwrap().role,
             CallerRole::User
+        );
+        host.register_trusted_with_capabilities(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/default",
+            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::Administration),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            host.resolve_caller_authority(&envelope, None).unwrap().role,
+            CallerRole::Owner
         );
     }
 

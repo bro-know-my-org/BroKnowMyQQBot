@@ -6,28 +6,30 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use plugin_api::{
-    ActionCompleted, ActionStatus, Audience, BrowserPermission, BrowserRun, BrowserRunResult,
-    BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil, CallerAuthority,
-    CallerRole, CommandDeclaration, Disposition, HandlerOutput, HostQueries, HttpPermission,
-    HttpRequest, HttpResponse, MediaReply, PluginCommand, PluginError, PluginEventEnvelope,
+    ActionCompleted, ActionStatus, Audience, CallerAuthority, CallerRole, CommandDeclaration,
+    Disposition, HandlerOutput, HostQueries, PluginCommand, PluginError, PluginEventEnvelope,
     PluginId, PluginManifest, PluginMetadata, PluginPermissions, PluginRuntimeConfig,
     ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin, StoragePermission,
     SubcommandDeclaration, Subscription,
 };
+#[cfg(feature = "coverage-probes")]
+use plugin_api::{
+    BrowserPermission, BrowserRun, BrowserRunResult, BrowserScreenshotFormat, BrowserStep,
+    BrowserViewport, BrowserWaitUntil, HttpPermission, HttpRequest, HttpResponse, MediaReply,
+};
 use serde_json::{Value, json};
-use tokio::time::{Duration, sleep};
 
 mod basic;
 mod business;
-mod devtools;
+#[cfg(feature = "coverage-probes")]
 mod probes;
 
 pub use basic::{CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin};
 pub use business::{AdminPlugin, ReminderPlugin};
-pub use devtools::DevToolsPlugin;
+#[cfg(feature = "coverage-probes")]
 pub use probes::{
-    ActionResultProbePlugin, ActiveSendProbePlugin, BrowserProbePlugin, ConfigProbePlugin,
-    HttpProbePlugin, QqExtensionProbePlugin, SchedulerProbePlugin,
+    ActiveSendProbePlugin, BrowserProbePlugin, DevToolsPlugin, HttpProbePlugin,
+    QqExtensionProbePlugin, SchedulerProbePlugin,
 };
 
 fn message_plugin_manifest(
@@ -81,6 +83,7 @@ fn message_plugin_manifest(
     }
 }
 
+#[cfg(feature = "coverage-probes")]
 fn diagnostic_plugin_manifest(
     id: &str,
     name: &str,
@@ -183,16 +186,6 @@ fn hex_bytes(bytes: &[u8]) -> String {
     output
 }
 
-pub fn default_plugin_configs() -> BTreeMap<String, BTreeMap<String, Value>> {
-    BTreeMap::from([
-        ("dev.bkm.ping".to_owned(), BTreeMap::new()),
-        ("dev.bkm.counter".to_owned(), BTreeMap::new()),
-        ("dev.bkm.help".to_owned(), BTreeMap::new()),
-        ("dev.bkm.echo".to_owned(), BTreeMap::new()),
-        ("dev.bkm.reminder".to_owned(), BTreeMap::new()),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -203,11 +196,12 @@ mod tests {
     };
     use serde_json::{Value, json};
 
+    #[cfg(feature = "coverage-probes")]
     use super::{
-        ActionResultProbePlugin, ActiveSendProbePlugin, AdminPlugin, BrowserProbePlugin,
-        ConfigProbePlugin, CounterPlugin, DevToolsPlugin, EchoPlugin, HelpPlugin, HttpProbePlugin,
-        PingPlugin, QqExtensionProbePlugin, ReminderPlugin, SchedulerProbePlugin,
+        ActiveSendProbePlugin, BrowserProbePlugin, DevToolsPlugin, HttpProbePlugin,
+        QqExtensionProbePlugin, SchedulerProbePlugin,
     };
+    use super::{AdminPlugin, CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin, ReminderPlugin};
 
     struct Queries {
         state: BTreeMap<String, StateValue>,
@@ -242,6 +236,40 @@ mod tests {
 
         fn caller_authority(&self) -> CallerAuthority {
             CallerAuthority::default()
+        }
+    }
+
+    #[cfg(feature = "coverage-probes")]
+    struct AuthorizedQueries<'a>(&'a Queries);
+
+    #[cfg(feature = "coverage-probes")]
+    impl HostQueries for AuthorizedQueries<'_> {
+        fn config_get(&self, key: &str) -> Option<&Value> {
+            self.0.config_get(key)
+        }
+
+        fn state_get(&self, key: &str) -> Option<&StateValue> {
+            self.0.state_get(key)
+        }
+
+        fn state_scan(&self, prefix: &str, limit: usize) -> Vec<(&str, &StateValue)> {
+            self.0.state_scan(prefix, limit)
+        }
+
+        fn granted_capabilities(&self) -> &BTreeSet<String> {
+            self.0.granted_capabilities()
+        }
+
+        fn invocation_time_ms(&self) -> i64 {
+            self.0.invocation_time_ms()
+        }
+
+        fn caller_authority(&self) -> CallerAuthority {
+            CallerAuthority {
+                role: CallerRole::Owner,
+                platform: "qq.official".to_owned(),
+                subject_hint: None,
+            }
         }
     }
 
@@ -457,12 +485,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "coverage-probes")]
     fn every_bundled_diagnostic_command_declares_diagnostic_audience() {
         let manifests = [
-            ActionResultProbePlugin::default().manifest().clone(),
             ActiveSendProbePlugin::default().manifest().clone(),
             BrowserProbePlugin::default().manifest().clone(),
-            ConfigProbePlugin::default().manifest().clone(),
             DevToolsPlugin::default().manifest().clone(),
             HttpProbePlugin::default().manifest().clone(),
             QqExtensionProbePlugin::default().manifest().clone(),
@@ -586,6 +613,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "coverage-probes")]
     async fn active_send_probe_confirms_then_uses_explicit_target() {
         let output = ActiveSendProbePlugin::default()
             .on_event(
@@ -599,10 +627,10 @@ mod tests {
                     }),
                     ..event("ignored")
                 },
-                &Queries {
+                &AuthorizedQueries(&Queries {
                     state: BTreeMap::new(),
                     capabilities: BTreeSet::new(),
-                },
+                }),
             )
             .await
             .unwrap();
@@ -613,45 +641,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn action_result_probe_persists_completion() {
-        let completion = ActionCompleted {
-            source_event_id: "source-event".to_owned(),
-            source_invocation_id: "source-invocation".to_owned(),
-            command_id: "reply".to_owned(),
-            kind: "message.reply".to_owned(),
-            status: ActionStatus::Succeeded,
-            retryable: false,
-            result: Some(json!({"message_id":"sent"})),
-            error_code: None,
-            error_message: None,
-        };
-        let output = ActionResultProbePlugin::default()
-            .on_event(
-                &PluginEventEnvelope {
-                    event_type: "action.completed".to_owned(),
-                    payload: serde_json::to_value(completion).unwrap(),
-                    ..event("ignored")
-                },
-                &Queries {
-                    state: BTreeMap::new(),
-                    capabilities: BTreeSet::new(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(output.state_ops.len(), 1);
-        assert!(output.commands.is_empty());
-    }
-
-    #[tokio::test]
+    #[cfg(feature = "coverage-probes")]
     async fn http_probe_emits_only_host_http_command() {
         let output = HttpProbePlugin::default()
             .on_event(
                 &event("/http-probe"),
-                &Queries {
+                &AuthorizedQueries(&Queries {
                     state: BTreeMap::new(),
                     capabilities: BTreeSet::new(),
-                },
+                }),
             )
             .await
             .unwrap();
@@ -661,6 +659,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "coverage-probes")]
     async fn scheduler_probe_emits_persistent_schedule_command() {
         let output = SchedulerProbePlugin::default()
             .on_event(
@@ -675,19 +674,16 @@ mod tests {
                     }),
                     ..event("ignored")
                 },
-                &Queries {
+                &AuthorizedQueries(&Queries {
                     state: BTreeMap::new(),
                     capabilities: BTreeSet::new(),
-                },
+                }),
             )
             .await
             .unwrap();
         assert_eq!(output.commands[0].kind, "schedule.create");
         assert_eq!(output.commands[0].payload["run_at_ms"], 30_000);
-        assert_eq!(
-            output.commands[0].payload["payload"]["target"]["group_id"],
-            "group-id"
-        );
+        assert_eq!(output.commands[0].payload["payload"], json!({}));
         assert_eq!(output.commands.len(), 1);
         assert_eq!(output.state_ops.len(), 1);
 
@@ -704,7 +700,7 @@ mod tests {
                     }),
                     ..event("ignored")
                 },
-                &Queries {
+                &AuthorizedQueries(&Queries {
                     state: BTreeMap::from([(
                         "tasks/probe-6576656e742d31".to_owned(),
                         StateValue {
@@ -717,7 +713,7 @@ mod tests {
                         },
                     )]),
                     capabilities: BTreeSet::new(),
-                },
+                }),
             )
             .await
             .unwrap();
@@ -755,28 +751,6 @@ mod tests {
                 .unwrap();
             assert_eq!(output.commands[0].payload["content"], expected);
         }
-    }
-
-    #[tokio::test]
-    async fn config_probe_rejects_missing_or_oversized_config() {
-        let plugin = ConfigProbePlugin::default();
-        assert!(plugin.validate_config(&BTreeMap::new()).await.is_err());
-        assert!(
-            plugin
-                .validate_config(&BTreeMap::from([(
-                    "prefix".to_owned(),
-                    Value::String("x".repeat(65)),
-                )]))
-                .await
-                .is_err()
-        );
-        plugin
-            .validate_config(&BTreeMap::from([(
-                "prefix".to_owned(),
-                Value::String("configured".to_owned()),
-            )]))
-            .await
-            .unwrap();
     }
 
     #[tokio::test]

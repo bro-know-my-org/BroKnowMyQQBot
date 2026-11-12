@@ -23,6 +23,10 @@ license.workspace = true
 publish = false
 autobins = false
 
+[features]
+default = []
+coverage-probes = ["builtin-plugins/coverage-probes"]
+
 [[bin]]
 name = "bkmqb"
 path = "src/main.rs"

@@ -33,6 +33,7 @@
 config.local.toml
 /config/bot.toml
 /config/plugins.toml
+/config/plugins.qq-smoke.toml
 /config/secrets.env
 secrets.toml
 *.pem

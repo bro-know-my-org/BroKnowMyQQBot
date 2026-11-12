@@ -12,35 +12,46 @@ use bot_core::{
     EventId, MessageSegment, MessageTarget, RuntimeBuilder, Sender, ShutdownHandle, ShutdownSignal,
     shutdown_channel,
 };
+use builtin_plugins::{AdminPlugin, HelpPlugin, PingPlugin};
+#[cfg(feature = "coverage-probes")]
 use builtin_plugins::{
-    ActionResultProbePlugin, AdminPlugin, BrowserProbePlugin, ConfigProbePlugin, DevToolsPlugin,
-    HelpPlugin, HttpProbePlugin, PingPlugin, QqExtensionProbePlugin, SchedulerProbePlugin,
+    BrowserProbePlugin, DevToolsPlugin, HttpProbePlugin, QqExtensionProbePlugin,
+    SchedulerProbePlugin,
 };
 use plugin_api::{
-    ActionCompleted, ActionStatus, BrowserPermission, BrowserRun, BrowserStep, HandlerOutput,
-    HostQueries, HttpPermission, HttpRequest, HttpResponse, PluginError, PluginEventEnvelope,
+    ActionCompleted, ActionStatus, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope,
     PluginManifest, StateOp, StaticPlugin,
 };
+#[cfg(feature = "coverage-probes")]
+use plugin_api::{
+    BrowserPermission, BrowserRun, BrowserStep, HttpPermission, HttpRequest, HttpResponse,
+};
 use plugin_fixtures::{
-    MigrationFixturePlugin, PanicFixturePlugin, PartitionFixturePlugin, QuotaFixturePlugin,
-    TimeoutFixturePlugin,
+    ActionResultProbePlugin, ConfigProbePlugin, MigrationFixturePlugin, PanicFixturePlugin,
+    PartitionFixturePlugin, QuotaFixturePlugin, TimeoutFixturePlugin,
+};
+#[cfg(feature = "coverage-probes")]
+use plugin_host::{
+    BrowserArtifact, BrowserExecution, BrowserExecutionError, BrowserExecutor, HttpExecutionError,
+    HttpExecutor, SecureHttpExecutor, TrustedPlatformQuery,
 };
 use plugin_host::{
-    BrowserArtifact, BrowserExecution, BrowserExecutionError, BrowserExecutor, CommitOptions,
-    HttpExecutionError, HttpExecutor, PluginHostError, PluginInstanceState, PluginStore,
-    SecureHttpExecutor, StaticPluginHost, TrustedAuthorityProvider, TrustedPlatformQuery,
-    TrustedPluginCapabilities,
+    CommitOptions, PluginHostError, PluginInstanceState, PluginStore, StaticPluginHost,
+    TrustedAuthorityProvider, TrustedPluginCapabilities,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
 #[derive(Debug)]
+#[cfg(feature = "coverage-probes")]
 struct MockHttpExecutor;
 
 #[derive(Debug)]
+#[cfg(feature = "coverage-probes")]
 struct MockBrowserExecutor;
 
 #[async_trait]
+#[cfg(feature = "coverage-probes")]
 impl BrowserExecutor for MockBrowserExecutor {
     async fn execute(
         &self,
@@ -175,6 +186,7 @@ impl StaticPlugin for ShutdownProbePlugin {
 }
 
 #[async_trait]
+#[cfg(feature = "coverage-probes")]
 impl HttpExecutor for MockHttpExecutor {
     async fn execute(
         &self,
@@ -231,6 +243,7 @@ struct MockAdapter {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "coverage-probes")]
 struct DevToolsAdapter {
     id: AdapterId,
     event: Mutex<Option<EventEnvelope>>,
@@ -349,6 +362,7 @@ impl Adapter for MockAdapter {
 }
 
 #[async_trait]
+#[cfg(feature = "coverage-probes")]
 impl Adapter for DevToolsAdapter {
     fn id(&self) -> &AdapterId {
         &self.id
@@ -441,6 +455,26 @@ fn message_event(text: &str) -> EventEnvelope {
     }
 }
 
+#[cfg(feature = "coverage-probes")]
+async fn register_test_admin(plugins: &mut StaticPluginHost) {
+    register_test_admin_with_owner(plugins, "user").await;
+}
+
+#[cfg(feature = "coverage-probes")]
+async fn register_test_admin_with_owner(plugins: &mut StaticPluginHost, owner: &str) {
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/test-authority",
+            BTreeMap::from([("owners".to_owned(), json!([owner]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::Administration),
+        )
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "coverage-probes")]
 fn devtools_event(adapter_id: &str, sender_id: &str) -> EventEnvelope {
     let mut event = message_event("/api-permissions");
     event.adapter = AdapterId::new(adapter_id);
@@ -633,17 +667,8 @@ async fn authority_help_runs_end_to_end_for_user_admin_owner_and_onebot() {
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn browser_screenshot_is_stored_and_replied_as_media() {
-    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap())
-        .with_browser_executor(Arc::new(MockBrowserExecutor));
-    plugins
-        .register_trusted(
-            Arc::new(BrowserProbePlugin::default()),
-            "dev.bkm.browser-probe/test",
-            BTreeMap::new(),
-        )
-        .await
-        .unwrap();
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(1);
     let adapter = Arc::new(MockAdapter {
@@ -654,6 +679,19 @@ async fn browser_screenshot_is_stored_and_replied_as_media() {
         outcome: ActionOutcome::Succeeded,
         shutdown_after_send: false,
     });
+    let routed_adapter: Arc<dyn Adapter> = adapter.clone();
+    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap())
+        .with_adapter(routed_adapter)
+        .with_browser_executor(Arc::new(MockBrowserExecutor));
+    register_test_admin(&mut plugins).await;
+    plugins
+        .register_trusted(
+            Arc::new(BrowserProbePlugin::default()),
+            "dev.bkm.browser-probe/test",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
     let runtime = RuntimeBuilder::new()
         .adapter(adapter)
         .handler(Arc::new(plugins))
@@ -670,21 +708,8 @@ async fn browser_screenshot_is_stored_and_replied_as_media() {
     assert!(reply.attachment.data().len() > 8);
 }
 
+#[cfg(feature = "coverage-probes")]
 async fn run_qq_extension_probe(grant_raw_extension: bool) -> String {
-    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
-    let mut grants = std::collections::BTreeSet::from(["message.reply".to_owned()]);
-    if grant_raw_extension {
-        grants.insert("event.extension.qq.official.raw".to_owned());
-    }
-    plugins
-        .register(
-            Arc::new(QqExtensionProbePlugin::default()),
-            "dev.bkm.qq-extension-probe/test",
-            BTreeMap::new(),
-            grants,
-        )
-        .await
-        .unwrap();
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(1);
     let mut event = message_event("/qq-extension");
@@ -705,6 +730,23 @@ async fn run_qq_extension_probe(grant_raw_extension: bool) -> String {
         outcome: ActionOutcome::Succeeded,
         shutdown_after_send: false,
     });
+    let routed_adapter: Arc<dyn Adapter> = adapter.clone();
+    let mut plugins =
+        StaticPluginHost::new(PluginStore::in_memory().unwrap()).with_adapter(routed_adapter);
+    register_test_admin(&mut plugins).await;
+    let mut grants = std::collections::BTreeSet::from(["message.reply".to_owned()]);
+    if grant_raw_extension {
+        grants.insert("event.extension.qq.official.raw".to_owned());
+    }
+    plugins
+        .register(
+            Arc::new(QqExtensionProbePlugin::default()),
+            "dev.bkm.qq-extension-probe/test",
+            BTreeMap::new(),
+            grants,
+        )
+        .await
+        .unwrap();
     let runtime = RuntimeBuilder::new()
         .adapter(adapter)
         .handler(Arc::new(plugins))
@@ -719,6 +761,7 @@ async fn run_qq_extension_probe(grant_raw_extension: bool) -> String {
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn qq_raw_extension_requires_manifest_and_administrator_grant() {
     assert_eq!(
         run_qq_extension_probe(true).await,
@@ -731,19 +774,8 @@ async fn qq_raw_extension_requires_manifest_and_administrator_grant() {
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn devtools_executes_only_its_allowlisted_platform_query() {
-    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
-    plugins
-        .register_trusted_with_capabilities(
-            Arc::new(DevToolsPlugin::default()),
-            "dev.bkm.devtools/test",
-            BTreeMap::from([("owners".to_owned(), json!(["user-id"]))]),
-            TrustedPluginCapabilities::default()
-                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList)
-                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
-        )
-        .await
-        .unwrap();
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(2);
     let adapter = Arc::new(DevToolsAdapter {
@@ -752,6 +784,20 @@ async fn devtools_executes_only_its_allowlisted_platform_query() {
         actions: action_sender,
         shutdown: shutdown_handle,
     });
+    let routed_adapter: Arc<dyn Adapter> = adapter.clone();
+    let mut plugins =
+        StaticPluginHost::new(PluginStore::in_memory().unwrap()).with_adapter(routed_adapter);
+    register_test_admin_with_owner(&mut plugins, "user-id").await;
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(DevToolsPlugin::default()),
+            "dev.bkm.devtools/test",
+            BTreeMap::new(),
+            TrustedPluginCapabilities::default()
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
+        )
+        .await
+        .unwrap();
     let runtime = RuntimeBuilder::new()
         .adapter(adapter)
         .handler(Arc::new(plugins))
@@ -783,9 +829,10 @@ async fn devtools_executes_only_its_allowlisted_platform_query() {
 }
 
 #[tokio::test]
-async fn devtools_owner_configuration_fails_closed() {
+#[cfg(feature = "coverage-probes")]
+async fn devtools_rejects_independent_owner_configuration() {
     for config in [
-        BTreeMap::new(),
+        BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
         BTreeMap::from([("owners".to_owned(), json!([]))]),
         BTreeMap::from([("owners".to_owned(), json!("owner-id"))]),
         BTreeMap::from([("owners".to_owned(), json!(["owner-id", "owner-id"]))]),
@@ -807,19 +854,8 @@ async fn devtools_owner_configuration_fails_closed() {
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn devtools_non_owner_never_reaches_platform_action() {
-    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
-    plugins
-        .register_trusted_with_capabilities(
-            Arc::new(DevToolsPlugin::default()),
-            "dev.bkm.devtools/non-owner",
-            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
-            TrustedPluginCapabilities::default()
-                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList)
-                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
-        )
-        .await
-        .unwrap();
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(2);
     let adapter = Arc::new(DevToolsAdapter {
@@ -828,6 +864,20 @@ async fn devtools_non_owner_never_reaches_platform_action() {
         actions: action_sender,
         shutdown: shutdown_handle,
     });
+    let routed_adapter: Arc<dyn Adapter> = adapter.clone();
+    let mut plugins =
+        StaticPluginHost::new(PluginStore::in_memory().unwrap()).with_adapter(routed_adapter);
+    register_test_admin_with_owner(&mut plugins, "owner-id").await;
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(DevToolsPlugin::default()),
+            "dev.bkm.devtools/non-owner",
+            BTreeMap::new(),
+            TrustedPluginCapabilities::default()
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
+        )
+        .await
+        .unwrap();
     let runtime = RuntimeBuilder::new()
         .adapter(adapter)
         .handler(Arc::new(plugins))
@@ -849,16 +899,8 @@ async fn devtools_non_owner_never_reaches_platform_action() {
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn ordinary_trusted_registration_cannot_become_an_authority_provider() {
-    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
-    plugins
-        .register_trusted(
-            Arc::new(DevToolsPlugin::default()),
-            "dev.bkm.devtools/ordinary-trusted",
-            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
-        )
-        .await
-        .unwrap();
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(1);
     let adapter = Arc::new(MockAdapter {
@@ -869,6 +911,17 @@ async fn ordinary_trusted_registration_cannot_become_an_authority_provider() {
         outcome: ActionOutcome::Succeeded,
         shutdown_after_send: true,
     });
+    let routed_adapter: Arc<dyn Adapter> = adapter.clone();
+    let mut plugins =
+        StaticPluginHost::new(PluginStore::in_memory().unwrap()).with_adapter(routed_adapter);
+    plugins
+        .register_trusted(
+            Arc::new(DevToolsPlugin::default()),
+            "dev.bkm.devtools/ordinary-trusted",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
     let runtime = RuntimeBuilder::new()
         .adapter(adapter)
         .handler(Arc::new(plugins))
@@ -890,18 +943,8 @@ async fn ordinary_trusted_registration_cannot_become_an_authority_provider() {
 }
 
 #[tokio::test]
-async fn authority_provider_without_platform_query_cannot_execute_it() {
-    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
-    plugins
-        .register_trusted_with_capabilities(
-            Arc::new(DevToolsPlugin::default()),
-            "dev.bkm.devtools/authority-only",
-            BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
-            TrustedPluginCapabilities::default()
-                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
-        )
-        .await
-        .unwrap();
+#[cfg(feature = "coverage-probes")]
+async fn authorized_owner_without_platform_query_cannot_execute_it() {
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(1);
     let adapter = Arc::new(MockAdapter {
@@ -915,6 +958,19 @@ async fn authority_provider_without_platform_query_cannot_execute_it() {
         outcome: ActionOutcome::Succeeded,
         shutdown_after_send: true,
     });
+    let routed_adapter: Arc<dyn Adapter> = adapter.clone();
+    let mut plugins =
+        StaticPluginHost::new(PluginStore::in_memory().unwrap()).with_adapter(routed_adapter);
+    register_test_admin_with_owner(&mut plugins, "owner-id").await;
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(DevToolsPlugin::default()),
+            "dev.bkm.devtools/authority-only",
+            BTreeMap::new(),
+            TrustedPluginCapabilities::default(),
+        )
+        .await
+        .unwrap();
     let runtime = RuntimeBuilder::new()
         .adapter(adapter)
         .handler(Arc::new(plugins))
@@ -983,20 +1039,12 @@ async fn action_completed_reports_success_failure_and_unknown() {
     assert_eq!(unknown.error_code.as_deref(), Some("result_unknown"));
 }
 
+#[cfg(feature = "coverage-probes")]
 async fn run_http_probe(
     executor: Arc<dyn HttpExecutor>,
     config: BTreeMap<String, Value>,
 ) -> (Action, BTreeMap<String, plugin_api::StateValue>) {
     let store = PluginStore::in_memory().unwrap();
-    let mut plugins = StaticPluginHost::new(store.clone()).with_http_executor(executor);
-    plugins
-        .register_trusted(
-            Arc::new(HttpProbePlugin::default()),
-            "dev.bkm.http-probe/test",
-            config,
-        )
-        .await
-        .unwrap();
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(1);
     let adapter = Arc::new(MockAdapter {
@@ -1007,6 +1055,19 @@ async fn run_http_probe(
         outcome: ActionOutcome::Succeeded,
         shutdown_after_send: false,
     });
+    let routed_adapter: Arc<dyn Adapter> = adapter.clone();
+    let mut plugins = StaticPluginHost::new(store.clone())
+        .with_adapter(routed_adapter)
+        .with_http_executor(executor);
+    register_test_admin(&mut plugins).await;
+    plugins
+        .register_trusted(
+            Arc::new(HttpProbePlugin::default()),
+            "dev.bkm.http-probe/test",
+            config,
+        )
+        .await
+        .unwrap();
     let runtime = RuntimeBuilder::new()
         .adapter(adapter)
         .handler(Arc::new(plugins))
@@ -1020,6 +1081,7 @@ async fn run_http_probe(
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn http_probe_uses_host_executor_and_receives_success() {
     let (action, state) = run_http_probe(Arc::new(MockHttpExecutor), BTreeMap::new()).await;
     let Action::Reply(reply) = action else {
@@ -1031,6 +1093,7 @@ async fn http_probe_uses_host_executor_and_receives_success() {
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn http_probe_rejects_ip_literal_before_network_access() {
     let (action, state) = run_http_probe(
         Arc::new(SecureHttpExecutor::default()),
@@ -1283,6 +1346,7 @@ async fn quota_failure_rolls_back_state_and_command() {
     assert!(actions.try_recv().is_err());
 }
 
+#[cfg(feature = "coverage-probes")]
 async fn persist_schedule_then_stop() -> PluginStore {
     let store = PluginStore::in_memory().unwrap();
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
@@ -1297,6 +1361,7 @@ async fn persist_schedule_then_stop() -> PluginStore {
     });
     let routed_adapter: Arc<dyn Adapter> = adapter.clone();
     let mut plugins = StaticPluginHost::new(store.clone()).with_adapter(routed_adapter);
+    register_test_admin(&mut plugins).await;
     plugins
         .register_trusted(
             Arc::new(SchedulerProbePlugin::default()),
@@ -1329,8 +1394,17 @@ async fn persist_schedule_then_stop() -> PluginStore {
 }
 
 #[tokio::test]
-async fn persisted_schedule_recovers_and_fires_after_host_restart() {
+#[cfg(feature = "coverage-probes")]
+async fn recovered_diagnostic_schedule_is_consumed_without_active_send() {
     let store = persist_schedule_then_stop().await;
+    assert!(
+        store
+            .snapshot("dev.bkm.scheduler-probe/test")
+            .unwrap()
+            .keys()
+            .any(|key| key.starts_with("tasks/")),
+        "the schedule must still be pending before host restart"
+    );
     let (shutdown_handle, _shutdown_signal) = shutdown_channel();
     let (action_sender, mut actions) = mpsc::channel(4);
     let adapter = Arc::new(MockAdapter {
@@ -1342,7 +1416,8 @@ async fn persisted_schedule_recovers_and_fires_after_host_restart() {
         shutdown_after_send: false,
     });
     let routed_adapter: Arc<dyn Adapter> = adapter;
-    let mut plugins = StaticPluginHost::new(store).with_adapter(routed_adapter);
+    let mut plugins = StaticPluginHost::new(store.clone()).with_adapter(routed_adapter);
+    register_test_admin(&mut plugins).await;
     plugins
         .register_trusted(
             Arc::new(SchedulerProbePlugin::default()),
@@ -1352,24 +1427,31 @@ async fn persisted_schedule_recovers_and_fires_after_host_restart() {
         .await
         .unwrap();
 
-    let action = tokio::time::timeout(std::time::Duration::from_secs(2), actions.recv())
-        .await
-        .expect("recovered schedule should fire")
-        .unwrap();
-    let Action::SendMessage(message) = action else {
-        panic!("scheduled trigger should actively send a message");
-    };
-    assert_eq!(message.content, "scheduled task fired");
-    assert_eq!(
-        message.target,
-        MessageTarget::Group {
-            group_id: "group".to_owned()
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let task_consumed = store
+                .snapshot("dev.bkm.scheduler-probe/test")
+                .unwrap()
+                .keys()
+                .all(|key| !key.starts_with("tasks/"));
+            let scheduler_idle = plugins
+                .diagnostic_active_schedule_count("dev.bkm.scheduler-probe/test")
+                .unwrap()
+                == 0;
+            if task_consumed && scheduler_idle {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    );
+    })
+    .await
+    .expect("recovered schedule should be consumed");
+    assert!(actions.try_recv().is_err());
     plugins.stop_schedulers().unwrap();
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn recovered_schedule_can_be_cancelled_before_it_fires() {
     let store = persist_schedule_then_stop().await;
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
@@ -1387,6 +1469,7 @@ async fn recovered_schedule_can_be_cancelled_before_it_fires() {
     });
     let routed_adapter: Arc<dyn Adapter> = adapter.clone();
     let mut plugins = StaticPluginHost::new(store).with_adapter(routed_adapter);
+    register_test_admin(&mut plugins).await;
     plugins
         .register_trusted(
             Arc::new(SchedulerProbePlugin::default()),
@@ -1476,6 +1559,23 @@ async fn config_update_validates_switches_and_rolls_back_failed_init() {
     )
     .await
     .unwrap();
+    assert_eq!(run_config_probe(host.clone()).await, "new: ok");
+
+    let numeric_representation_error = host
+        .update_config(
+            "dev.bkm.config-probe/test",
+            BTreeMap::from([
+                ("prefix".to_owned(), Value::String("float".to_owned())),
+                ("delay_ms".to_owned(), Value::from(1.0)),
+            ]),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        numeric_representation_error,
+        PluginHostError::InvalidConfig { message, .. }
+            if message.contains("nonnegative integer")
+    ));
     assert_eq!(run_config_probe(host.clone()).await, "new: ok");
 
     let schema_error = host

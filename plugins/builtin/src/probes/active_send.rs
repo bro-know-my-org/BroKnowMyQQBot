@@ -1,7 +1,7 @@
 use super::{
     Disposition, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest,
-    StaticPlugin, async_trait, command_argument, diagnostic_plugin_manifest, ignored, json,
-    message_text, plugin_command,
+    StaticPlugin, async_trait, command_argument, diagnostic_authorized, diagnostic_plugin_manifest,
+    ignored, json, message_text, plugin_command, restricted,
 };
 
 /// Explicit functional probe for platform proactive-message authorization.
@@ -36,7 +36,7 @@ impl StaticPlugin for ActiveSendProbePlugin {
     async fn on_event(
         &self,
         event: &PluginEventEnvelope,
-        _queries: &dyn HostQueries,
+        queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
         let Some(text) = message_text(event) else {
             return Ok(ignored());
@@ -44,6 +44,9 @@ impl StaticPlugin for ActiveSendProbePlugin {
         let Some(content) = command_argument(text, "/active-send") else {
             return Ok(ignored());
         };
+        if !diagnostic_authorized(queries) {
+            return Ok(restricted(event));
+        }
         let target = event
             .payload
             .pointer("/data/target")

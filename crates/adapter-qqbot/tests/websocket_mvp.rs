@@ -10,9 +10,13 @@ use axum::{
 use bot_core::{
     Adapter, EventSender, RuntimeBuilder, RuntimeObserver, ShutdownHandle, shutdown_channel,
 };
-use builtin_plugins::{ActiveSendProbePlugin, EchoPlugin, PingPlugin};
+#[cfg(feature = "coverage-probes")]
+use builtin_plugins::{ActiveSendProbePlugin, AdminPlugin};
+use builtin_plugins::{EchoPlugin, PingPlugin};
 use futures_util::{SinkExt, StreamExt};
 use plugin_host::{PluginStore, StaticPluginHost};
+#[cfg(feature = "coverage-probes")]
+use plugin_host::{TrustedAuthorityProvider, TrustedPluginCapabilities};
 use qqbot_protocol::{OpenApiClient, TokenManager};
 use reqwest::Client;
 use secrecy::SecretString;
@@ -480,6 +484,7 @@ async fn echo_plugin_uses_passive_group_reply() {
 }
 
 #[tokio::test]
+#[cfg(feature = "coverage-probes")]
 async fn active_send_probe_confirms_then_sends_without_reply_id() {
     let (gateway_url, gateway_task) = start_gateway("/active-send proactive").await;
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
@@ -493,7 +498,19 @@ async fn active_send_probe_confirms_then_sends_without_reply_id() {
     );
     let api = OpenApiClient::with_base_url(base_url, tokens).unwrap();
     let adapter = Arc::new(QqWebSocketAdapter::new(QqWebSocketConfig::default(), api));
-    let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+    let routed_adapter: Arc<dyn Adapter> = adapter.clone();
+    let mut plugins =
+        StaticPluginHost::new(PluginStore::in_memory().unwrap()).with_adapter(routed_adapter);
+    plugins
+        .register_trusted_with_capabilities(
+            Arc::new(AdminPlugin::default()),
+            "dev.bkm.admin/qq-websocket-test",
+            BTreeMap::from([("owners".to_owned(), json!(["member-id"]))]),
+            TrustedPluginCapabilities::default()
+                .with_authority_provider(TrustedAuthorityProvider::Administration),
+        )
+        .await
+        .unwrap();
     plugins
         .register_trusted(
             Arc::new(ActiveSendProbePlugin::default()),

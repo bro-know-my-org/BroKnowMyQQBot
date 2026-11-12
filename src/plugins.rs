@@ -12,18 +12,33 @@ use serde_json::Value;
 use thiserror::Error;
 use tracing::info;
 
+#[cfg(feature = "coverage-probes")]
 use builtin_plugins::{
-    ActiveSendProbePlugin, AdminPlugin, BrowserProbePlugin, CounterPlugin, DevToolsPlugin,
-    EchoPlugin, HelpPlugin, HttpProbePlugin, PingPlugin, QqExtensionProbePlugin, ReminderPlugin,
-    SchedulerProbePlugin,
+    ActiveSendProbePlugin, BrowserProbePlugin, DevToolsPlugin, HttpProbePlugin,
+    QqExtensionProbePlugin, SchedulerProbePlugin,
 };
+use builtin_plugins::{
+    AdminPlugin, CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin, ReminderPlugin,
+};
+#[cfg(feature = "coverage-probes")]
+use plugin_host::TrustedPlatformQuery;
 use plugin_host::{
-    PluginStore, StaticPluginHost, TrustedAuthorityProvider, TrustedPlatformQuery,
-    TrustedPluginCapabilities, ValidatedPluginPackage, WasmPlugin,
+    PluginStore, StaticPluginHost, TrustedAuthorityProvider, TrustedPluginCapabilities,
+    ValidatedPluginPackage, WasmPlugin,
 };
 
 const MAX_INSTALLATION_FILE_BYTES: usize = 1024 * 1024;
 const MAX_CONFIGURED_OWNERS: usize = 32;
+pub(crate) const DEFAULT_BUNDLED_PLUGINS: &[&str] =
+    &["ping", "help", "echo", "counter", "reminder"];
+const COVERAGE_PROBE_NAMES: &[&str] = &[
+    "http-probe",
+    "browser-probe",
+    "scheduler-probe",
+    "qq-extension-probe",
+    "active-send-probe",
+    "devtools",
+];
 const BUNDLED_PLUGIN_INSTANCES: &[(&str, &str)] = &[
     ("ping", "dev.bkm.ping/default"),
     ("help", "dev.bkm.help/default"),
@@ -322,19 +337,28 @@ async fn register_bundled_plugins(
     selected: Option<Vec<String>>,
     configs: &BTreeMap<String, BTreeMap<String, Value>>,
 ) -> Result<(bool, BTreeSet<String>), Box<dyn std::error::Error>> {
-    let mut selected = selected.unwrap_or_else(|| {
-        ["ping", "help", "echo", "counter", "reminder"]
-            .map(str::to_owned)
-            .to_vec()
+    let selected = selected.unwrap_or_else(|| {
+        DEFAULT_BUNDLED_PLUGINS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect()
     });
-    if let (Some(admin), Some(devtools)) = (
-        selected.iter().position(|name| name == "admin"),
-        selected.iter().position(|name| name == "devtools"),
-    ) {
-        if devtools < admin {
-            selected.swap(devtools, admin);
+    #[cfg(feature = "coverage-probes")]
+    let selected = {
+        let mut selected = selected;
+        let requires_authority = selected
+            .iter()
+            .any(|name| COVERAGE_PROBE_NAMES.contains(&name.as_str()));
+        if requires_authority {
+            let admin = selected
+                .iter()
+                .position(|name| name == "admin")
+                .ok_or(PluginConfigError::MissingDiagnosticAuthority)?;
+            let provider = selected.remove(admin);
+            selected.insert(0, provider);
         }
-    }
+        selected
+    };
     let mut seen = BTreeSet::new();
     let mut instance_ids = BTreeSet::new();
     let mut include_help = false;
@@ -356,20 +380,30 @@ async fn register_bundled_plugins(
             "counter" => std::sync::Arc::new(CounterPlugin::default()),
             "admin" => std::sync::Arc::new(AdminPlugin::default()),
             "reminder" => std::sync::Arc::new(ReminderPlugin::default()),
+            #[cfg(feature = "coverage-probes")]
             "http-probe" => std::sync::Arc::new(HttpProbePlugin::default()),
+            #[cfg(feature = "coverage-probes")]
             "browser-probe" => std::sync::Arc::new(BrowserProbePlugin::default()),
+            #[cfg(feature = "coverage-probes")]
             "scheduler-probe" => std::sync::Arc::new(SchedulerProbePlugin::default()),
+            #[cfg(feature = "coverage-probes")]
             "qq-extension-probe" => std::sync::Arc::new(QqExtensionProbePlugin::default()),
+            #[cfg(feature = "coverage-probes")]
             "active-send-probe" => std::sync::Arc::new(ActiveSendProbePlugin::default()),
+            #[cfg(feature = "coverage-probes")]
             "devtools" => std::sync::Arc::new(DevToolsPlugin::default()),
+            #[cfg(not(feature = "coverage-probes"))]
+            _ if COVERAGE_PROBE_NAMES.contains(&name.as_str()) => {
+                return Err(Box::new(PluginConfigError::CoverageProbeUnavailable(name)));
+            }
             _ => return Err(Box::new(PluginConfigError::UnknownBundled(name))),
         };
         let trusted_capabilities = match name.as_str() {
             "admin" => TrustedPluginCapabilities::default()
                 .with_authority_provider(TrustedAuthorityProvider::Administration),
+            #[cfg(feature = "coverage-probes")]
             "devtools" => TrustedPluginCapabilities::default()
-                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList)
-                .with_authority_provider(TrustedAuthorityProvider::DevToolsLegacy),
+                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
             _ => TrustedPluginCapabilities::default(),
         };
         plugins
@@ -389,8 +423,16 @@ async fn register_bundled_plugins(
 enum PluginConfigError {
     #[error("unknown bundled plugin `{0}`")]
     UnknownBundled(String),
+    #[cfg(not(feature = "coverage-probes"))]
+    #[error(
+        "bundled plugin `{0}` requires a bkmqb binary built with the `coverage-probes` feature"
+    )]
+    CoverageProbeUnavailable(String),
     #[error("bundled plugin `{0}` is listed more than once")]
     DuplicateBundled(String),
+    #[cfg(feature = "coverage-probes")]
+    #[error("diagnostic probes require bundled `admin` as the authority provider")]
+    MissingDiagnosticAuthority,
     #[error("plugin instance `{0}` is declared by more than one installation source")]
     DuplicateInstance(String),
     #[error("plugin instance `{0}` is reserved for a bundled plugin")]
@@ -431,6 +473,7 @@ enum PluginConfigError {
 mod tests {
     use super::*;
     use base64::Engine as _;
+    use plugin_api::{CallerAuthority, HostQueries, PluginEventEnvelope, StateValue, StaticPlugin};
 
     struct TestDirectory(PathBuf);
 
@@ -452,6 +495,59 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct HelpQueries {
+        capabilities: BTreeSet<String>,
+    }
+
+    impl HostQueries for HelpQueries {
+        fn config_get(&self, _key: &str) -> Option<&Value> {
+            None
+        }
+
+        fn state_get(&self, _key: &str) -> Option<&StateValue> {
+            None
+        }
+
+        fn state_scan(&self, _prefix: &str, _limit: usize) -> Vec<(&str, &StateValue)> {
+            Vec::new()
+        }
+
+        fn granted_capabilities(&self) -> &BTreeSet<String> {
+            &self.capabilities
+        }
+
+        fn invocation_time_ms(&self) -> i64 {
+            0
+        }
+
+        fn caller_authority(&self) -> CallerAuthority {
+            CallerAuthority::default()
+        }
+    }
+
+    fn help_event() -> PluginEventEnvelope {
+        PluginEventEnvelope {
+            protocol_version: "1.0.0".to_owned(),
+            event_id: "help-event".to_owned(),
+            delivery_id: "help-delivery".to_owned(),
+            invocation_id: "help-invocation".to_owned(),
+            occurred_at_ms: None,
+            received_at_ms: 0,
+            adapter_id: "test".to_owned(),
+            event_type: "message.created".to_owned(),
+            trace_id: None,
+            payload: serde_json::json!({
+                "type": "message",
+                "data": {
+                    "text": "/help",
+                    "sender": {"id": "user-id"},
+                    "target": {"scope": "group", "group_id": "group-id"}
+                }
+            }),
+            extensions: Vec::new(),
         }
     }
 
@@ -501,6 +597,141 @@ mod tests {
     }
 
     #[test]
+    fn default_bundled_plugin_order_is_stable() {
+        assert_eq!(
+            DEFAULT_BUNDLED_PLUGINS,
+            ["ping", "help", "echo", "counter", "reminder"]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_registration_contains_only_product_plugins() {
+        let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
+        let (include_help, instances) =
+            register_bundled_plugins(&mut plugins, None, &BTreeMap::new())
+                .await
+                .unwrap();
+        assert!(include_help);
+        register_help_plugin(&mut plugins).await.unwrap();
+
+        assert_eq!(
+            instances,
+            BTreeSet::from([
+                "dev.bkm.ping/default".to_owned(),
+                "dev.bkm.help/default".to_owned(),
+                "dev.bkm.echo/default".to_owned(),
+                "dev.bkm.counter/default".to_owned(),
+                "dev.bkm.reminder/default".to_owned(),
+            ])
+        );
+        let help = HelpPlugin::with_commands(plugins.command_declarations().unwrap());
+        let output = help
+            .on_event(
+                &help_event(),
+                &HelpQueries {
+                    capabilities: BTreeSet::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let content = output.commands[0].payload["content"].as_str().unwrap();
+        for command in ["/ping", "/help", "/echo", "/count", "/remind"] {
+            assert!(content.contains(command), "default help omitted {command}");
+        }
+        for probe in ["/whoami", "/api-permissions", "/screenshot", "/active-send"] {
+            assert!(!content.contains(probe), "default help exposed {probe}");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "coverage-probes")]
+    async fn smoke_template_registers_every_selected_plugin() {
+        let installations: PluginInstallations =
+            toml::from_str(include_str!("../config/examples/plugins.qq-smoke.toml")).unwrap();
+        let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
+        let (include_help, instances) = register_bundled_plugins(
+            &mut plugins,
+            installations.bundled,
+            &installations.bundled_config,
+        )
+        .await
+        .unwrap();
+        assert!(include_help);
+        register_help_plugin(&mut plugins).await.unwrap();
+        assert_eq!(instances.len(), BUNDLED_PLUGIN_INSTANCES.len());
+        for (_, instance_id) in BUNDLED_PLUGIN_INSTANCES {
+            assert!(
+                instances.contains(*instance_id),
+                "smoke profile omitted {instance_id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "coverage-probes")]
+    async fn diagnostic_probes_require_an_authority_provider() {
+        for &name in COVERAGE_PROBE_NAMES {
+            let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
+            let error = register_bundled_plugins(
+                &mut plugins,
+                Some(vec![name.to_owned()]),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("authority provider"),
+                "standalone probe {name} did not report its authority dependency"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_remains_explicitly_selectable_with_owner_config() {
+        let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
+        let configs = BTreeMap::from([(
+            "admin".to_owned(),
+            BTreeMap::from([("owners".to_owned(), serde_json::json!(["owner-id"]))]),
+        )]);
+        let (_, instances) =
+            register_bundled_plugins(&mut plugins, Some(vec!["admin".to_owned()]), &configs)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            instances,
+            BTreeSet::from(["dev.bkm.admin/default".to_owned()])
+        );
+        assert_eq!(
+            plugins
+                .instance_manifest("dev.bkm.admin/default")
+                .unwrap()
+                .id
+                .to_string(),
+            "dev.bkm.admin"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(feature = "coverage-probes"))]
+    async fn ordinary_build_rejects_coverage_probe_selection() {
+        for name in COVERAGE_PROBE_NAMES {
+            let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
+            let error = register_bundled_plugins(
+                &mut plugins,
+                Some(vec![(*name).to_owned()]),
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("`coverage-probes` feature"),
+                "ordinary build did not reject {name} with an actionable error"
+            );
+        }
+    }
+
+    #[test]
     fn global_administrators_reject_malformed_configured_owners() {
         let directory = TestDirectory::new();
         let installation_file = directory.0.join("plugins.toml");
@@ -533,6 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "coverage-probes")]
     async fn bundled_selection_can_replace_static_ping() {
         let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
         let configs = BTreeMap::from([(
@@ -595,37 +827,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundled_admin_registers_before_legacy_devtools_regardless_of_selection_order() {
-        let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
-        let configs = BTreeMap::from([
-            (
-                "admin".to_owned(),
-                BTreeMap::from([("owners".to_owned(), serde_json::json!(["admin-owner"]))]),
-            ),
-            (
-                "devtools".to_owned(),
-                BTreeMap::from([("owners".to_owned(), serde_json::json!(["legacy-owner"]))]),
-            ),
-        ]);
-
-        register_bundled_plugins(
-            &mut plugins,
-            Some(vec!["devtools".to_owned(), "admin".to_owned()]),
-            &configs,
-        )
-        .await
-        .unwrap();
-
-        let commands = plugins.command_declarations().unwrap();
-        let admin = commands
-            .iter()
-            .position(|command| command.name == "admin")
+    #[cfg(feature = "coverage-probes")]
+    async fn bundled_admin_registers_before_every_diagnostic_consumer() {
+        let configs = BTreeMap::from([(
+            "admin".to_owned(),
+            BTreeMap::from([("owners".to_owned(), serde_json::json!(["admin-owner"]))]),
+        )]);
+        for &name in COVERAGE_PROBE_NAMES {
+            let mut plugins = StaticPluginHost::new(plugin_host::PluginStore::in_memory().unwrap());
+            register_bundled_plugins(
+                &mut plugins,
+                Some(vec![name.to_owned(), "admin".to_owned()]),
+                &configs,
+            )
+            .await
             .unwrap();
-        let devtools = commands
-            .iter()
-            .position(|command| command.name == "api-permissions")
-            .unwrap();
-        assert!(admin < devtools);
+            // Registration recovers pending deliveries immediately. The authority
+            // provider must be available before any diagnostic consumer registers.
+            let commands = plugins.command_declarations().unwrap();
+            assert_eq!(commands[0].name, "admin", "{name} recovered before admin");
+        }
     }
 
     #[tokio::test]

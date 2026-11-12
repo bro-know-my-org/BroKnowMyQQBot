@@ -9,6 +9,7 @@ publish = false
 [features]
 default = []
 wasm = ["dep:anyhow", "dep:wasmtime"]
+coverage-probes = ["builtin-plugins/coverage-probes"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }

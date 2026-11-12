@@ -1,8 +1,10 @@
+#[cfg(test)]
+use super::CallerRole;
 use super::{
-    ActionCompleted, ActionStatus, Audience, BTreeSet, CallerRole, Disposition, HandlerOutput,
-    HostQueries, PluginCommand, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin,
-    Subscription, Value, async_trait, command_argument, command_declaration,
-    diagnostic_plugin_manifest, ignored, is_command, json, message_text, reply,
+    ActionCompleted, ActionStatus, Audience, BTreeSet, Disposition, HandlerOutput, HostQueries,
+    PluginCommand, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin, Subscription,
+    Value, async_trait, command_argument, command_declaration, diagnostic_authorized,
+    diagnostic_plugin_manifest, ignored, is_command, json, message_text, reply, restricted,
 };
 use std::collections::BTreeMap;
 
@@ -66,6 +68,7 @@ impl Default for DevToolsPlugin {
             "List QQ guild API permissions",
         ));
         manifest.commands[1].audience = Audience::DevDiagnostic;
+        ">=1.1,<2.0".clone_into(&mut manifest.protocol);
         manifest.subscriptions.push(Subscription {
             id: "platform-query-results".to_owned(),
             event: "action.completed".to_owned(),
@@ -81,16 +84,7 @@ impl Default for DevToolsPlugin {
             config_schema: json!({
                 "$schema":"https://json-schema.org/draft/2020-12/schema",
                 "type":"object",
-                "properties":{
-                    "owners":{
-                        "type":"array",
-                        "minItems":1,
-                        "maxItems":32,
-                        "uniqueItems":true,
-                        "items":{"type":"string","minLength":1,"maxLength":124}
-                    }
-                },
-                "required":["owners"],
+                "properties":{},
                 "additionalProperties":false
             }),
         }
@@ -107,24 +101,6 @@ impl StaticPlugin for DevToolsPlugin {
         Some(&self.config_schema)
     }
 
-    async fn validate_config(&self, config: &BTreeMap<String, Value>) -> Result<(), PluginError> {
-        let owners = config
-            .get("owners")
-            .and_then(Value::as_array)
-            .ok_or_else(|| PluginError::InvalidConfig("owners must be an array".to_owned()))?;
-        if owners.is_empty()
-            || owners.len() > 32
-            || owners
-                .iter()
-                .any(|owner| owner.as_str().is_none_or(|owner| !valid_identity(owner)))
-        {
-            return Err(PluginError::InvalidConfig(
-                "owners must contain 1..32 unique valid sender IDs".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
     async fn on_event(
         &self,
         event: &PluginEventEnvelope,
@@ -137,34 +113,32 @@ impl StaticPlugin for DevToolsPlugin {
             return Ok(ignored());
         };
         if is_command("/whoami")(text) {
-            return Ok(whoami(event));
+            return if diagnostic_authorized(queries) {
+                Ok(whoami(event))
+            } else {
+                Ok(restricted(event))
+            };
         }
         let view = if is_command("/api-permissions")(text) {
-            PermissionView::Summary
+            Some(PermissionView::Summary)
         } else {
             match command_argument(text, "/api-permissions") {
-                Some("channels") => PermissionView::Channels,
-                Some("all") => PermissionView::All,
-                Some(_) => {
-                    return Ok(reply(
-                        event,
-                        "Usage: /api-permissions [channels|all]",
-                        Vec::new(),
-                    ));
-                }
+                Some("channels") => Some(PermissionView::Channels),
+                Some("all") => Some(PermissionView::All),
+                Some(_) => None,
                 None => return Ok(ignored()),
             }
         };
-        if !matches!(
-            queries.caller_authority().role,
-            CallerRole::Admin | CallerRole::Owner
-        ) {
+        if !diagnostic_authorized(queries) {
+            return Ok(restricted(event));
+        }
+        let Some(view) = view else {
             return Ok(reply(
                 event,
-                "API permission diagnostics are restricted to configured owners and delegated administrators",
+                "Usage: /api-permissions [channels|all]",
                 Vec::new(),
             ));
-        }
+        };
         let Some(guild_id) = qq_guild_id(event)? else {
             return Ok(reply(
                 event,
@@ -383,23 +357,6 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, PluginE
         .ok_or_else(|| PluginError::Permanent(format!("API permission {field} is invalid")))
 }
 
-fn valid_identity(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 124
-        && !value.chars().any(|character| {
-            character.is_control()
-                || matches!(
-                    character,
-                    '\u{00ad}'
-                        | '\u{061c}'
-                        | '\u{200b}'..='\u{200f}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2060}'..='\u{206f}'
-                        | '\u{feff}'
-                )
-        })
-}
-
 fn qq_guild_id(event: &PluginEventEnvelope) -> Result<Option<String>, PluginError> {
     event
         .extensions
@@ -432,13 +389,13 @@ mod tests {
 
     struct Queries {
         capabilities: BTreeSet<String>,
-        owners: Value,
         role: CallerRole,
+        platform: &'static str,
     }
 
     impl HostQueries for Queries {
-        fn config_get(&self, key: &str) -> Option<&Value> {
-            (key == "owners").then_some(&self.owners)
+        fn config_get(&self, _key: &str) -> Option<&Value> {
+            panic!("DevTools authorization must use caller_authority, not plugin configuration")
         }
 
         fn state_get(&self, _key: &str) -> Option<&StateValue> {
@@ -460,7 +417,7 @@ mod tests {
         fn caller_authority(&self) -> CallerAuthority {
             CallerAuthority {
                 role: self.role,
-                platform: "qq.official".to_owned(),
+                platform: self.platform.to_owned(),
                 subject_hint: None,
             }
         }
@@ -469,8 +426,8 @@ mod tests {
     fn queries() -> Queries {
         Queries {
             capabilities: BTreeSet::new(),
-            owners: json!(["sender-id"]),
             role: CallerRole::Owner,
+            platform: "qq.official",
         }
     }
 
@@ -503,55 +460,120 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whoami_reports_sender_adapter_and_target() {
-        let output = DevToolsPlugin::default()
-            .on_event(&event("/whoami"), &queries())
-            .await
-            .unwrap();
-        let content = output.commands[0].payload["content"].as_str().unwrap();
-        assert!(content.contains("adapter: qq-main"));
-        assert!(content.contains("sender_id: sender-id"));
-        assert!(content.contains("channel-id"));
-    }
-
-    #[tokio::test]
-    async fn api_permissions_emits_the_narrow_platform_query() {
-        let output = DevToolsPlugin::default()
-            .on_event(&event("/api-permissions"), &queries())
-            .await
-            .unwrap();
-        assert_eq!(output.commands[0].kind, API_PERMISSIONS_ACTION);
-        assert_eq!(output.commands[0].command_id, "api-permissions");
-        assert_eq!(output.commands[0].payload, json!({"guild_id":"guild-id"}));
-
-        for (argument, command_id) in [
-            ("channels", "api-permissions-channels"),
-            ("all", "api-permissions-all"),
-        ] {
+    async fn whoami_reports_sender_adapter_and_target_for_admin_and_owner() {
+        for role in [CallerRole::Admin, CallerRole::Owner] {
             let output = DevToolsPlugin::default()
-                .on_event(&event(&format!("/api-permissions {argument}")), &queries())
+                .on_event(&event("/whoami"), &Queries { role, ..queries() })
                 .await
                 .unwrap();
-            assert_eq!(output.commands[0].command_id, command_id);
-            assert_eq!(output.commands[0].kind, API_PERMISSIONS_ACTION);
+            let content = output.commands[0].payload["content"].as_str().unwrap();
+            assert!(content.contains("adapter: qq-main"));
+            assert!(content.contains("sender_id: sender-id"));
+            assert!(content.contains("channel-id"));
         }
     }
 
     #[tokio::test]
-    async fn api_permissions_rejects_non_owner_senders() {
+    async fn api_permissions_emits_the_narrow_platform_query() {
+        for role in [CallerRole::Admin, CallerRole::Owner] {
+            let queries = Queries { role, ..queries() };
+            for (text, command_id) in [
+                ("/api-permissions", "api-permissions"),
+                ("/api-permissions channels", "api-permissions-channels"),
+                ("/api-permissions all", "api-permissions-all"),
+            ] {
+                let output = DevToolsPlugin::default()
+                    .on_event(&event(text), &queries)
+                    .await
+                    .unwrap();
+                assert_eq!(output.commands.len(), 1);
+                assert_eq!(output.commands[0].command_id, command_id);
+                assert_eq!(output.commands[0].kind, API_PERMISSIONS_ACTION);
+                assert_eq!(output.commands[0].payload, json!({"guild_id":"guild-id"}));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_permissions_rejects_users() {
         let output = DevToolsPlugin::default()
             .on_event(
                 &event("/api-permissions"),
                 &Queries {
-                    capabilities: BTreeSet::new(),
-                    owners: json!(["another-owner"]),
                     role: CallerRole::User,
+                    ..queries()
                 },
             )
             .await
             .unwrap();
         assert_eq!(output.commands.len(), 1);
         assert_eq!(output.commands[0].kind, "message.reply");
+        assert!(
+            output.commands[0].payload["content"]
+                .as_str()
+                .unwrap()
+                .contains("restricted to configured owners")
+        );
+    }
+
+    #[tokio::test]
+    async fn whoami_rejects_users() {
+        let output = DevToolsPlugin::default()
+            .on_event(
+                &event("/whoami"),
+                &Queries {
+                    role: CallerRole::User,
+                    ..queries()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.commands[0].kind, "message.reply");
+        assert!(
+            output.commands[0].payload["content"]
+                .as_str()
+                .unwrap()
+                .contains("restricted to configured owners")
+        );
+    }
+
+    #[tokio::test]
+    async fn privileged_roles_from_other_platforms_cannot_run_devtools() {
+        for role in [CallerRole::Admin, CallerRole::Owner] {
+            let queries = Queries {
+                role,
+                platform: "onebot11",
+                ..queries()
+            };
+            for command in ["/whoami", "/api-permissions"] {
+                let output = DevToolsPlugin::default()
+                    .on_event(&event(command), &queries)
+                    .await
+                    .unwrap();
+                assert_eq!(output.commands.len(), 1);
+                assert_eq!(output.commands[0].kind, "message.reply");
+                assert!(
+                    output.commands[0].payload["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("restricted")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn api_permissions_authorizes_before_reporting_invalid_arguments() {
+        let output = DevToolsPlugin::default()
+            .on_event(
+                &event("/api-permissions invalid"),
+                &Queries {
+                    role: CallerRole::User,
+                    ..queries()
+                },
+            )
+            .await
+            .unwrap();
         assert!(
             output.commands[0].payload["content"]
                 .as_str()

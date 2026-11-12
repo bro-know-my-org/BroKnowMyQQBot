@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+coverage-probes = []
+
 [dependencies]
 async-trait.workspace = true
 plugin-api = { path = "../../crates/plugin-api" }

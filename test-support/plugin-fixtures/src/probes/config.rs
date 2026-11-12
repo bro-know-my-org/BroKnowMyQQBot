@@ -1,40 +1,34 @@
-use super::{
-    BTreeMap, Duration, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope,
-    PluginManifest, StaticPlugin, Value, async_trait, diagnostic_plugin_manifest, ignored,
-    is_command, json, message_text, reply, sleep,
-};
+use std::{collections::BTreeMap, time::Duration};
+
+use async_trait::async_trait;
+use plugin_api::{HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, StaticPlugin};
+use serde_json::{Value, json};
+use tokio::time::sleep;
+
+use super::action_result::{ignored, message_text, probe_manifest, reply};
 
 #[derive(Debug)]
 pub struct ConfigProbePlugin {
-    manifest: PluginManifest,
+    manifest: plugin_api::PluginManifest,
     config_schema: Value,
 }
 
 impl Default for ConfigProbePlugin {
     fn default() -> Self {
         Self {
-            manifest: diagnostic_plugin_manifest(
+            manifest: probe_manifest(
                 "dev.bkm.config-probe",
                 "Config Probe",
                 "config-probe",
-                "message.reply",
                 false,
             ),
             config_schema: json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
                 "properties": {
-                    "prefix": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 64
-                    },
-                    "delay_ms": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 1000
-                    },
-                    "fail_init": { "type": "boolean" }
+                    "prefix": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "delay_ms": {"type": "integer", "minimum": 0, "maximum": 1000},
+                    "fail_init": {"type": "boolean"}
                 },
                 "required": ["prefix"],
                 "additionalProperties": false
@@ -45,7 +39,7 @@ impl Default for ConfigProbePlugin {
 
 #[async_trait]
 impl StaticPlugin for ConfigProbePlugin {
-    fn manifest(&self) -> &PluginManifest {
+    fn manifest(&self) -> &plugin_api::PluginManifest {
         &self.manifest
     }
 
@@ -65,14 +59,17 @@ impl StaticPlugin for ConfigProbePlugin {
                 "prefix must contain between 1 and 64 characters".to_owned(),
             ));
         }
-        if config
-            .get("delay_ms")
-            .and_then(Value::as_u64)
-            .is_some_and(|delay| delay > 1_000)
-        {
-            return Err(PluginError::InvalidConfig(
-                "delay_ms must not exceed 1000".to_owned(),
-            ));
+        if let Some(delay) = config.get("delay_ms") {
+            let Some(delay) = delay.as_u64() else {
+                return Err(PluginError::InvalidConfig(
+                    "delay_ms must be a nonnegative integer".to_owned(),
+                ));
+            };
+            if delay > 1_000 {
+                return Err(PluginError::InvalidConfig(
+                    "delay_ms must not exceed 1000".to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -91,7 +88,7 @@ impl StaticPlugin for ConfigProbePlugin {
         event: &PluginEventEnvelope,
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
-        if !message_text(event).is_some_and(is_command("/config-probe")) {
+        if message_text(event).is_none_or(|text| text.trim() != "/config-probe") {
             return Ok(ignored());
         }
         if let Some(delay) = queries.config_get("delay_ms").and_then(Value::as_u64) {
@@ -101,6 +98,6 @@ impl StaticPlugin for ConfigProbePlugin {
             .config_get("prefix")
             .and_then(Value::as_str)
             .ok_or_else(|| PluginError::Permanent("validated prefix is missing".to_owned()))?;
-        Ok(reply(event, &format!("{prefix}: ok"), Vec::new()))
+        Ok(reply(event, &format!("{prefix}: ok")))
     }
 }

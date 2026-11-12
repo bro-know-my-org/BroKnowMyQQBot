@@ -3,7 +3,7 @@ use super::{
     BrowserRunResult, BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil,
     Disposition, HandlerOutput, HostQueries, MediaReply, PluginCommand, PluginError,
     PluginEventEnvelope, PluginManifest, StaticPlugin, Subscription, async_trait, command_argument,
-    diagnostic_plugin_manifest, ignored, message_text,
+    diagnostic_authorized, diagnostic_plugin_manifest, ignored, message_text, restricted,
 };
 
 #[derive(Debug)]
@@ -35,6 +35,10 @@ impl Default for BrowserProbePlugin {
             "media.reply",
             false,
         );
+        manifest
+            .permissions
+            .actions
+            .insert("message.reply".to_owned());
         ">=1.1,<2.0".clone_into(&mut manifest.protocol);
         manifest.subscriptions.push(Subscription {
             id: "browser-results".to_owned(),
@@ -71,7 +75,7 @@ impl StaticPlugin for BrowserProbePlugin {
     async fn on_event(
         &self,
         event: &PluginEventEnvelope,
-        _queries: &dyn HostQueries,
+        queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
         if event.event_type == "message.created" {
             let Some(url) =
@@ -79,6 +83,9 @@ impl StaticPlugin for BrowserProbePlugin {
             else {
                 return Ok(ignored());
             };
+            if !diagnostic_authorized(queries) {
+                return Ok(restricted(event));
+            }
             let url = normalize_screenshot_url(url);
             let request = BrowserRun {
                 steps: vec![

@@ -37,6 +37,7 @@ const DEDUP_ENTRY_MEMORY_ESTIMATE_BYTES: usize = 2 * 1024 + 256;
 const DEDUP_AUXILIARY_MEMORY_ESTIMATE_BYTES: usize = 3 * 1024;
 const CONFIG_TEMPLATE: &str = include_str!("../../config/examples/bot.toml");
 const SECRETS_TEMPLATE: &str = include_str!("../../config/examples/secrets.env");
+#[cfg(feature = "coverage-probes")]
 const SMOKE_PLUGINS_TEMPLATE: &str = include_str!("../../config/examples/plugins.qq-smoke.toml");
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -46,17 +47,21 @@ impl BotConfig {
         let path = explicit_path
             .clone()
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+        Self::load_from_path(&path, explicit_path.is_some())
+    }
+
+    fn load_from_path(path: &PathBuf, explicit: bool) -> Result<Self, ConfigError> {
         let exists = path.try_exists().map_err(|source| ConfigError::Read {
             path: path.clone(),
             source,
         })?;
         let mut config = if exists {
-            Self::from_path(&path)?
-        } else if explicit_path.is_some() {
-            return Err(ConfigError::Missing(path));
+            Self::from_path(path)?
+        } else if explicit {
+            return Err(ConfigError::Missing(path.clone()));
         } else {
-            create_file_once(&path, CONFIG_TEMPLATE.as_bytes(), false)?;
-            Self::from_path(&path)?
+            create_file_once(path, CONFIG_TEMPLATE.as_bytes(), false)?;
+            Self::from_path(path)?
         };
         config.apply_environment_overrides()?;
         config.validate()?;
@@ -103,24 +108,7 @@ impl BotConfig {
         if !metadata.is_file() {
             return Err(ConfigError::NotRegularFile(path.clone()));
         }
-        let mut file = fs::File::open(path).map_err(|source| ConfigError::Read {
-            path: path.clone(),
-            source,
-        })?;
-        let mut bytes = Vec::with_capacity(MAX_CONFIG_BYTES + 1);
-        std::io::Read::by_ref(&mut file)
-            .take((MAX_CONFIG_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|source| ConfigError::Read {
-                path: path.clone(),
-                source,
-            })?;
-        if bytes.len() > MAX_CONFIG_BYTES {
-            return Err(ConfigError::TooLarge {
-                path: path.clone(),
-                size: bytes.len(),
-            });
-        }
+        let bytes = read_bounded_config_bytes(path)?;
         let source = std::str::from_utf8(&bytes).map_err(|source| ConfigError::Utf8 {
             path: path.clone(),
             source,
@@ -186,9 +174,7 @@ impl BotConfig {
         if let Some(value) = env::var_os("BKMQB_PLUGIN_DB") {
             self.plugins.database = PathBuf::from(value);
         }
-        if let Some(value) = env::var_os("BKMQB_PLUGIN_INSTALLATIONS") {
-            self.plugins.installations = Some(PathBuf::from(value));
-        }
+        self.apply_plugin_installations_override(env::var_os("BKMQB_PLUGIN_INSTALLATIONS"));
         if let Ok(value) = env::var("BKMQB_EVENT_CONCURRENCY") {
             self.runtime.event_concurrency =
                 value.parse().map_err(|_| ConfigError::InvalidEnvironment {
@@ -226,6 +212,12 @@ impl BotConfig {
             self.logging.files.message_content = enabled;
         }
         Ok(())
+    }
+
+    fn apply_plugin_installations_override(&mut self, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            self.plugins.installations = Some(PathBuf::from(value));
+        }
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -312,9 +304,13 @@ impl BotConfig {
 
     pub(crate) fn save(&self) -> Result<PathBuf, ConfigError> {
         let path = application_config_path();
-        let encoded = toml::to_string_pretty(self).map_err(ConfigError::Encode)?;
+        let encoded = self.encode_for_save()?;
         atomic_write(&path, encoded.as_bytes(), 0o600)?;
         Ok(path)
+    }
+
+    fn encode_for_save(&self) -> Result<String, ConfigError> {
+        toml::to_string_pretty(self).map_err(ConfigError::Encode)
     }
 }
 
@@ -580,12 +576,35 @@ pub(crate) fn application_config_path() -> PathBuf {
     env::var_os("BKMQB_CONFIG").map_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH), PathBuf::from)
 }
 
+fn read_bounded_config_bytes(path: &Path) -> Result<Vec<u8>, ConfigError> {
+    let mut file = fs::File::open(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut bytes = Vec::with_capacity(MAX_CONFIG_BYTES + 1);
+    std::io::Read::by_ref(&mut file)
+        .take((MAX_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge {
+            path: path.to_path_buf(),
+            size: bytes.len(),
+        });
+    }
+    Ok(bytes)
+}
+
+#[cfg(feature = "coverage-probes")]
 pub(crate) fn ensure_smoke_plugin_config() -> Result<PathBuf, ConfigError> {
     let application_path = application_config_path();
     let path = application_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join("plugins.toml");
+        .join("plugins.qq-smoke.toml");
     create_file_once(&path, SMOKE_PLUGINS_TEMPLATE.as_bytes(), false)?;
     Ok(path)
 }
@@ -1178,5 +1197,37 @@ mod tests {
     #[test]
     fn secret_values_are_quoted_for_dotenv() {
         assert_eq!(quote_environment_value("a\\\"b"), "\"a\\\\\\\"b\"");
+    }
+
+    #[test]
+    fn configured_installations_path_is_preserved_on_load_and_save() {
+        let directory = std::env::temp_dir().join(format!(
+            "bkm-explicit-installations-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let application = directory.join("bot.toml");
+        let installations = directory.join("plugins.toml");
+        fs::write(
+            &installations,
+            br#"# Functional plugin profile for a real QQ Official WebSocket smoke test.
+bundled = ["ping", "help", "echo", "counter", "http-probe", "browser-probe", "scheduler-probe", "qq-extension-probe", "active-send-probe", "devtools"]
+[bundled_config.devtools]
+owners = ["configured-owner"]
+"#,
+        )
+        .unwrap();
+        let mut config = BotConfig::default();
+        config.plugins.installations = Some(installations.clone());
+        let original = toml::to_string_pretty(&config).unwrap();
+        fs::write(&application, &original).unwrap();
+
+        let loaded = BotConfig::load_from_path(&application, true).unwrap();
+        assert_eq!(loaded.plugins.installations.as_ref(), Some(&installations));
+        let saved: BotConfig = toml::from_str(&loaded.encode_for_save().unwrap()).unwrap();
+        assert_eq!(saved.plugins.installations, Some(installations));
+        assert_eq!(fs::read_to_string(&application).unwrap(), original);
+        fs::remove_dir_all(directory).unwrap();
     }
 }
