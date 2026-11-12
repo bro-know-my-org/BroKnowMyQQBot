@@ -61,6 +61,8 @@ const DELIVERY_RETRY_BASE_MS: u64 = 25;
 const ACTION_COMPLETION_DEPTH_NAMESPACE: &str = "dev.bkm.host/action-completion-depth";
 const ADMIN_STATE_PREFIX: &str = "admins/";
 
+type ScheduleWorkers = HashMap<(String, String), AbortHandle>;
+
 #[derive(Debug, Error)]
 pub enum PluginHostError {
     #[error("plugin manifest is invalid: {0}")]
@@ -183,7 +185,7 @@ pub struct StaticPluginHost {
     browser_executor: Arc<dyn BrowserExecutor>,
     assets: AssetStore,
     adapters: Arc<BTreeMap<String, Arc<dyn Adapter>>>,
-    scheduled_tasks: Arc<StdMutex<HashMap<(String, String), AbortHandle>>>,
+    scheduled_tasks: Arc<StdMutex<ScheduleWorkers>>,
 }
 
 impl std::fmt::Debug for StaticPluginHost {
@@ -340,10 +342,15 @@ impl StaticPluginHost {
             );
         } else {
             supervised_init(&registered, config).await?;
-            registered.set_state(PluginInstanceState::Ready)?;
             self.recover_pending_commands(&registered)?;
             self.recover_pending_deliveries(&registered).await?;
-            self.recover_plugin_schedules(&registered)?;
+            // Initial registration retains disabled instances for diagnostics.
+            // Replayed commands still must not start workers before Ready.
+            if registered.state()? != PluginInstanceState::Disabled {
+                self.store.recover_schedules(&registered.instance_id)?;
+                registered.set_state(PluginInstanceState::Ready)?;
+                self.resume_pending_schedules(&registered)?;
+            }
         }
         self.instances.insert(registered.instance_id.clone());
         for command in &registered.manifest.commands {
@@ -1387,7 +1394,8 @@ impl StaticPluginHost {
                     .create_schedule(&task, plugin.manifest.permissions.storage_quota_bytes)
                     .map_err(|error| PluginError::Permanent(error.to_string()))?;
                 if created {
-                    self.launch_schedule(plugin, &task);
+                    self.launch_schedule(plugin, &task)
+                        .map_err(|error| PluginError::Permanent(error.to_string()))?;
                 }
                 Ok(serde_json::json!({
                     "created": created,
@@ -1418,10 +1426,8 @@ impl StaticPluginHost {
         &self,
         plugin: &Arc<RegisteredPlugin>,
     ) -> Result<(), PluginHostError> {
-        for task in self.store.recover_schedules(&plugin.instance_id)? {
-            self.launch_schedule(plugin, &task);
-        }
-        Ok(())
+        self.store.recover_schedules(&plugin.instance_id)?;
+        self.resume_pending_schedules(plugin)
     }
 
     fn recover_pending_commands(
@@ -1467,78 +1473,171 @@ impl StaticPluginHost {
         Ok(())
     }
 
-    fn launch_schedule(&self, plugin: &Arc<RegisteredPlugin>, task: &ScheduledTask) {
+    fn resume_pending_schedules(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+    ) -> Result<(), PluginHostError> {
+        let mut handles = self.schedule_handles()?;
+        if plugin.state()? == PluginInstanceState::Ready {
+            for task in self.store.pending_schedules(&plugin.instance_id)? {
+                self.launch_schedule_locked(plugin, &task, &mut handles);
+            }
+        }
+        Ok(())
+    }
+
+    fn schedule_handles(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ScheduleWorkers>, PluginHostError> {
+        self.scheduled_tasks
+            .lock()
+            .map_err(|_| PluginHostError::Invocation {
+                plugin_id: "scheduler".to_owned(),
+                message: "scheduler lock is poisoned".to_owned(),
+            })
+    }
+
+    fn launch_schedule(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        task: &ScheduledTask,
+    ) -> Result<(), PluginHostError> {
+        let mut handles = self.schedule_handles()?;
+        // Recovery and in-flight commands may persist work while Draining.
+        // Activation/rollback will launch it after Ready has been published.
+        if plugin.state()? == PluginInstanceState::Ready {
+            self.launch_schedule_locked(plugin, task, &mut handles);
+        }
+        Ok(())
+    }
+
+    fn launch_schedule_locked(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        task: &ScheduledTask,
+        handles: &mut ScheduleWorkers,
+    ) {
         let key = (task.instance_id.clone(), task.task_id.clone());
-        let Ok(mut handles) = self.scheduled_tasks.lock() else {
-            error!(
-                instance_id = task.instance_id,
-                task_id = task.task_id,
-                "scheduler lock is poisoned"
-            );
-            return;
-        };
         if handles.contains_key(&key) {
             return;
         }
         let host = self.clone();
         let plugin = Arc::clone(plugin);
         let task_for_worker = task.clone();
-        let key_for_worker = key.clone();
         let worker = tokio::spawn(async move {
+            let worker_id = tokio::task::id();
             let delay_ms = task_for_worker.run_at_ms.saturating_sub(now_ms()).max(0);
             sleep(Duration::from_millis(
                 u64::try_from(delay_ms).unwrap_or(u64::MAX),
             ))
             .await;
-            let claimed = host
-                .store
-                .claim_schedule(&task_for_worker.instance_id, &task_for_worker.task_id);
-            let (was_claimed, result) = match claimed {
-                Ok(true) => match plugin
-                    .execution
-                    .acquire(schedule_partition_key(&task_for_worker))
-                    .await
-                {
-                    Ok(_execution) => (true, host.fire_schedule(&plugin, &task_for_worker).await),
-                    Err(error) => (true, Err(error)),
-                },
-                Ok(false) => (false, Ok(())),
-                Err(error) => (false, Err(PluginHostError::Store(error))),
-            };
-            if was_claimed {
-                let status = if result.is_ok() {
-                    "completed"
-                } else {
-                    "failed"
-                };
-                if let Err(error) = host.store.finish_schedule(
-                    &task_for_worker.instance_id,
-                    &task_for_worker.task_id,
-                    status,
-                ) {
-                    error!(instance_id = task_for_worker.instance_id, task_id = task_for_worker.task_id, error = %error, "failed to persist scheduler completion");
-                }
-            }
-            if let Err(error) = result {
+            let result = host
+                .run_schedule_owned(&plugin, &task_for_worker, Some(worker_id))
+                .await;
+            if let Err(error) = &result {
                 error!(instance_id = task_for_worker.instance_id, task_id = task_for_worker.task_id, error = %error, "scheduled plugin invocation failed");
             }
-            if let Ok(mut handles) = host.scheduled_tasks.lock() {
-                handles.remove(&key_for_worker);
+            if let Err(error) =
+                host.retire_schedule(&plugin, &task_for_worker, worker_id, result.is_ok())
+            {
+                error!(instance_id = task_for_worker.instance_id, task_id = task_for_worker.task_id, %error, "failed to retire scheduled worker");
             }
         });
         handles.insert(key, worker.abort_handle());
+    }
+
+    fn retire_schedule(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        task: &ScheduledTask,
+        worker_id: tokio::task::Id,
+        run_succeeded: bool,
+    ) -> Result<(), PluginHostError> {
+        let mut handles = self.schedule_handles()?;
+        let key = (task.instance_id.clone(), task.task_id.clone());
+        if handles
+            .get(&key)
+            .is_none_or(|handle| handle.id() != worker_id)
+        {
+            return Ok(());
+        }
+        // Retirement and the rollback sweep use the same lock. If the sweep
+        // saw our old handle, we take responsibility for its late requeue.
+        handles.remove(&key);
+        // Only successful lifecycle requeues need a handoff. Runtime/storage
+        // failures retain their durable rows for explicit recovery or restart;
+        // immediately retrying a failed claim can otherwise spin indefinitely.
+        if run_succeeded && plugin.state()? == PluginInstanceState::Ready {
+            if let Some(pending) = self
+                .store
+                .pending_schedule(&task.instance_id, &task.task_id)?
+            {
+                self.launch_schedule_locked(plugin, &pending, &mut handles);
+            }
+        }
+        Ok(())
+    }
+
+    async fn run_schedule_owned(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        task: &ScheduledTask,
+        worker_id: Option<tokio::task::Id>,
+    ) -> Result<(), PluginHostError> {
+        let key = (task.instance_id.clone(), task.task_id.clone());
+        let owns_task = |handles: &ScheduleWorkers| {
+            worker_id.is_none_or(|id| handles.get(&key).is_some_and(|handle| handle.id() == id))
+        };
+        {
+            let handles = self.schedule_handles()?;
+            if !owns_task(&handles) {
+                return Ok(());
+            }
+            if !self
+                .store
+                .claim_schedule(&task.instance_id, &task.task_id)?
+            {
+                return Ok(());
+            }
+        }
+        let result = async {
+            let Some(generation) = plugin.ready_generation()? else {
+                return Ok(false);
+            };
+            let _execution = plugin
+                .execution
+                .acquire(schedule_partition_key(task))
+                .await?;
+            self.fire_schedule(plugin, task, generation).await
+        }
+        .await;
+        // An aborted worker must not overwrite a claim made by its replacement.
+        let handles = self.schedule_handles()?;
+        if !owns_task(&handles) {
+            return Ok(());
+        }
+        // A runtime/storage failure may precede delivery persistence. Preserve
+        // the claim for recovery instead of deleting potentially unhandled work.
+        let invoked = result?;
+        if invoked {
+            self.store
+                .finish_schedule(&task.instance_id, &task.task_id, "completed")?;
+        } else {
+            // No invocation started: retain only this task for the next resume.
+            self.store
+                .requeue_schedule(&task.instance_id, &task.task_id)?;
+        }
+        Ok(())
     }
 
     async fn fire_schedule(
         &self,
         plugin: &Arc<RegisteredPlugin>,
         task: &ScheduledTask,
-    ) -> Result<(), PluginHostError> {
-        if plugin.state()? != PluginInstanceState::Ready {
-            return Err(PluginHostError::Invocation {
-                plugin_id: plugin.manifest.id.to_string(),
-                message: "plugin instance is not ready for scheduled delivery".to_owned(),
-            });
+        generation: u64,
+    ) -> Result<bool, PluginHostError> {
+        if !plugin.is_ready_generation(generation)? {
+            return Ok(false);
         }
         if plugin.priority_for("schedule.triggered", None).is_none() {
             return Err(PluginHostError::InvalidOutput {
@@ -1575,7 +1674,7 @@ impl StaticPluginHost {
         };
         self.deliver_with_retry(plugin, origin, envelope)
             .await
-            .map(|_| ())
+            .map(|_| true)
     }
 
     fn abort_schedule(&self, instance_id: &str, task_id: &str) -> Result<(), PluginError> {

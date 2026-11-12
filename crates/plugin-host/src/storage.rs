@@ -1238,12 +1238,17 @@ impl PluginStore {
         &self,
         instance_id: &str,
     ) -> Result<Vec<ScheduledTask>, StoreError> {
+        self.requeue_firing_schedules(instance_id)?;
+        self.pending_schedules(instance_id)
+    }
+
+    /// Reads only pending rows; unlike restart recovery, this must not reclaim
+    /// tasks still owned by an invocation from an earlier lifecycle generation.
+    pub(crate) fn pending_schedules(
+        &self,
+        instance_id: &str,
+    ) -> Result<Vec<ScheduledTask>, StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
-        connection.execute(
-            "UPDATE scheduled_tasks SET status = 'pending'
-             WHERE instance_id = ? AND status = 'firing'",
-            [instance_id],
-        )?;
         let mut statement = connection.prepare(
             "SELECT task_id, adapter_id, run_at_ms, payload
              FROM scheduled_tasks
@@ -1271,6 +1276,32 @@ impl PluginStore {
             .map_err(StoreError::from)
     }
 
+    pub(crate) fn pending_schedule(
+        &self,
+        instance_id: &str,
+        task_id: &str,
+    ) -> Result<Option<ScheduledTask>, StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
+        let row: Option<(String, i64, Vec<u8>)> = connection
+            .query_row(
+                "SELECT adapter_id, run_at_ms, payload FROM scheduled_tasks
+                 WHERE instance_id = ? AND task_id = ? AND status = 'pending'",
+                params![instance_id, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        row.map(|(adapter_id, run_at_ms, payload)| {
+            Ok(ScheduledTask {
+                instance_id: instance_id.to_owned(),
+                task_id: task_id.to_owned(),
+                adapter_id,
+                run_at_ms,
+                payload: serde_json::from_slice(&payload)?,
+            })
+        })
+        .transpose()
+    }
+
     pub(crate) fn requeue_firing_schedules(&self, instance_id: &str) -> Result<(), StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         connection.execute(
@@ -1295,6 +1326,20 @@ impl PluginStore {
             )
             .map(|updated| updated == 1)
             .map_err(StoreError::from)
+    }
+
+    pub(crate) fn requeue_schedule(
+        &self,
+        instance_id: &str,
+        task_id: &str,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
+        connection.execute(
+            "UPDATE scheduled_tasks SET status = 'pending'
+             WHERE instance_id = ? AND task_id = ? AND status = 'firing'",
+            params![instance_id, task_id],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn finish_schedule(
