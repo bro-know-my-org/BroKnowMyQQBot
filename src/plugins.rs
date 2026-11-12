@@ -118,6 +118,19 @@ pub(crate) fn is_reserved_bundled_instance_id(instance_id: &str) -> bool {
         .any(|(_, bundled_instance_id)| *bundled_instance_id == instance_id)
 }
 
+pub(crate) fn is_declared_instance_id(
+    installation_file: Option<&Path>,
+    instance_id: &str,
+) -> Result<bool, PluginConfigError> {
+    let Some(path) = installation_file else {
+        return Ok(false);
+    };
+    Ok(PluginInstallations::from_path(path)?
+        .wasm
+        .iter()
+        .any(|installation| installation.instance_id == instance_id))
+}
+
 fn bundled_plugin_instance_id(name: &str) -> Option<&'static str> {
     BUNDLED_PLUGIN_INSTANCES
         .iter()
@@ -363,7 +376,7 @@ async fn register_bundled_plugins(
 }
 
 #[derive(Debug, Error)]
-enum PluginConfigError {
+pub(crate) enum PluginConfigError {
     #[error("unknown bundled plugin `{0}`")]
     UnknownBundled(String),
     #[cfg(not(feature = "coverage-probes"))]

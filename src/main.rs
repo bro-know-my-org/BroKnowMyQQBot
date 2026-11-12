@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod logging;
 mod management;
+mod plugin_configuration;
 mod plugin_dev;
 mod plugin_marketplace;
 mod plugins;

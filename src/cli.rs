@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::{
     browser,
     config::BotConfig,
-    plugin_dev,
+    plugin_configuration, plugin_dev,
     plugin_marketplace::{MarketplaceClient, MarketplacePlugin, validate_selector},
     plugins, version,
 };
@@ -121,21 +121,26 @@ async fn run_plugin(arguments: &[String]) -> Result<(), Box<dyn std::error::Erro
                 locale,
             )?;
         }
+        "config" => configure_plugin(&store, &config, arguments).await?,
         "enable" => {
             require_argument_count(arguments, 2, "bkmqb plugin enable <instance-id>")?;
             set_enabled(
                 &store,
+                &config,
                 required_argument(arguments, 1, "instance ID")?,
                 true,
-            )?;
+            )
+            .await?;
         }
         "disable" => {
             require_argument_count(arguments, 2, "bkmqb plugin disable <instance-id>")?;
             set_enabled(
                 &store,
+                &config,
                 required_argument(arguments, 1, "instance ID")?,
                 false,
-            )?;
+            )
+            .await?;
         }
         "remove" => {
             require_argument_count(arguments, 2, "bkmqb plugin remove <instance-id>")?;
@@ -157,6 +162,35 @@ async fn run_plugin(arguments: &[String]) -> Result<(), Box<dyn std::error::Erro
             );
         }
     }
+    Ok(())
+}
+
+async fn configure_plugin(
+    store: &PluginStore,
+    config: &BotConfig,
+    arguments: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    require_argument_count(
+        arguments,
+        4,
+        "bkmqb plugin config <instance-id> --config-file <JSON>",
+    )?;
+    if arguments[2] != "--config-file" {
+        return Err("usage: bkmqb plugin config <instance-id> --config-file <JSON>".into());
+    }
+    let instance_id = &arguments[1];
+    require_managed_instance(config, instance_id)?;
+    let current = store
+        .installation(instance_id)?
+        .ok_or("plugin instance is not installed")?;
+    plugin_configuration::save_config(
+        store,
+        instance_id,
+        current.updated_at_ms,
+        read_plugin_config_file(Path::new(&arguments[3]))?,
+    )
+    .await?;
+    println!("Plugin configuration saved. Restart bkmqb or apply it in the management panel.");
     Ok(())
 }
 
@@ -319,12 +353,7 @@ async fn install_or_update(
         .instance_id
         .clone()
         .unwrap_or_else(|| format!("{}/default", manifest.id));
-    if plugins::is_reserved_bundled_instance_id(&instance_id) {
-        return Err(format!(
-            "plugin instance `{instance_id}` is reserved for a bundled plugin; use a different instance ID"
-        )
-        .into());
-    }
+    require_managed_instance(bot_config, &instance_id)?;
     let existing = store.installation(&instance_id)?;
     if update && existing.is_none() {
         return Err(format!("plugin instance `{instance_id}` is not installed").into());
@@ -821,23 +850,38 @@ fn info_plugin(
     Ok(())
 }
 
-fn set_enabled(
+async fn set_enabled(
     store: &PluginStore,
+    config: &BotConfig,
     instance_id: &str,
     enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if enabled && plugins::is_reserved_bundled_instance_id(instance_id) {
-        return Err(
-            format!("plugin instance `{instance_id}` is reserved for a bundled plugin").into(),
-        );
-    }
-    if !store.set_installation_enabled(instance_id, enabled, now_ms())? {
-        return Err(format!("plugin instance `{instance_id}` is not installed").into());
-    }
+    require_managed_instance(config, instance_id)?;
+    let current = store
+        .installation(instance_id)?
+        .ok_or_else(|| format!("plugin instance `{instance_id}` is not installed"))?;
+    plugin_configuration::save_enabled(store, instance_id, current.updated_at_ms, enabled).await?;
     println!(
         "Plugin `{instance_id}` {}. Restart bkmqb to apply.",
         if enabled { "enabled" } else { "disabled" }
     );
+    Ok(())
+}
+
+fn require_managed_instance(
+    config: &BotConfig,
+    instance_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if plugins::is_reserved_bundled_instance_id(instance_id) {
+        return Err(
+            format!("plugin instance `{instance_id}` is reserved for a bundled plugin").into(),
+        );
+    }
+    if plugins::is_declared_instance_id(config.plugins.installations.as_deref(), instance_id)? {
+        return Err(
+            format!("plugin instance `{instance_id}` is managed by the declarative file").into(),
+        );
+    }
     Ok(())
 }
 
@@ -1318,6 +1362,7 @@ Usage:\n\
   bkmqb plugin update <package-or-marketplace-plugin> [--instance ID] [--accept-permissions | --grant CAP]... [--config-file FILE] [--config KEY=JSON]... [-y]\n\
   bkmqb plugin list\n\
   bkmqb plugin info <instance-id>\n\
+  bkmqb plugin config <instance-id> --config-file <JSON>\n\
   bkmqb plugin enable <instance-id>\n\
   bkmqb plugin disable <instance-id>\n\
   bkmqb plugin remove <instance-id>\n\
@@ -1897,8 +1942,49 @@ mod tests {
         assert!(!looks_like_plugin_path("github-issue"));
     }
 
-    #[test]
-    fn bundled_instance_ids_are_reserved_from_managed_installations() {
+    #[tokio::test]
+    async fn cli_edits_reject_declarative_instance_collisions_without_changing_the_record() {
+        let fixture = crate::plugin_configuration::fixture::Fixture::new(false);
+        let declarations = Path::new(&fixture.installation.package_path).with_extension("toml");
+        let id = &fixture.installation.instance_id;
+        fs::write(
+            &declarations,
+            format!("[[wasm]]\npackage = 'unused'\ninstance_id = '{id}'\nenabled = false\n"),
+        )
+        .unwrap();
+        let mut config = BotConfig::default();
+        config.plugins.installations = Some(declarations.clone());
+        for enabled in [false, true] {
+            assert!(
+                set_enabled(&fixture.store, &config, id, enabled)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("declarative")
+            );
+        }
+        let args = vec![
+            "config".to_owned(),
+            id.clone(),
+            "--config-file".to_owned(),
+            "unused.json".to_owned(),
+        ];
+        assert!(
+            configure_plugin(&fixture.store, &config, &args)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("declarative")
+        );
+        assert_eq!(
+            fixture.store.installation(id).unwrap().unwrap(),
+            fixture.installation
+        );
+        fs::remove_file(declarations).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bundled_instance_ids_are_reserved_from_managed_installations() {
         assert!(plugins::is_reserved_bundled_instance_id(
             "dev.bkm.help/default"
         ));
@@ -1913,7 +1999,8 @@ mod tests {
         ));
         let store = PluginStore::in_memory().unwrap();
         assert!(
-            set_enabled(&store, "dev.bkm.admin/default", true)
+            set_enabled(&store, &BotConfig::default(), "dev.bkm.admin/default", true)
+                .await
                 .unwrap_err()
                 .to_string()
                 .contains("reserved")
