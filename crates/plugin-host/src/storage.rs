@@ -47,6 +47,8 @@ pub enum StoreError {
 pub struct OutboxOrigin {
     pub source_event_id: String,
     pub adapter_id: String,
+    #[serde(default)]
+    pub platform: Option<String>,
     pub reply_target: Option<MessageTarget>,
     pub source_message_id: Option<String>,
 }
@@ -1635,6 +1637,7 @@ mod tests {
         OutboxOrigin {
             source_event_id: "event-1".to_owned(),
             adapter_id: "mock".to_owned(),
+            platform: Some("mock".to_owned()),
             reply_target: Some(MessageTarget::Group {
                 group_id: "group-1".to_owned(),
             }),
@@ -1690,10 +1693,9 @@ mod tests {
         assert!(!failure.dead_letter);
         assert!(!failure.circuit_open);
         assert!(store.pending_deliveries("instance", 1).unwrap().is_empty());
-        assert_eq!(
-            store.pending_deliveries("instance", 2).unwrap()[0].next_attempt_ms,
-            2
-        );
+        let pending = store.pending_deliveries("instance", 2).unwrap();
+        assert_eq!(pending[0].next_attempt_ms, 2);
+        assert_eq!(pending[0].origin.platform.as_deref(), Some("mock"));
         let second = store
             .begin_delivery(
                 "instance",

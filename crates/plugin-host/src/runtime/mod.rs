@@ -698,7 +698,11 @@ impl StaticPluginHost {
                     warn!(plugin_id = %plugin.manifest.id, "plugin lifecycle changed while invocation was queued");
                     return Ok(None);
                 }
-                let caller_authority = self.resolve_caller_authority(&envelope, None)?;
+                let caller_authority = self.resolve_delivery_authority(
+                    &envelope,
+                    None,
+                    ExecutionOrigin::Event(&context),
+                )?;
                 self.deliver_with_authority(
                     plugin,
                     ExecutionOrigin::Event(&context),
@@ -754,7 +758,7 @@ impl StaticPluginHost {
         origin: ExecutionOrigin<'_>,
         envelope: PluginEventEnvelope,
     ) -> Result<bool, PluginHostError> {
-        let caller_authority = self.resolve_caller_authority(&envelope, Some(plugin))?;
+        let caller_authority = self.resolve_delivery_authority(&envelope, Some(plugin), origin)?;
         self.deliver_with_authority(plugin, origin, envelope, caller_authority)
             .await
     }
@@ -823,6 +827,12 @@ impl StaticPluginHost {
                     envelope.extensions = event_extensions(plugin, context)?;
                 }
             }
+            let refreshed_authority = if envelope.event_type == "message.created" {
+                Some(self.resolve_delivery_authority(&envelope, Some(plugin), origin)?)
+            } else {
+                None
+            };
+            let caller_authority = refreshed_authority.as_ref().unwrap_or(caller_authority);
             let outbox_origin = origin.outbox_origin(&envelope.event_id);
             if self.reject_excessive_action_completion(plugin, &envelope, &outbox_origin)? {
                 return Ok((false, VecDeque::new()));
@@ -1622,6 +1632,31 @@ impl StaticPluginHost {
         first_error.map_or(Ok(()), Err)
     }
 
+    fn resolve_delivery_authority(
+        &self,
+        envelope: &PluginEventEnvelope,
+        current_plugin: Option<&RegisteredPlugin>,
+        origin: ExecutionOrigin<'_>,
+    ) -> Result<CallerAuthority, PluginHostError> {
+        if let ExecutionOrigin::Recovered(original) = origin {
+            let platform = original.platform.as_deref();
+            if platform.is_none()
+                || original.adapter_id != envelope.adapter_id
+                || self
+                    .adapters
+                    .get(&original.adapter_id)
+                    .is_none_or(|adapter| Some(adapter.platform()) != platform)
+            {
+                return Ok(CallerAuthority {
+                    role: CallerRole::User,
+                    platform: platform.unwrap_or("unknown").to_owned(),
+                    subject_hint: None,
+                });
+            }
+        }
+        self.resolve_caller_authority(envelope, current_plugin)
+    }
+
     fn resolve_caller_authority(
         &self,
         envelope: &PluginEventEnvelope,
@@ -1753,12 +1788,14 @@ impl<'a> ExecutionOrigin<'a> {
             Self::Event(context) => OutboxOrigin {
                 source_event_id: source_event_id.to_owned(),
                 adapter_id: context.adapter_id().to_string(),
+                platform: Some(context.platform().to_owned()),
                 reply_target: context.reply_target().cloned(),
                 source_message_id: context.source_message_id().map(str::to_owned),
             },
             Self::Scheduled { adapter_id } => OutboxOrigin {
                 source_event_id: source_event_id.to_owned(),
                 adapter_id: adapter_id.to_owned(),
+                platform: None,
                 reply_target: None,
                 source_message_id: None,
             },
@@ -2187,7 +2224,10 @@ mod tests {
         },
     };
 
-    use bot_core::MessageTarget;
+    use bot_core::{
+        Action, ActionResult, Adapter, AdapterError, AdapterId, EventSender, MessageTarget,
+        ShutdownSignal,
+    };
     use builtin_plugins::{AdminPlugin, PingPlugin};
     use plugin_api::{
         CallerRole, Disposition, ExtensionPayload, HandlerOutput, HostQueries, InitContext,
@@ -2203,6 +2243,37 @@ mod tests {
         TrustedPluginCapabilities, delegated_admin_state_key, validate_config_schema,
         validate_output, validate_plugin_config, validation::redact_sensitive_fields,
     };
+
+    #[derive(Debug)]
+    struct RecoveryAdapter {
+        id: AdapterId,
+    }
+
+    #[async_trait::async_trait]
+    impl Adapter for RecoveryAdapter {
+        fn id(&self) -> &AdapterId {
+            &self.id
+        }
+
+        fn platform(&self) -> &'static str {
+            "qq.official"
+        }
+
+        async fn run(
+            &self,
+            _events: EventSender,
+            _shutdown: ShutdownSignal,
+        ) -> Result<(), AdapterError> {
+            Ok(())
+        }
+
+        async fn execute(&self, _action: Action) -> Result<ActionResult, AdapterError> {
+            Ok(ActionResult {
+                message_id: None,
+                raw: json!({}),
+            })
+        }
+    }
 
     #[derive(Debug)]
     struct SchemaPlugin {
@@ -2621,6 +2692,7 @@ mod tests {
         let origin = OutboxOrigin {
             source_event_id: source_event.event_id.clone(),
             adapter_id: "mock".to_owned(),
+            platform: Some("mock".to_owned()),
             reply_target: Some(MessageTarget::Group {
                 group_id: "group-1".to_owned(),
             }),
@@ -2757,6 +2829,67 @@ mod tests {
         assert!(events.lock().unwrap().is_empty());
         assert!(store.circuit_open(instance_id).unwrap());
         assert_eq!(store.dead_letters(Some(instance_id)).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovered_administration_requires_original_platform_binding() {
+        for (platform, should_grant) in [
+            (Some("onebot11"), false),
+            (None, false),
+            (Some("qq.official"), true),
+        ] {
+            let store = PluginStore::in_memory().unwrap();
+            let instance_id = "dev.bkm.admin/recovery";
+            let envelope = PluginEventEnvelope {
+                protocol_version: "1.2.0".to_owned(),
+                event_id: "recovered-grant".to_owned(),
+                delivery_id: "delivery".to_owned(),
+                invocation_id: "invocation".to_owned(),
+                occurred_at_ms: None,
+                received_at_ms: 0,
+                adapter_id: "reused-adapter".to_owned(),
+                event_type: "message.created".to_owned(),
+                trace_id: None,
+                payload: json!({"data": {
+                    "text":"/admin grant delegated-id",
+                    "sender":{"id":"owner-id"}
+                }}),
+                extensions: Vec::new(),
+            };
+            let origin = OutboxOrigin {
+                source_event_id: envelope.event_id.clone(),
+                adapter_id: envelope.adapter_id.clone(),
+                platform: platform.map(str::to_owned),
+                reply_target: Some(MessageTarget::Group {
+                    group_id: "group".to_owned(),
+                }),
+                source_message_id: Some("source-message".to_owned()),
+            };
+            store
+                .enqueue_delivery(instance_id, &envelope, &origin, 0)
+                .unwrap();
+            let mut host =
+                StaticPluginHost::new(store.clone()).with_adapter(Arc::new(RecoveryAdapter {
+                    id: AdapterId::new("reused-adapter"),
+                }));
+            host.register_trusted_with_capabilities(
+                Arc::new(AdminPlugin::default()),
+                instance_id,
+                BTreeMap::from([("owners".to_owned(), json!(["owner-id"]))]),
+                TrustedPluginCapabilities::default()
+                    .with_authority_provider(TrustedAuthorityProvider::Administration),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .state_get(instance_id, &delegated_admin_state_key("delegated-id"))
+                    .unwrap()
+                    .is_some(),
+                should_grant,
+                "recovery used the current adapter platform instead of {platform:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2936,6 +3069,7 @@ mod tests {
         OutboxOrigin {
             source_event_id: event_id.to_owned(),
             adapter_id: "mock".to_owned(),
+            platform: Some("mock".to_owned()),
             reply_target: None,
             source_message_id: None,
         }

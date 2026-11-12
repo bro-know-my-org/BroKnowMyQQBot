@@ -47,13 +47,21 @@ pub(super) async fn execute_context_command(
                     .map_err(|error| context_command_error(&error))?
             }
             ExecutionOrigin::Recovered(origin) => {
+                let persisted_platform = origin.platform.as_deref().ok_or_else(|| {
+                    PluginError::PermissionDenied(
+                        "recovered trusted platform query lacks an original platform binding"
+                            .to_owned(),
+                    )
+                })?;
                 let adapter = adapters.get(&origin.adapter_id).ok_or_else(|| {
                     PluginError::Permanent(format!(
                         "recovered event adapter `{}` is unavailable",
                         origin.adapter_id
                     ))
                 })?;
-                if adapter.platform() != query.platform() {
+                if persisted_platform != query.platform()
+                    || adapter.platform() != persisted_platform
+                {
                     return Err(PluginError::Permanent(format!(
                         "trusted platform query `{}` requires platform `{}`",
                         query.action_name(),
@@ -178,34 +186,7 @@ pub(super) async fn execute_context_command(
                 )
                 .await
                 .map_err(browser_plugin_error)?;
-            let (final_url, title, extracted_text, artifacts) = execution.into_parts();
-            let mut references = Vec::with_capacity(artifacts.len());
-            for artifact in artifacts {
-                let (mime_type, data) = artifact.into_parts();
-                assets
-                    .preflight(instance_id, &mime_type, &data)
-                    .map_err(|error| PluginError::ResourceExhausted(error.to_string()))?;
-                let (data, digest) = tokio::task::spawn_blocking(move || {
-                    let digest = AssetDigest::from_data(&data);
-                    (data, digest)
-                })
-                .await
-                .map_err(|error| {
-                    PluginError::Permanent(format!("asset hashing task failed: {error}"))
-                })?;
-                references.push(
-                    assets
-                        .insert_prehashed(instance_id, mime_type, data, digest)
-                        .map_err(|error| PluginError::ResourceExhausted(error.to_string()))?,
-                );
-            }
-            serde_json::to_value(plugin_api::BrowserRunResult {
-                final_url,
-                title,
-                extracted_text,
-                assets: references,
-            })
-            .map_err(|error| PluginError::Permanent(error.to_string()))
+            store_browser_execution(assets, instance_id, execution).await
         }
         "media.reply" => {
             let request: MediaReply = serde_json::from_value(command.payload.clone())
@@ -321,6 +302,39 @@ pub(super) async fn execute_context_command(
             "command executor `{other}` is not implemented"
         ))),
     }
+}
+
+async fn store_browser_execution(
+    assets: &AssetStore,
+    instance_id: &str,
+    execution: crate::BrowserExecution,
+) -> Result<Value, PluginError> {
+    let (final_url, title, extracted_text, artifacts) = execution.into_parts();
+    let mut references = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let (mime_type, data) = artifact.into_parts();
+        assets
+            .preflight(instance_id, &mime_type, &data)
+            .map_err(|error| PluginError::ResourceExhausted(error.to_string()))?;
+        let (data, digest) = tokio::task::spawn_blocking(move || {
+            let digest = AssetDigest::from_data(&data);
+            (data, digest)
+        })
+        .await
+        .map_err(|error| PluginError::Permanent(format!("asset hashing task failed: {error}")))?;
+        references.push(
+            assets
+                .insert_prehashed(instance_id, mime_type, data, digest)
+                .map_err(|error| PluginError::ResourceExhausted(error.to_string()))?,
+        );
+    }
+    serde_json::to_value(plugin_api::BrowserRunResult {
+        final_url,
+        title,
+        extracted_text,
+        assets: references,
+    })
+    .map_err(|error| PluginError::Permanent(error.to_string()))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -676,11 +690,11 @@ mod tests {
         }
 
         async fn execute(&self, action: Action) -> Result<ActionResult, AdapterError> {
-            assert!(matches!(
-                action,
-                Action::Platform { ref name, .. }
-                    if name == "qq.guild.api-permission.list"
-            ));
+            if let Action::Platform { ref name, .. } = action {
+                assert_eq!(name, "qq.guild.api-permission.list");
+            } else {
+                assert!(matches!(action, Action::Reply { .. }));
+            }
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ActionResult {
                 message_id: None,
@@ -731,6 +745,7 @@ mod tests {
         let origin = OutboxOrigin {
             source_event_id: "source".to_owned(),
             adapter_id: "query-adapter".to_owned(),
+            platform: Some(platform.to_owned()),
             reply_target: None,
             source_message_id: None,
         };
