@@ -18,8 +18,9 @@ pub use browser::{
 pub use http::{HttpExecutionError, HttpExecutor, SecureHttpExecutor};
 pub use package::{MAX_PLUGIN_PACKAGE_BYTES, PluginPackageError, ValidatedPluginPackage};
 pub use runtime::{
-    PluginHostError, PluginInstanceState, StaticPluginHost, TrustedAuthorityProvider,
-    TrustedPlatformQuery, TrustedPluginCapabilities, validate_plugin_config,
+    PluginHostError, PluginInstanceSnapshot, PluginInstanceState, StaticPluginHost,
+    TrustedAuthorityProvider, TrustedPlatformQuery, TrustedPluginCapabilities,
+    validate_plugin_config,
 };
 pub use storage::{
     CommitOptions, DeadLetter, OutboxOrigin, PluginInstallation, PluginStore, StoreError,

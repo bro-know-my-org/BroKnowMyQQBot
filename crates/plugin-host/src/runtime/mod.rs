@@ -1,7 +1,11 @@
 //! Static BPP plugin runtime, lifecycle, dispatch, and command execution.
 
 mod command;
+mod management;
 mod validation;
+
+use management::LifecycleTransition;
+pub use management::PluginInstanceSnapshot;
 
 use command::{action_status_name, execute_context_command, failed_completion};
 use validation::{
@@ -60,7 +64,6 @@ const CIRCUIT_BREAKER_FAILURES: u32 = 3;
 const DELIVERY_RETRY_BASE_MS: u64 = 25;
 const ACTION_COMPLETION_DEPTH_NAMESPACE: &str = "dev.bkm.host/action-completion-depth";
 const ADMIN_STATE_PREFIX: &str = "admins/";
-
 type ScheduleWorkers = HashMap<(String, String), AbortHandle>;
 
 #[derive(Debug, Error)]
@@ -328,6 +331,7 @@ impl StaticPluginHost {
             trusted_platform_queries: trusted_capabilities.platform_queries,
             authority_provider: trusted_capabilities.authority_provider,
             execution,
+            lifecycle: Arc::new(Mutex::new(())),
             state: StdMutex::new(LifecycleState {
                 state: PluginInstanceState::Draining,
                 generation: 0,
@@ -406,9 +410,14 @@ impl StaticPluginHost {
                 plugin_id: instance_id.to_owned(),
                 message: "plugin instance is not registered".to_owned(),
             })?;
-        plugin.begin_draining()?;
+        let _lifecycle = plugin.lifecycle.lock().await;
+        plugin.require_state(PluginInstanceState::Ready)?;
+        let mut transition = LifecycleTransition::begin(self, &plugin)?;
         let _execution = plugin.execution.acquire_exclusive().await?;
+        plugin.require_state(PluginInstanceState::Draining)?;
+        self.pause_plugin_schedules(instance_id)?;
         let old_config = plugin.config_snapshot()?;
+        let result = async {
         if let Err(error) = validate_config_schema(
             plugin.plugin.as_ref(),
             &plugin.manifest.id.to_string(),
@@ -417,14 +426,23 @@ impl StaticPluginHost {
             plugin.set_state(PluginInstanceState::Ready)?;
             return Err(error);
         }
+        transition.hooks_started();
         if let Err(error) =
             supervised_validate_config(plugin.plugin.as_ref(), &plugin.manifest, &config).await
         {
-            plugin.set_state(PluginInstanceState::Ready)?;
+            plugin.set_state(if lifecycle_error_is_poisoning(&error) {
+                PluginInstanceState::Disabled
+            } else {
+                PluginInstanceState::Ready
+            })?;
             return Err(error);
         }
         if let Err(error) = supervised_shutdown(&plugin).await {
-            plugin.set_state(PluginInstanceState::Ready)?;
+            plugin.set_state(if lifecycle_error_is_poisoning(&error) {
+                PluginInstanceState::Disabled
+            } else {
+                PluginInstanceState::Ready
+            })?;
             return Err(error);
         }
         match supervised_init(&plugin, config.clone()).await {
@@ -433,6 +451,11 @@ impl StaticPluginHost {
                 self.assets.remove_instance(instance_id);
                 plugin.set_state(PluginInstanceState::Ready)?;
                 Ok(())
+            }
+            Err(update_error) if lifecycle_error_is_poisoning(&update_error) => {
+                plugin.set_state(PluginInstanceState::Disabled)?;
+                self.assets.remove_instance(instance_id);
+                Err(update_error)
             }
             Err(update_error) => match supervised_init(&plugin, old_config).await {
                 Ok(()) => {
@@ -451,6 +474,15 @@ impl StaticPluginHost {
                 }
             },
         }
+        }.await;
+        if plugin.state()? == PluginInstanceState::Ready {
+            if let Err(error) = self.resume_pending_schedules(&plugin) {
+                plugin.set_state(PluginInstanceState::Disabled)?;
+                return Err(error);
+            }
+        }
+        transition.finish();
+        result
     }
 
     pub fn instance_state(
@@ -606,20 +638,32 @@ impl StaticPluginHost {
             trusted_platform_queries: trusted_capabilities.platform_queries,
             authority_provider: trusted_capabilities.authority_provider,
             execution,
+            lifecycle: Arc::clone(&old.lifecycle),
             state: StdMutex::new(LifecycleState {
                 state: PluginInstanceState::Draining,
                 generation: 0,
             }),
         });
 
-        old.begin_draining()?;
+        let _lifecycle = old.lifecycle.lock().await;
+        old.require_state(PluginInstanceState::Ready)?;
+        let mut transition = LifecycleTransition::begin(self, &old)?;
         let _execution = old.execution.acquire_exclusive().await?;
+        old.require_state(PluginInstanceState::Draining)?;
         self.pause_plugin_schedules(instance_id)?;
         let old_config = old.config_snapshot()?;
         let old_state = self.store.snapshot(instance_id)?;
+        transition.hooks_started();
         if let Err(error) = supervised_shutdown(&old).await {
-            old.set_state(PluginInstanceState::Ready)?;
-            self.recover_plugin_schedules(&old)?;
+            old.set_state(if lifecycle_error_is_poisoning(&error) {
+                PluginInstanceState::Disabled
+            } else {
+                PluginInstanceState::Ready
+            })?;
+            if old.state()? == PluginInstanceState::Ready {
+                self.resume_pending_schedules(&old)?;
+            }
+            transition.finish();
             return Err(error);
         }
         let upgrade_result = async {
@@ -648,32 +692,29 @@ impl StaticPluginHost {
                     CommitOptions::new(candidate.manifest.permissions.storage_quota_bytes),
                 )?;
             }
-            supervised_init(&candidate, config).await?;
-            if let Err(error) = supervised_health(&candidate).await {
-                if let Err(shutdown_error) = supervised_shutdown(&candidate).await {
-                    warn!(
-                        plugin_id = %candidate.manifest.id,
-                        error = %shutdown_error,
-                        "failed to shut down rejected upgrade candidate"
-                    );
-                }
-                return Err(error);
-            }
-            Ok(())
+            supervised_activate(&candidate, config).await
         }
         .await;
 
         if let Err(error) = upgrade_result {
-            return self
+            let result = self
                 .rollback_upgrade(&old, &old_state, old_config, error)
                 .await;
+            if old.state()? != PluginInstanceState::Draining {
+                transition.finish();
+            }
+            return result;
         }
 
         candidate.set_state(PluginInstanceState::Ready)?;
         self.plugins[index] = Arc::clone(&candidate);
         self.rebuild_command_names();
         self.assets.remove_instance(instance_id);
-        self.recover_plugin_schedules(&candidate)?;
+        if let Err(error) = self.resume_pending_schedules(&candidate) {
+            candidate.set_state(PluginInstanceState::Disabled)?;
+            return Err(error);
+        }
+        transition.finish();
         Ok(())
     }
 
@@ -688,7 +729,10 @@ impl StaticPluginHost {
         match supervised_init(old, old_config).await {
             Ok(()) => {
                 old.set_state(PluginInstanceState::Ready)?;
-                self.recover_plugin_schedules(old)?;
+                if let Err(error) = self.resume_pending_schedules(old) {
+                    old.set_state(PluginInstanceState::Disabled)?;
+                    return Err(error);
+                }
                 Err(upgrade_error)
             }
             Err(rollback_error) => {
@@ -1422,14 +1466,6 @@ impl StaticPluginHost {
         }
     }
 
-    fn recover_plugin_schedules(
-        &self,
-        plugin: &Arc<RegisteredPlugin>,
-    ) -> Result<(), PluginHostError> {
-        self.store.recover_schedules(&plugin.instance_id)?;
-        self.resume_pending_schedules(plugin)
-    }
-
     fn recover_pending_commands(
         &self,
         plugin: &Arc<RegisteredPlugin>,
@@ -1759,33 +1795,11 @@ impl StaticPluginHost {
     /// Drains all ready plugin instances, stops scheduled work, and invokes
     /// each plugin's bounded BPP shutdown lifecycle hook.
     pub async fn shutdown(&self) -> Result<(), PluginHostError> {
-        self.stop_schedulers()?;
         let mut first_error = None;
         for plugin in &self.plugins {
-            match plugin.state()? {
-                PluginInstanceState::Ready => plugin.begin_draining()?,
-                PluginInstanceState::Draining => {}
-                PluginInstanceState::Disabled | PluginInstanceState::Stopped => {
-                    self.assets.remove_instance(&plugin.instance_id);
-                    continue;
-                }
-            }
-            let execution = plugin.execution.acquire_exclusive().await;
-            match execution {
-                Ok(_execution) => match supervised_shutdown(plugin).await {
-                    Ok(()) => plugin.set_state(PluginInstanceState::Stopped)?,
-                    Err(error) => {
-                        plugin.set_state(PluginInstanceState::Disabled)?;
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
-                },
-                Err(error) => {
-                    plugin.set_state(PluginInstanceState::Disabled)?;
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
+            if let Err(error) = self.set_instance_enabled(&plugin.instance_id, false).await {
+                if first_error.is_none() {
+                    first_error = Some(error);
                 }
             }
             self.assets.remove_instance(&plugin.instance_id);
@@ -2089,6 +2103,9 @@ struct RegisteredPlugin {
     trusted_platform_queries: BTreeSet<TrustedPlatformQuery>,
     authority_provider: Option<TrustedAuthorityProvider>,
     execution: InvocationGate,
+    // Shared by Host clones and upgrade candidates. Lifecycle hooks must never
+    // overlap, even when both callers observed the same stopped/ready state.
+    lifecycle: Arc<Mutex<()>>,
     state: StdMutex<LifecycleState>,
 }
 
@@ -2141,13 +2158,33 @@ impl RegisteredPlugin {
     }
 
     fn set_state(&self, state: PluginInstanceState) -> Result<(), PluginHostError> {
-        self.state
-            .lock()
-            .map_err(|_| PluginHostError::Invocation {
-                plugin_id: self.manifest.id.to_string(),
-                message: "plugin lifecycle lock is poisoned".to_owned(),
-            })?
-            .state = state;
+        let mut lifecycle = self.state.lock().map_err(|_| PluginHostError::Invocation {
+            plugin_id: self.manifest.id.to_string(),
+            message: "plugin lifecycle lock is poisoned".to_owned(),
+        })?;
+        if lifecycle.state == PluginInstanceState::Disabled
+            && state != PluginInstanceState::Disabled
+        {
+            return Err(self.unexpected_state(PluginInstanceState::Disabled));
+        }
+        lifecycle.state = state;
+        Ok(())
+    }
+
+    fn unexpected_state(&self, state: PluginInstanceState) -> PluginHostError {
+        PluginHostError::Invocation {
+            plugin_id: self.manifest.id.to_string(),
+            message: format!(
+                "plugin instance is {state:?}; disabled instances require recovery and a process restart"
+            ),
+        }
+    }
+
+    fn require_state(&self, expected: PluginInstanceState) -> Result<(), PluginHostError> {
+        let actual = self.state()?;
+        if actual != expected {
+            return Err(self.unexpected_state(actual));
+        }
         Ok(())
     }
 
@@ -2156,6 +2193,9 @@ impl RegisteredPlugin {
             plugin_id: self.manifest.id.to_string(),
             message: "plugin lifecycle lock is poisoned".to_owned(),
         })?;
+        if lifecycle.state == PluginInstanceState::Disabled {
+            return Err(self.unexpected_state(lifecycle.state));
+        }
         lifecycle.state = PluginInstanceState::Draining;
         lifecycle.generation = lifecycle.generation.wrapping_add(1);
         Ok(())
@@ -2253,9 +2293,13 @@ async fn supervised_shutdown(plugin: &RegisteredPlugin) -> Result<(), PluginHost
         .map_err(|_| PluginHostError::Panic {
             plugin_id: plugin.manifest.id.to_string(),
         })?
-        .map_err(|error| PluginHostError::Invocation {
-            plugin_id: plugin.manifest.id.to_string(),
-            message: error.to_string(),
+        .map_err(|error| {
+            preserve_guest_trap(plugin.manifest.id.as_str(), error, |message| {
+                PluginHostError::Invocation {
+                    plugin_id: plugin.manifest.id.to_string(),
+                    message,
+                }
+            })
         })
 }
 
@@ -2279,9 +2323,13 @@ async fn supervised_init(
         .map_err(|_| PluginHostError::Panic {
             plugin_id: plugin.manifest.id.to_string(),
         })?
-        .map_err(|error| PluginHostError::Init {
-            plugin_id: plugin.manifest.id.to_string(),
-            message: error.to_string(),
+        .map_err(|error| {
+            preserve_guest_trap(plugin.manifest.id.as_str(), error, |message| {
+                PluginHostError::Init {
+                    plugin_id: plugin.manifest.id.to_string(),
+                    message,
+                }
+            })
         })
 }
 
@@ -2299,9 +2347,13 @@ async fn supervised_validate_config(
         .map_err(|_| PluginHostError::Panic {
             plugin_id: manifest.id.to_string(),
         })?
-        .map_err(|error| PluginHostError::InvalidConfig {
-            plugin_id: manifest.id.to_string(),
-            message: error.to_string(),
+        .map_err(|error| {
+            preserve_guest_trap(manifest.id.as_str(), error, |message| {
+                PluginHostError::InvalidConfig {
+                    plugin_id: manifest.id.to_string(),
+                    message,
+                }
+            })
         })
 }
 
@@ -2337,18 +2389,67 @@ async fn supervised_health(plugin: &RegisteredPlugin) -> Result<(), PluginHostEr
         .map_err(|_| PluginHostError::Panic {
             plugin_id: plugin.manifest.id.to_string(),
         })?
-        .map_err(|error| PluginHostError::Invocation {
-            plugin_id: plugin.manifest.id.to_string(),
-            message: error.to_string(),
+        .map_err(|error| {
+            preserve_guest_trap(plugin.manifest.id.as_str(), error, |message| {
+                PluginHostError::Invocation {
+                    plugin_id: plugin.manifest.id.to_string(),
+                    message,
+                }
+            })
         })?;
     if health == HealthStatus::Healthy {
         Ok(())
     } else {
         Err(PluginHostError::Invocation {
             plugin_id: plugin.manifest.id.to_string(),
-            message: "upgraded plugin reported degraded health".to_owned(),
+            message: "plugin reported degraded health".to_owned(),
         })
     }
+}
+
+fn preserve_guest_trap(
+    plugin_id: &str,
+    error: PluginError,
+    otherwise: impl FnOnce(String) -> PluginHostError,
+) -> PluginHostError {
+    match error {
+        PluginError::GuestTrap(message) => PluginHostError::GuestTrap {
+            plugin_id: plugin_id.to_owned(),
+            message,
+        },
+        PluginError::ResourceExhaustedTrap(message) => PluginHostError::ResourceExhaustedTrap {
+            plugin_id: plugin_id.to_owned(),
+            message,
+        },
+        error => otherwise(error.to_string()),
+    }
+}
+
+fn lifecycle_error_is_poisoning(error: &PluginHostError) -> bool {
+    matches!(
+        error,
+        PluginHostError::GuestTrap { .. }
+            | PluginHostError::ResourceExhaustedTrap { .. }
+            | PluginHostError::Timeout { .. }
+            | PluginHostError::Panic { .. }
+    )
+}
+
+async fn supervised_activate(
+    plugin: &RegisteredPlugin,
+    config: BTreeMap<String, Value>,
+) -> Result<(), PluginHostError> {
+    supervised_init(plugin, config).await?;
+    if let Err(error) = supervised_health(plugin).await {
+        if !lifecycle_error_is_poisoning(&error) {
+            if let Err(cleanup_error) = supervised_shutdown(plugin).await {
+                warn!(plugin_id = %plugin.manifest.id, error = %cleanup_error,
+                    "failed to shut down instance rejected by health check");
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 const fn delivery_error_retryable(error: &PluginHostError) -> bool {
@@ -2570,6 +2671,7 @@ mod tests {
             trusted_platform_queries: BTreeSet::default(),
             authority_provider: None,
             execution,
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             state: StdMutex::new(LifecycleState::ready()),
         }
     }
