@@ -7,7 +7,7 @@ use bot_core::{
     EventId, MessageSegment, MessageTarget, RuntimeBuilder, Sender, ShutdownHandle, ShutdownSignal,
     shutdown_channel,
 };
-use builtin_plugins::{AdminPlugin, PingPlugin};
+use builtin_plugins::{AdminPlugin, EchoPlugin, PingPlugin};
 use plugin_api::{StateOp, StaticPlugin};
 use plugin_host::{
     CommitOptions, PluginStore, StaticPluginHost, TrustedAuthorityProvider,
@@ -143,6 +143,47 @@ async fn wasm_ping_matches_static_ping_through_bpp_host_and_adapter() {
     let static_action = run_ping(Arc::new(PingPlugin::default())).await;
     let wasm_action = run_ping(wasm).await;
     assert_eq!(static_action, wasm_action);
+}
+
+#[tokio::test]
+async fn unicode_command_prefix_and_multiline_echo_match_between_static_and_wasm() {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(
+            include_str!("../../../test-support/wasm-plugins/ping/commands.bkm-plugin.b64").trim(),
+        )
+        .unwrap();
+    let wasm = Arc::new(
+        WasmPlugin::from_package(ValidatedPluginPackage::from_bytes(&bytes).unwrap())
+            .await
+            .unwrap(),
+    );
+    for prefix in ["!!", "喵："] {
+        for plugin in [
+            Arc::new(EchoPlugin::default()) as Arc<dyn StaticPlugin>,
+            wasm.clone(),
+        ] {
+            let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap())
+                .with_command_prefix(prefix)
+                .unwrap();
+            host.register_trusted(plugin, "echo/test", BTreeMap::new())
+                .await
+                .unwrap();
+            let mut event = ping_event();
+            let Event::Message(message) = &mut event.event else {
+                unreachable!()
+            };
+            message.text = format!("  {prefix}echo 第一行\n\n 第二行\r\n ");
+            message.segments = vec![MessageSegment::Text {
+                text: message.text.clone(),
+            }];
+            let Action::Reply(reply) = run_plugin(host, event, "mock").await else {
+                panic!("expected echo reply")
+            };
+            assert_eq!(reply.content, "第一行\n\n 第二行\r\n ");
+        }
+        // The fixture asserts that no command context survives a lifecycle call.
+        wasm.health().await.unwrap();
+    }
 }
 
 #[tokio::test]

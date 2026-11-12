@@ -12,7 +12,7 @@ use validation::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     panic::AssertUnwindSafe,
-    sync::{Arc, Mutex as StdMutex, Weak},
+    sync::{Arc, Mutex as StdMutex, RwLock, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -173,6 +173,7 @@ impl TrustedPlatformQuery {
 
 #[derive(Clone)]
 pub struct StaticPluginHost {
+    command_prefix: Arc<RwLock<String>>,
     name: String,
     store: PluginStore,
     plugins: Vec<Arc<RegisteredPlugin>>,
@@ -189,6 +190,7 @@ impl std::fmt::Debug for StaticPluginHost {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StaticPluginHost")
+            .field("command_prefix", &self.command_prefix())
             .field("name", &self.name)
             .field("store", &self.store)
             .field("plugin_count", &self.plugins.len())
@@ -206,6 +208,7 @@ impl std::fmt::Debug for StaticPluginHost {
 impl StaticPluginHost {
     pub fn new(store: PluginStore) -> Self {
         Self {
+            command_prefix: Arc::new(RwLock::new(plugin_api::DEFAULT_COMMAND_PREFIX.to_owned())),
             name: "plugin-host".to_owned(),
             store,
             plugins: Vec::new(),
@@ -217,6 +220,34 @@ impl StaticPluginHost {
             adapters: Arc::new(BTreeMap::new()),
             scheduled_tasks: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_command_prefix(
+        self,
+        prefix: &str,
+    ) -> Result<Self, plugin_api::InvalidCommandPrefix> {
+        self.set_command_prefix(prefix)?;
+        Ok(self)
+    }
+
+    /// Shared by Host clones; existing invocation snapshots remain unchanged.
+    pub fn set_command_prefix(&self, prefix: &str) -> Result<(), plugin_api::InvalidCommandPrefix> {
+        plugin_api::validate_command_prefix(prefix)?;
+        prefix.clone_into(
+            &mut self
+                .command_prefix
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn command_prefix(&self) -> String {
+        self.command_prefix
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[must_use]
@@ -1151,7 +1182,20 @@ impl StaticPluginHost {
     ) -> Result<HandlerOutput, PluginHostError> {
         let state = self.store.snapshot(&plugin.instance_id)?;
         let config = plugin.config_snapshot()?;
+        let command_prefix = self.command_prefix();
+        let command_context = (envelope.event_type == "message.created")
+            .then(|| {
+                envelope
+                    .payload
+                    .pointer("/data/text")
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+            .and_then(|text| plugin_api::CommandContext::parse(&command_prefix, text));
         let queries = InvocationQueries {
+            command_declarations: self.command_declarations()?,
+            command_prefix,
+            command_context,
             config: &config,
             state: &state,
             granted_capabilities: &plugin.granted_capabilities,
@@ -2049,6 +2093,9 @@ impl RegisteredPlugin {
 }
 
 struct InvocationQueries<'a> {
+    command_declarations: Vec<CommandDeclaration>,
+    command_prefix: String,
+    command_context: Option<plugin_api::CommandContext>,
     config: &'a BTreeMap<String, Value>,
     state: &'a BTreeMap<String, StateValue>,
     granted_capabilities: &'a BTreeSet<String>,
@@ -2057,6 +2104,16 @@ struct InvocationQueries<'a> {
 }
 
 impl HostQueries for InvocationQueries<'_> {
+    fn command_declarations(&self) -> Option<Vec<CommandDeclaration>> {
+        Some(self.command_declarations.clone())
+    }
+    fn command_prefix(&self) -> String {
+        self.command_prefix.clone()
+    }
+
+    fn command_context(&self) -> Option<plugin_api::CommandContext> {
+        self.command_context.clone()
+    }
     fn config_get(&self, key: &str) -> Option<&Value> {
         self.config.get(key)
     }
@@ -2242,8 +2299,9 @@ mod tests {
     };
     use builtin_plugins::{AdminPlugin, PingPlugin};
     use plugin_api::{
-        CallerRole, Disposition, ExtensionPayload, HandlerOutput, HostQueries, InitContext,
-        PluginCommand, PluginError, PluginEventEnvelope, PluginManifest, StateOp, StaticPlugin,
+        BPP_VERSION, CallerAuthority, CallerRole, Disposition, ExtensionPayload, HandlerOutput,
+        HostQueries, InitContext, PluginCommand, PluginError, PluginEventEnvelope, PluginManifest,
+        StateOp, StaticPlugin,
     };
     use serde_json::{Value, json};
 
@@ -2415,6 +2473,152 @@ mod tests {
             execution,
             state: StdMutex::new(LifecycleState::ready()),
         }
+    }
+
+    #[tokio::test]
+    async fn command_queries_keep_raw_messages_and_snapshot_shared_prefix() {
+        struct Probe {
+            manifest: PluginManifest,
+            host: StaticPluginHost,
+        }
+        #[async_trait::async_trait]
+        impl StaticPlugin for Probe {
+            fn manifest(&self) -> &PluginManifest {
+                &self.manifest
+            }
+            async fn on_event(
+                &self,
+                event: &PluginEventEnvelope,
+                queries: &dyn HostQueries,
+            ) -> Result<HandlerOutput, PluginError> {
+                let prefix = queries.command_prefix();
+                let command = queries.command_context();
+                self.host.set_command_prefix("changed!").unwrap();
+                assert_eq!(queries.command_prefix(), prefix);
+                assert_eq!(queries.command_context(), command);
+                let raw = event
+                    .payload
+                    .pointer("/data/text")
+                    .and_then(Value::as_str)
+                    .unwrap();
+                if event.event_type == "message.created" {
+                    assert_eq!(command, plugin_api::CommandContext::parse(&prefix, raw));
+                } else {
+                    assert!(command.is_none());
+                }
+                if raw.starts_with('/') {
+                    assert!(command.is_none());
+                }
+                if let Some(command) = command {
+                    assert_eq!(command.arguments, "第一行\n\n 第二行\n ");
+                }
+                Ok(HandlerOutput::default())
+            }
+        }
+        let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap())
+            .with_command_prefix("喵!")
+            .unwrap();
+        host.register_trusted(
+            Arc::new(Probe {
+                manifest: PingPlugin::default().manifest().clone(),
+                host: host.clone(),
+            }),
+            "probe",
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        let plugin = &host.plugins[0];
+        for (event_type, text) in [
+            ("message.created", "喵!echo 第一行\n\n 第二行\n "),
+            ("message.created", "/echo 第一行\n\n 第二行\n "),
+            ("action.completed", "喵!echo 第一行\n\n 第二行\n "),
+        ] {
+            host.set_command_prefix("喵!").unwrap();
+            let envelope = PluginEventEnvelope {
+                protocol_version: BPP_VERSION.to_owned(),
+                event_id: "command-test".to_owned(),
+                delivery_id: "delivery".to_owned(),
+                invocation_id: "invocation".to_owned(),
+                occurred_at_ms: None,
+                received_at_ms: 0,
+                adapter_id: "mock".to_owned(),
+                event_type: event_type.to_owned(),
+                trace_id: None,
+                payload: json!({"type":"message", "data":{"text":text}}),
+                extensions: Vec::new(),
+            };
+            host.invoke_envelope(plugin, &envelope, &CallerAuthority::default())
+                .await
+                .unwrap();
+            assert_eq!(host.command_prefix(), "changed!");
+            assert!(host.set_command_prefix(" ").is_err());
+            assert_eq!(host.command_prefix(), "changed!");
+        }
+    }
+
+    #[cfg(feature = "wasm")]
+    #[tokio::test]
+    async fn wasm_command_queries_reject_the_previous_prefix() {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                include_str!("../../../../test-support/wasm-plugins/ping/commands.bkm-plugin.b64")
+                    .trim(),
+            )
+            .unwrap();
+        let wasm = Arc::new(
+            crate::WasmPlugin::from_package(
+                crate::ValidatedPluginPackage::from_bytes(&bytes).unwrap(),
+            )
+            .await
+            .unwrap(),
+        );
+        let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap())
+            .with_command_prefix("喵!")
+            .unwrap();
+        host.register_trusted(wasm.clone(), "wasm", BTreeMap::new())
+            .await
+            .unwrap();
+        for (text, matches) in [
+            ("/echo body", false),
+            ("喵!echo body", true),
+            ("!!echo body", false),
+        ] {
+            let envelope = PluginEventEnvelope {
+                protocol_version: BPP_VERSION.to_owned(),
+                event_id: "command-test".to_owned(),
+                delivery_id: "delivery".to_owned(),
+                invocation_id: "invocation".to_owned(),
+                occurred_at_ms: None,
+                received_at_ms: 0,
+                adapter_id: "mock".to_owned(),
+                event_type: "message.created".to_owned(),
+                trace_id: None,
+                payload: serde_json::to_value(bot_core::Event::Message(bot_core::CommonMessage {
+                    message_id: "message".to_owned(),
+                    target: MessageTarget::Group {
+                        group_id: "group".to_owned(),
+                    },
+                    sender: bot_core::Sender {
+                        id: "user".to_owned(),
+                        display_name: None,
+                    },
+                    text: text.to_owned(),
+                    segments: Vec::new(),
+                    reply_to: None,
+                }))
+                .unwrap(),
+                extensions: Vec::new(),
+            };
+            let output = host
+                .invoke_envelope(&host.plugins[0], &envelope, &CallerAuthority::default())
+                .await
+                .unwrap();
+            assert_eq!(!output.commands.is_empty(), matches);
+        }
+        wasm.health().await.unwrap();
+        host.shutdown().await.unwrap();
     }
 
     #[test]

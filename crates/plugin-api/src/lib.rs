@@ -2,10 +2,15 @@
 
 #![forbid(unsafe_code)]
 
+mod command;
 mod id;
 mod manifest;
 mod protocol;
 
+pub use command::{
+    CommandContext, DEFAULT_COMMAND_PREFIX, InvalidCommandPrefix, MAX_COMMAND_PREFIX_CHARS,
+    validate_command_prefix,
+};
 pub use id::{PluginId, PluginIdError};
 pub use manifest::{
     Audience, BrowserPermission, CommandDeclaration, HttpPermission, LocalizedPluginMetadata,
@@ -22,4 +27,4 @@ pub use protocol::{
     ScheduleCreate, ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 
-pub const BPP_VERSION: &str = "1.3.0";
+pub const BPP_VERSION: &str = "1.4.0";

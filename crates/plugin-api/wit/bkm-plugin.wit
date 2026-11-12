@@ -1,6 +1,11 @@
-package bkm:plugin@1.3.0;
+package bkm:plugin@1.4.0;
 
 interface types {
+    record command-context {
+        prefix: string,
+        name: string,
+        arguments: string,
+    }
     enum caller-role { user, admin, owner }
 
     record caller-authority {
@@ -315,7 +320,7 @@ interface types {
 }
 
 interface queries {
-    use types.{host-error, state-entry, state-value, encoded-value, caller-authority as authority};
+    use types.{host-error, state-entry, state-value, encoded-value, caller-authority as authority, command-context as parsed-command};
 
     config-get: func(key: string) -> result<option<encoded-value>, host-error>;
     state-get: func(key: string) -> result<option<state-value>, host-error>;
@@ -324,6 +329,8 @@ interface queries {
     granted-capabilities: func() -> list<string>;
     invocation-time-ms: func() -> s64;
     caller-authority: func() -> authority;
+    command-prefix: func() -> string;
+    command-context: func() -> option<parsed-command>;
 }
 
 interface lifecycle {

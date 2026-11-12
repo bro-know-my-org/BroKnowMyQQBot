@@ -45,6 +45,8 @@ struct StoreData {
     granted_capabilities: BTreeSet<String>,
     invocation_time_ms: i64,
     caller_authority: CallerAuthority,
+    command_prefix: String,
+    command_context: Option<plugin_api::CommandContext>,
     limits: PluginResourceLimits,
 }
 
@@ -114,6 +116,21 @@ impl StoreData {
 impl types::Host for StoreData {}
 
 impl queries::Host for StoreData {
+    fn command_prefix(&mut self) -> impl Future<Output = String> {
+        std::future::ready(self.command_prefix.clone())
+    }
+
+    fn command_context(&mut self) -> impl Future<Output = Option<types::CommandContext>> {
+        std::future::ready(
+            self.command_context
+                .as_ref()
+                .map(|command| types::CommandContext {
+                    prefix: command.prefix.clone(),
+                    name: command.name.clone(),
+                    arguments: command.arguments.clone(),
+                }),
+        )
+    }
     fn config_get(
         &mut self,
         key: String,
@@ -248,6 +265,8 @@ impl WasmPlugin {
                 granted_capabilities: BTreeSet::new(),
                 invocation_time_ms: 0,
                 caller_authority: CallerAuthority::default(),
+                command_prefix: plugin_api::DEFAULT_COMMAND_PREFIX.to_owned(),
+                command_context: None,
                 limits: PluginResourceLimits {
                     inner: limits,
                     memory_bytes,
@@ -284,6 +303,7 @@ impl WasmPlugin {
         store: &mut Store<StoreData>,
     ) -> Result<EpochDeadline, PluginError> {
         store.data_mut().caller_authority = CallerAuthority::default();
+        store.data_mut().command_context = None;
         reset_fuel(store, self.fuel)?;
         store.set_epoch_deadline(1);
         let engine = self.engine.clone();
@@ -399,6 +419,8 @@ impl StaticPlugin for WasmPlugin {
             .clone_from(queries.granted_capabilities());
         instance.store.data_mut().invocation_time_ms = queries.invocation_time_ms();
         instance.store.data_mut().caller_authority = queries.caller_authority();
+        instance.store.data_mut().command_prefix = queries.command_prefix();
+        instance.store.data_mut().command_context = queries.command_context();
         let WasmInstance { store, bindings } = &mut *instance;
         let output = bindings
             .bkm_plugin_handler()

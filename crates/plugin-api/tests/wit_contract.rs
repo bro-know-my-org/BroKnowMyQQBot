@@ -28,6 +28,19 @@ fn formal_wit_contract_parses_with_expected_identity() {
     let types = &resolve.interfaces[types_id];
     let queries = &resolve.interfaces[package.interfaces["queries"]];
     assert!(queries.functions.contains_key("caller-authority"));
+    assert!(queries.functions.contains_key("command-context"));
+    assert!(queries.functions.contains_key("command-prefix"));
+    let TypeDefKind::Record(command) = &resolve.types[types.types["command-context"]].kind else {
+        panic!("BPP command-context must be a record");
+    };
+    assert_eq!(
+        command
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        ["prefix", "name", "arguments"]
+    );
     let TypeDefKind::Enum(roles) = &resolve.types[types.types["caller-role"]].kind else {
         panic!("BPP caller-role must be an enum");
     };

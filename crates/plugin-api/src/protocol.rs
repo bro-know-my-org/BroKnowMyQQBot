@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{PluginId, PluginManifest};
+use crate::{CommandContext, CommandDeclaration, DEFAULT_COMMAND_PREFIX, PluginId, PluginManifest};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginEventEnvelope {
@@ -367,6 +367,18 @@ impl Default for CallerAuthority {
 }
 
 pub trait HostQueries: Send + Sync {
+    /// Current Ready command catalog, if this Host provides discovery.
+    fn command_declarations(&self) -> Option<Vec<CommandDeclaration>> {
+        None
+    }
+    /// The configured global prefix, stable within this invocation.
+    fn command_prefix(&self) -> String {
+        DEFAULT_COMMAND_PREFIX.to_owned()
+    }
+    /// Host-parsed command for message events; absent for all other calls.
+    fn command_context(&self) -> Option<CommandContext> {
+        None
+    }
     fn config_get(&self, key: &str) -> Option<&Value>;
     fn state_get(&self, key: &str) -> Option<&StateValue>;
     fn state_scan(&self, prefix: &str, limit: usize) -> Vec<(&str, &StateValue)>;

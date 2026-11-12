@@ -14,15 +14,18 @@ struct WasmPing;
 
 impl LifecycleGuest for WasmPing {
     fn validate_config(_config: Vec<bkm::plugin::types::ConfigEntry>) -> Result<(), PluginError> {
+        assert!(queries::command_context().is_none());
         Ok(())
     }
 
     fn init(_context: InitContext) -> Result<(), PluginError> {
+        assert!(queries::command_context().is_none());
         Ok(())
     }
 
     fn health() -> Result<HealthStatus, PluginError> {
         assert!(matches!(queries::caller_authority().role, CallerRole::User));
+        assert!(queries::command_context().is_none());
         Ok(HealthStatus::Healthy)
     }
 
@@ -37,6 +40,7 @@ impl LifecycleGuest for WasmPing {
     }
 
     fn shutdown() -> Result<(), PluginError> {
+        assert!(queries::command_context().is_none());
         Ok(())
     }
 }
@@ -46,9 +50,15 @@ impl HandlerGuest for WasmPing {
         let EventPayload::MessageCreated(message) = event.payload else {
             return Ok(ignored());
         };
-        match message.text.trim() {
-            "/ping" => Ok(reply(&event.event_id, "pong".to_owned())),
-            "/caller-authority" => {
+        let Some(command) = queries::command_context() else {
+            return Ok(ignored());
+        };
+        assert_eq!(command.prefix, queries::command_prefix());
+        assert!(message.text.trim_start().starts_with(&command.prefix));
+        match command.name.as_str() {
+            "echo" => Ok(reply(&event.event_id, command.arguments)),
+            "ping" => Ok(reply(&event.event_id, "pong".to_owned())),
+            "caller-authority" => {
                 let authority = queries::caller_authority();
                 Ok(reply(
                     &event.event_id,
@@ -58,16 +68,16 @@ impl HandlerGuest for WasmPing {
                     ),
                 ))
             }
-            "/wasm-trap" => panic!("intentional WASM fixture trap"),
-            "/wasm-fuel" | "/wasm-timeout" => loop {
+            "wasm-trap" => panic!("intentional WASM fixture trap"),
+            "wasm-fuel" | "wasm-timeout" => loop {
                 std::hint::black_box(());
             },
-            "/wasm-memory" => {
+            "wasm-memory" => {
                 let allocation = vec![0xA5_u8; 64 * 1024 * 1024];
                 std::hint::black_box(allocation);
                 Ok(ignored())
             }
-            "/wasm-output" => Ok(reply(&event.event_id, "x".repeat(2 * 1024 * 1024))),
+            "wasm-output" => Ok(reply(&event.event_id, "x".repeat(2 * 1024 * 1024))),
             _ => Ok(ignored()),
         }
     }
