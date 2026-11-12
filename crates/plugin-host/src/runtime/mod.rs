@@ -2,6 +2,8 @@
 
 mod command;
 mod management;
+#[cfg(test)]
+mod upgrade_tests;
 mod validation;
 
 use management::LifecycleTransition;
@@ -207,6 +209,41 @@ impl std::fmt::Debug for StaticPluginHost {
             .field("adapter_count", &self.adapters.len())
             .field("scheduled_tasks", &"supervised")
             .finish()
+    }
+}
+
+/// Restore a published migration before releasing the lifecycle/execution locks
+/// if activation is cancelled. Guest reuse is handled by `LifecycleTransition`.
+struct UpgradeStateRollback<'a> {
+    store: &'a PluginStore,
+    old: &'a RegisteredPlugin,
+    snapshot: Option<&'a BTreeMap<String, StateValue>>,
+}
+
+impl UpgradeStateRollback<'_> {
+    fn restore(&mut self) -> Result<(), PluginHostError> {
+        let Some(snapshot) = self.snapshot.take() else {
+            return Ok(());
+        };
+        if let Err(error) = self.store.replace_state(&self.old.instance_id, snapshot) {
+            let disable_error = self.old.set_state(PluginInstanceState::Disabled).err();
+            error!(instance_id = self.old.instance_id, %error, ?disable_error,
+                "failed to restore plugin state after unsuccessful upgrade");
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) {
+        self.snapshot = None;
+    }
+}
+
+impl Drop for UpgradeStateRollback<'_> {
+    fn drop(&mut self) {
+        // restore logs persistence failures and conservatively disables the old
+        // instance; Drop cannot propagate the error to a cancelled caller.
+        let _ = self.restore();
     }
 }
 
@@ -666,6 +703,13 @@ impl StaticPluginHost {
             transition.finish();
             return Err(error);
         }
+        // Declared after the lock guards so cancellation restores persistent
+        // state while the instance is still exclusively drained.
+        let mut state_rollback = UpgradeStateRollback {
+            store: &self.store,
+            old: &old,
+            snapshot: None,
+        };
         let upgrade_result = async {
             if candidate.manifest.state_version != old.manifest.state_version {
                 let operations = supervised_migration(
@@ -691,6 +735,8 @@ impl StaticPluginHost {
                     &[],
                     CommitOptions::new(candidate.manifest.permissions.storage_quota_bytes),
                 )?;
+                // No await separates publication from arming the rollback.
+                state_rollback.snapshot = Some(&old_state);
             }
             supervised_activate(&candidate, config).await
         }
@@ -698,7 +744,7 @@ impl StaticPluginHost {
 
         if let Err(error) = upgrade_result {
             let result = self
-                .rollback_upgrade(&old, &old_state, old_config, error)
+                .rollback_upgrade(&old, &mut state_rollback, old_config, error)
                 .await;
             if old.state()? != PluginInstanceState::Draining {
                 transition.finish();
@@ -707,6 +753,7 @@ impl StaticPluginHost {
         }
 
         candidate.set_state(PluginInstanceState::Ready)?;
+        state_rollback.finish();
         self.plugins[index] = Arc::clone(&candidate);
         self.rebuild_command_names();
         self.assets.remove_instance(instance_id);
@@ -721,11 +768,11 @@ impl StaticPluginHost {
     async fn rollback_upgrade(
         &self,
         old: &Arc<RegisteredPlugin>,
-        old_state: &BTreeMap<String, StateValue>,
+        state_rollback: &mut UpgradeStateRollback<'_>,
         old_config: BTreeMap<String, Value>,
         upgrade_error: PluginHostError,
     ) -> Result<(), PluginHostError> {
-        self.store.replace_state(&old.instance_id, old_state)?;
+        state_rollback.restore()?;
         match supervised_init(old, old_config).await {
             Ok(()) => {
                 old.set_state(PluginInstanceState::Ready)?;
