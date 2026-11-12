@@ -1,6 +1,7 @@
 //! Structured, non-secret application configuration.
 
 mod model;
+mod persistence;
 pub(crate) mod setup;
 
 use std::{
@@ -13,6 +14,13 @@ use std::{
 use thiserror::Error;
 
 pub(crate) use model::{BotConfig, LoggingConfig, ManagementConfig};
+pub(crate) use persistence::{ConfigFileLock, config_revision};
+
+#[derive(Debug, Clone)]
+struct ConfigSource {
+    path: PathBuf,
+    revision: String,
+}
 
 const DEFAULT_CONFIG_PATH: &str = "config/bot.toml";
 const DEFAULT_SECRETS_PATH: &str = "config/secrets.env";
@@ -50,7 +58,7 @@ impl BotConfig {
         Self::load_from_path(&path, explicit_path.is_some())
     }
 
-    fn load_from_path(path: &PathBuf, explicit: bool) -> Result<Self, ConfigError> {
+    pub(crate) fn load_from_path(path: &PathBuf, explicit: bool) -> Result<Self, ConfigError> {
         let exists = path.try_exists().map_err(|source| ConfigError::Read {
             path: path.clone(),
             source,
@@ -60,6 +68,7 @@ impl BotConfig {
         } else if explicit {
             return Err(ConfigError::Missing(path.clone()));
         } else {
+            let _lock = ConfigFileLock::acquire(path)?;
             create_file_once(path, CONFIG_TEMPLATE.as_bytes(), false)?;
             Self::from_path(path)?
         };
@@ -113,10 +122,15 @@ impl BotConfig {
             path: path.clone(),
             source,
         })?;
-        toml::from_str(source).map_err(|source| ConfigError::Parse {
+        let mut config: Self = toml::from_str(source).map_err(|source| ConfigError::Parse {
             path: path.clone(),
             source,
-        })
+        })?;
+        config.source = Some(ConfigSource {
+            path: path.clone(),
+            revision: config_revision(&bytes),
+        });
+        Ok(config)
     }
 
     fn apply_environment_overrides(&mut self) -> Result<(), ConfigError> {
@@ -304,10 +318,32 @@ impl BotConfig {
         Ok(())
     }
 
-    pub(crate) fn save(&self) -> Result<PathBuf, ConfigError> {
-        let path = application_config_path();
+    pub(crate) fn save(&mut self) -> Result<PathBuf, ConfigError> {
+        let path = self
+            .source
+            .as_ref()
+            .map_or_else(application_config_path, |source| source.path.clone());
         let encoded = self.encode_for_save()?;
+        // Setup can spend minutes editing a previously loaded snapshot. Locking
+        // only the rename would still allow it to replace newer Web settings.
+        let _lock = ConfigFileLock::acquire(&path)?;
+        let current = match read_bounded_config_bytes(&path) {
+            Ok(bytes) => Some(config_revision(&bytes)),
+            Err(ConfigError::Read { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        if current.as_deref() != self.source.as_ref().map(|source| source.revision.as_str()) {
+            return Err(ConfigError::Conflict(path));
+        }
         atomic_write(&path, encoded.as_bytes(), 0o600)?;
+        self.source = Some(ConfigSource {
+            path: path.clone(),
+            revision: config_revision(encoded.as_bytes()),
+        });
         Ok(path)
     }
 
@@ -869,6 +905,14 @@ fn parse_bool_environment(name: &'static str, value: &str) -> Result<bool, Confi
 
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
+    #[error("application configuration `{0}` changed or is being updated; reload and retry setup")]
+    Conflict(PathBuf),
+    #[error("failed to lock application configuration `{path}`")]
+    Lock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("configured application file `{0}` does not exist")]
     Missing(PathBuf),
     #[error("configured application path `{0}` is not a regular file")]

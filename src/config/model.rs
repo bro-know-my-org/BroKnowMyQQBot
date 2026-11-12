@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct BotConfig {
+    /// The exact on-disk source used before environment overrides or setup edits.
+    #[serde(skip)]
+    pub(super) source: Option<super::ConfigSource>,
     pub(crate) commands: CommandsConfig,
     pub(crate) qq: QqConfig,
     pub(crate) onebot11: OneBot11Config,

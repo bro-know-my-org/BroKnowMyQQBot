@@ -1,6 +1,10 @@
 //! Interactive first-run setup for one QQ Official Bot instance.
 
-use std::{env, fs, io::IsTerminal as _, path::Path};
+use std::{
+    env, fs,
+    io::IsTerminal as _,
+    path::{Path, PathBuf},
+};
 
 use dialoguer::{Confirm, Input, Password, Select, theme::ColorfulTheme};
 use fs2::FileExt as _;
@@ -113,6 +117,25 @@ pub(crate) fn run(
     config.logging.console.message_content = log_message_content;
     config.logging.files.message_content = log_message_content;
 
+    let config_path = save(config, secrets_path, app_id.trim(), &app_secret)?;
+    println!(
+        "\n{}:\n- {}: {}\n- {}: {}{}\n",
+        text.completed,
+        text.configuration,
+        config_path.display(),
+        text.credentials,
+        secrets_path.display(),
+        credential_protection_label()
+    );
+    Ok((app_id.trim().to_owned(), app_secret))
+}
+
+fn save(
+    config: &mut BotConfig,
+    secrets_path: &Path,
+    app_id: &str,
+    app_secret: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let _setup_lock = lock_setup(secrets_path)?;
     let previous_secrets = match fs::read(secrets_path) {
         Ok(contents) => Some(contents),
@@ -125,7 +148,7 @@ pub(crate) fn run(
             .into());
         }
     };
-    write_secret_environment(secrets_path, app_id.trim(), &app_secret)?;
+    write_secret_environment(secrets_path, app_id, app_secret)?;
     let config_path = match config.save() {
         Ok(path) => path,
         Err(error) => {
@@ -146,16 +169,7 @@ pub(crate) fn run(
             return Err(error.into());
         }
     };
-    println!(
-        "\n{}:\n- {}: {}\n- {}: {}{}\n",
-        text.completed,
-        text.configuration,
-        config_path.display(),
-        text.credentials,
-        secrets_path.display(),
-        credential_protection_label()
-    );
-    Ok((app_id.trim().to_owned(), app_secret))
+    Ok(config_path)
 }
 
 fn lock_setup(secrets_path: &Path) -> std::io::Result<fs::File> {
@@ -315,4 +329,43 @@ const fn setup_progress(coverage_probes: &'static str, ordinary: &'static str) -
 
 fn non_empty_environment(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigError;
+
+    #[test]
+    fn stale_setup_save_restores_credentials_and_preserves_newer_config() {
+        for previous_secrets in [None, Some(b"# Existing credentials\n".as_slice())] {
+            let directory = env::temp_dir().join(format!("bkm-setup-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&directory).unwrap();
+            let path = directory.join("bot.toml");
+            let secrets = directory.join("secrets.env");
+            fs::write(&path, "[commands]\nprefix = '/'\n").unwrap();
+            if let Some(previous) = previous_secrets {
+                fs::write(&secrets, previous).unwrap();
+            }
+            let mut stale = BotConfig::load_from_path(&path, true).unwrap();
+            stale.qq.environment = "sandbox".to_owned();
+            let mut newer = BotConfig::load_from_path(&path, true).unwrap();
+            newer.commands.prefix = "机器人".to_owned();
+            newer.save().unwrap();
+            let newer_bytes = fs::read(&path).unwrap();
+
+            let error = save(&mut stale, &secrets, "new-id", "new-secret").unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<ConfigError>(),
+                Some(ConfigError::Conflict(_))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), newer_bytes);
+            if let Some(previous) = previous_secrets {
+                assert_eq!(fs::read(&secrets).unwrap(), previous);
+            } else {
+                assert!(!secrets.exists());
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
 }
