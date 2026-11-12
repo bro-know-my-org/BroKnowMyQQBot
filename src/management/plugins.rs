@@ -350,6 +350,86 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    #[tokio::test]
+    async fn http_configuration_edits_are_saved_before_explicit_runtime_application() {
+        use crate::plugin_configuration::{checked_plugin, fixture::Fixture};
+        let fixture = Fixture::new(true);
+        let mut host = StaticPluginHost::new(fixture.store.clone());
+        host.register(
+            checked_plugin(&fixture.installation).await.unwrap(),
+            &fixture.installation.instance_id,
+            std::collections::BTreeMap::new(),
+            fixture
+                .installation
+                .granted_permissions
+                .iter()
+                .cloned()
+                .collect(),
+        )
+        .await
+        .unwrap();
+        let packages = std::collections::BTreeMap::from([(
+            fixture.installation.instance_id.clone(),
+            fixture.installation.package_sha256.clone(),
+        )]);
+        let manager = PluginManager::new(
+            host,
+            fixture.store.clone(),
+            packages,
+            std::collections::BTreeSet::new(),
+        );
+        let app = router(manager.clone(), token_digest(TOKEN).unwrap());
+        let send = |path: &'static str, body: Value| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::post(path)
+                            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let id = &fixture.installation.instance_id;
+        let (status, saved) = send(
+            "/api/plugins/config",
+            json!({
+                "instance_id":id,"expected_updated_at_ms":1,"config":{"greeting":"hello"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saved["plugin"]["pending"], true);
+        assert_eq!(saved["plugin"]["runtime_state"], "ready");
+        let revision = saved["plugin"]["updated_at_ms"].as_i64().unwrap();
+        let (status, _) = send(
+            "/api/plugins/apply",
+            json!({
+                "instance_id":id,"expected_updated_at_ms":1
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, applied) = send(
+            "/api/plugins/apply",
+            json!({
+                "instance_id":id,"expected_updated_at_ms":revision
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(applied["plugin"]["pending"], false);
+        assert_eq!(applied["plugin"]["config"]["greeting"], "hello");
+        manager.shutdown().await.unwrap();
+    }
+
     #[test]
     fn management_tokens_cannot_be_empty_short_or_header_incompatible() {
         for token in [
@@ -361,5 +441,45 @@ mod tests {
             assert!(token_digest(token).is_err());
         }
         assert!(token_digest(TOKEN).is_ok());
+    }
+
+    #[tokio::test]
+    async fn stalled_bodies_time_out_and_release_all_request_slots() {
+        let app = app();
+        let (polled, mut signals) = tokio::sync::mpsc::channel(4);
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let polled = polled.clone();
+            let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+                let _ = polled.try_send(());
+                std::task::Poll::<Option<Result<axum::body::Bytes, std::io::Error>>>::Pending
+            }));
+            let request = Request::post("/api/plugins/config")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap();
+            requests.spawn(app.clone().oneshot(request));
+        }
+        for _ in 0..4 {
+            signals.recv().await.unwrap();
+        }
+        let get = || {
+            Request::get("/api/plugins")
+                .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(get()).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        while let Some(result) = requests.join_next().await {
+            assert_eq!(
+                result.unwrap().unwrap().status(),
+                StatusCode::REQUEST_TIMEOUT
+            );
+        }
+        assert_eq!(app.oneshot(get()).await.unwrap().status(), StatusCode::OK);
     }
 }
