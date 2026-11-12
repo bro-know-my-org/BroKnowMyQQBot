@@ -78,6 +78,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         info!(path = %path.display(), "loaded local secrets environment file");
     }
 
+    management::check_access(&config.management)?;
     let AdapterSet { adapters, qq_api } = build_adapters(&config, qq_credentials).await?;
     let plugin_db = config.plugins.database.clone();
     if let Some(parent) = plugin_db.parent() {
@@ -137,8 +138,14 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         onebot11_enabled = config.onebot11.enabled,
         "starting BroKnowMyQQBot adapters"
     );
-    let runtime_result =
-        supervise_runtime(runtime, config.management, observer, shutdown_timeout).await;
+    let runtime_result = supervise_runtime(
+        runtime,
+        config.management,
+        observer,
+        manager,
+        shutdown_timeout,
+    )
+    .await;
     if let Err(error) = plugins.shutdown().await {
         if runtime_result.is_ok() {
             return Err(error.into());
@@ -206,6 +213,7 @@ async fn supervise_runtime(
     runtime: Runtime,
     management_config: ManagementConfig,
     observer: RuntimeObserver,
+    manager: PluginManager,
     shutdown_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
@@ -213,6 +221,7 @@ async fn supervise_runtime(
     let management_run = management::serve(
         management_config,
         observer,
+        manager,
         shutdown_signal,
         shutdown_timeout,
     );

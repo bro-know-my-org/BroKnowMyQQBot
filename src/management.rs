@@ -1,4 +1,7 @@
-//! Loopback-only runtime health, metrics, and configuration-check server.
+//! Loopback-only runtime diagnostics and authenticated plugin management.
+
+mod plugins;
+mod settings;
 
 use std::{net::SocketAddr, sync::Arc, thread, time::Duration};
 
@@ -25,6 +28,7 @@ use tower::{
 use tracing::{info, warn};
 
 use crate::config::{BotConfig, ManagementConfig};
+use crate::plugin_management::PluginManager;
 
 const MAX_CONFIG_CHECK_BYTES: usize = 1024 * 1024;
 const MAX_CONCURRENT_CONFIG_CHECKS: usize = 4;
@@ -32,6 +36,10 @@ const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub(crate) enum ManagementError {
+    #[error(
+        "management requires BKMQB_MANAGEMENT_TOKEN with 32..=256 visible ASCII characters; set it in the environment or config/secrets.env"
+    )]
+    InvalidToken,
     #[error("management listen address `{0}` is invalid")]
     InvalidListen(String),
     #[error("failed to bind management listener at {listen}: {source}")]
@@ -64,6 +72,7 @@ struct ValidationJob {
 pub(crate) async fn serve(
     config: ManagementConfig,
     observer: RuntimeObserver,
+    manager: PluginManager,
     mut shutdown: ShutdownSignal,
     shutdown_timeout: Duration,
 ) -> Result<(), ManagementError> {
@@ -71,6 +80,7 @@ pub(crate) async fn serve(
         shutdown.cancelled().await;
         return Ok(());
     }
+    let token = access_token()?;
     let listen = config
         .listen
         .parse::<SocketAddr>()
@@ -79,7 +89,7 @@ pub(crate) async fn serve(
         .await
         .map_err(|source| ManagementError::Bind { listen, source })?;
     info!(listen = %listen, "management server listening");
-    let (app, validation_jobs) = router_parts(observer);
+    let (app, validation_jobs) = router_parts(observer, Some((manager, token)));
     let mut validation_supervisor = tokio::spawn(run_validation_workers(validation_jobs));
     let (serve_result, shutdown_deadline) = {
         let mut graceful_shutdown = shutdown.clone();
@@ -132,12 +142,28 @@ pub(crate) async fn serve(
 
 #[cfg(test)]
 fn router(observer: RuntimeObserver) -> Router {
-    let (router, validation_jobs) = router_parts(observer);
+    let (router, validation_jobs) = router_parts(observer, None);
     tokio::spawn(run_validation_workers(validation_jobs));
     router
 }
 
-fn router_parts(observer: RuntimeObserver) -> (Router, mpsc::Receiver<ValidationJob>) {
+pub(crate) fn check_access(config: &ManagementConfig) -> Result<(), ManagementError> {
+    if config.enabled {
+        access_token()?;
+    }
+    Ok(())
+}
+
+fn access_token() -> Result<[u8; 32], ManagementError> {
+    let token =
+        std::env::var("BKMQB_MANAGEMENT_TOKEN").map_err(|_| ManagementError::InvalidToken)?;
+    plugins::token_digest(&token)
+}
+
+fn router_parts(
+    observer: RuntimeObserver,
+    api: Option<(PluginManager, [u8; 32])>,
+) -> (Router, mpsc::Receiver<ValidationJob>) {
     let (validation_jobs, validation_receiver) = mpsc::channel(MAX_CONCURRENT_CONFIG_CHECKS);
     let router = Router::new()
         .route("/healthz", get(health))
@@ -158,6 +184,16 @@ fn router_parts(observer: RuntimeObserver) -> (Router, mpsc::Receiver<Validation
             validation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CONFIG_CHECKS)),
             validation_jobs,
         });
+    let router = if let Some((manager, token)) = api {
+        router
+            .merge(plugins::router(manager, token))
+            .merge(plugins::assets())
+    } else {
+        router
+    };
+    let router = router
+        .layer(DefaultBodyLimit::max(MAX_CONFIG_CHECK_BYTES))
+        .layer(axum::middleware::from_fn(plugins::security_headers));
     (router, validation_receiver)
 }
 
