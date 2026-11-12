@@ -12,6 +12,22 @@ permissions:
   contents: read
 
 jobs:
+  webui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - run: npm ci --prefix webui
+      - run: npm test --prefix webui
+      - run: npm run build --prefix webui
+      - run: git diff --exit-code -- src/webui
+      - run: test -z "$(git ls-files --others --exclude-standard -- src/webui)"
+
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 30

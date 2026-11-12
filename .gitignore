@@ -14,6 +14,9 @@
 !/src/
 !/test-data/
 !/test-support/
+!/webui/
+/webui/node_modules/
+/webui/*.tsbuildinfo
 
 # Build artifacts.
 /target/
