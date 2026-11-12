@@ -16,6 +16,7 @@ use crate::{
     browser::InstalledBrowserExecutor,
     config::{self, BotConfig, ManagementConfig, load_secret_environment},
     logging, management,
+    plugin_management::PluginManager,
     plugins::load_plugins,
     version,
 };
@@ -93,33 +94,27 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         plugins = plugins.with_adapter(adapter.clone());
     }
     let installation_file = config.plugins.installations.clone();
-    if let Err(error) =
-        load_plugins(&mut plugins, &plugin_store, installation_file.as_deref()).await
-    {
-        if let Err(shutdown_error) = plugins.shutdown().await {
-            warn!(%shutdown_error, "plugin shutdown failed after plugin loading failure");
-        }
-        return Err(error);
-    }
-    if config.qq.enabled && config.qq.check_only {
-        let api = qq_api
-            .as_ref()
-            .ok_or("QQ preflight client is unavailable")?;
-        let gateway = match api.gateway().await {
-            Ok(gateway) => gateway,
+    let loaded_packages =
+        match load_plugins(&mut plugins, &plugin_store, installation_file.as_deref()).await {
+            Ok(loaded) => loaded,
             Err(error) => {
                 if let Err(shutdown_error) = plugins.shutdown().await {
-                    warn!(%shutdown_error, "plugin shutdown failed after Gateway preflight failure");
+                    warn!(%shutdown_error, "plugin shutdown failed after plugin loading failure");
                 }
-                return Err(Box::new(error));
+                return Err(error);
             }
         };
-        info!(gateway_url = %gateway.url, "QQ credentials, Gateway endpoint, and plugins are available");
-        plugins.shutdown().await?;
-        return Ok(());
+    if config.qq.enabled && config.qq.check_only {
+        return preflight(&plugins, qq_api.as_ref()).await;
     }
 
-    let plugins = Arc::new(plugins);
+    let manager = PluginManager::new(
+        plugins,
+        plugin_store,
+        loaded_packages.packages,
+        loaded_packages.file_instances,
+    );
+    let plugins = Arc::new(manager.clone());
     let observer = RuntimeObserver::new();
     let shutdown_timeout = Duration::from_secs(config.runtime.shutdown_timeout_seconds);
     let mut runtime_builder = RuntimeBuilder::new()
@@ -152,6 +147,25 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     }
     runtime_result?;
     info!("BroKnowMyQQBot stopped");
+    Ok(())
+}
+
+async fn preflight(
+    plugins: &StaticPluginHost,
+    qq_api: Option<&OpenApiClient>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let api = qq_api.ok_or("QQ preflight client is unavailable")?;
+    let gateway = match api.gateway().await {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            if let Err(shutdown_error) = plugins.shutdown().await {
+                warn!(%shutdown_error, "plugin shutdown failed after Gateway preflight failure");
+            }
+            return Err(Box::new(error));
+        }
+    };
+    info!(gateway_url = %gateway.url, "QQ credentials, Gateway endpoint, and plugins are available");
+    plugins.shutdown().await?;
     Ok(())
 }
 
