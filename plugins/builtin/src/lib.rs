@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use plugin_api::{
-    ActionCompleted, ActionStatus, Audience, CallerAuthority, CallerRole, CommandDeclaration,
-    Disposition, HandlerOutput, HostQueries, PluginCommand, PluginError, PluginEventEnvelope,
-    PluginId, PluginManifest, PluginMetadata, PluginPermissions, PluginRuntimeConfig,
-    ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin, StoragePermission,
-    SubcommandDeclaration, Subscription,
+    ActionCompleted, ActionStatus, Audience, CallerAuthority, CallerRole, CommandContext,
+    CommandDeclaration, Disposition, HandlerOutput, HostQueries, PluginCommand, PluginError,
+    PluginEventEnvelope, PluginId, PluginManifest, PluginMetadata, PluginPermissions,
+    PluginRuntimeConfig, ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin,
+    StoragePermission, SubcommandDeclaration, Subscription,
 };
 #[cfg(feature = "coverage-probes")]
 use plugin_api::{
@@ -18,6 +18,9 @@ use plugin_api::{
     BrowserViewport, BrowserWaitUntil, HttpPermission, HttpRequest, HttpResponse, MediaReply,
 };
 use serde_json::{Value, json};
+
+#[cfg(test)]
+mod test_queries;
 
 mod basic;
 mod business;
@@ -46,7 +49,7 @@ fn message_plugin_manifest(
         id: PluginId::new(id).expect("built-in plugin ID must be valid"),
         metadata: PluginMetadata::single_locale("en", name, format!("Built-in {name} plugin")),
         version: "0.1.0".to_owned(),
-        protocol: ">=1.0,<2.0".to_owned(),
+        protocol: ">=1.4,<2.0".to_owned(),
         state_version: 1,
         entry: "component.wasm".to_owned(),
         runtime: PluginRuntimeConfig::default(),
@@ -113,30 +116,21 @@ fn command_description(command: &str) -> String {
         "echo" => "原样回显".to_owned(),
         "help" => "查看本帮助".to_owned(),
         "remind" => "创建提醒".to_owned(),
-        _ => format!("Run /{command}"),
+        _ => format!("Run {command}"),
     }
 }
 
-fn message_text(event: &PluginEventEnvelope) -> Option<&str> {
-    event.payload.pointer("/data/text").and_then(Value::as_str)
+fn is_command(command: Option<&CommandContext>, name: &str) -> bool {
+    command_tail(command, name).is_some_and(|arguments| arguments.trim().is_empty())
 }
 
-fn is_command(command: &'static str) -> impl FnOnce(&str) -> bool {
-    move |content| content.trim() == command
+fn command_argument<'a>(command: Option<&'a CommandContext>, name: &str) -> Option<&'a str> {
+    command_tail(command, name).filter(|argument| !argument.trim().is_empty())
 }
 
-fn command_argument<'a>(content: &'a str, command: &str) -> Option<&'a str> {
-    let argument = command_tail(content, command)?;
-    (!argument.is_empty()).then_some(argument)
-}
-
-fn command_tail<'a>(content: &'a str, command: &str) -> Option<&'a str> {
-    let content = content.trim_start();
-    let tail = content.strip_prefix(command)?;
-    tail.chars()
-        .next()
-        .is_none_or(char::is_whitespace)
-        .then(|| tail.trim())
+fn command_tail<'a>(command: Option<&'a CommandContext>, name: &str) -> Option<&'a str> {
+    let command = command?;
+    (command.name == name).then_some(command.arguments.as_str())
 }
 
 fn ignored() -> HandlerOutput {
@@ -188,6 +182,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_queries::TestPlugin as _;
     use std::collections::{BTreeMap, BTreeSet};
 
     use plugin_api::{
@@ -299,7 +294,7 @@ mod tests {
     #[tokio::test]
     async fn ping_returns_reply_command() {
         let output = PingPlugin::default()
-            .on_event(
+            .on_test_event(
                 &event("/ping"),
                 &Queries {
                     state: BTreeMap::new(),
@@ -312,13 +307,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_bundled_command_follows_multicharacter_and_unicode_prefixes() {
+        let queries = Queries {
+            state: BTreeMap::new(),
+            capabilities: BTreeSet::new(),
+        };
+        let cases: Vec<(Box<dyn StaticPlugin>, &str)> = vec![
+            (Box::new(PingPlugin::default()), "ping"),
+            (Box::new(HelpPlugin::default()), "help"),
+            (Box::new(CounterPlugin::default()), "count"),
+            (Box::new(EchoPlugin::default()), "echo 第一行\n 第二行\n "),
+            (Box::new(AdminPlugin::default()), "admin invalid"),
+            (Box::new(ReminderPlugin::default()), "remind"),
+        ];
+        #[cfg(feature = "coverage-probes")]
+        let queries = AuthorizedQueries(&queries);
+        #[cfg(feature = "coverage-probes")]
+        let cases = cases.into_iter().chain([
+            (
+                Box::new(DevToolsPlugin::default()) as Box<dyn StaticPlugin>,
+                "whoami",
+            ),
+            (Box::new(HttpProbePlugin::default()), "http-probe"),
+            (
+                Box::new(BrowserProbePlugin::default()),
+                "screenshot example.com",
+            ),
+            (Box::new(QqExtensionProbePlugin::default()), "qq-extension"),
+            (
+                Box::new(SchedulerProbePlugin::default()),
+                "schedule invalid",
+            ),
+            (
+                Box::new(ActiveSendProbePlugin::default()),
+                "active-send hello",
+            ),
+        ]);
+        for (plugin, command) in cases {
+            for prefix in ["!!", "机器人："] {
+                let input = event(&format!("{prefix}{command}"));
+                let snapshot =
+                    crate::test_queries::CommandQueries::with_prefix(&input, &queries, prefix);
+                let output = plugin.on_event(&input, &snapshot).await.unwrap();
+                assert!(
+                    !output.commands.is_empty(),
+                    "{} ignored {prefix}{command}",
+                    plugin.manifest().id
+                );
+                let old = event(&format!("/{command}"));
+                let snapshot =
+                    crate::test_queries::CommandQueries::with_prefix(&old, &queries, prefix);
+                let output = plugin.on_event(&old, &snapshot).await.unwrap();
+                assert!(
+                    output.commands.is_empty(),
+                    "{} accepted old prefix",
+                    plugin.manifest().id
+                );
+                assert!(output.state_ops.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn help_lists_the_supplied_manifest_commands() {
         let plugin = HelpPlugin::with_commands([
             super::command_declaration("ping", "Ping command"),
             super::command_declaration("http-probe", "HTTP command"),
         ]);
         let output = plugin
-            .on_event(
+            .on_test_event(
                 &event("/help"),
                 &Queries {
                     state: BTreeMap::new(),
@@ -406,7 +463,7 @@ mod tests {
         let plugin = HelpPlugin::with_commands([admin, diagnostic, hidden]);
 
         let output = plugin
-            .on_event(
+            .on_test_event(
                 &event("/help"),
                 &AuthorityQueries {
                     role: CallerRole::User,
@@ -427,7 +484,7 @@ mod tests {
         assert!(!content.contains("/p "));
 
         let administrator = plugin
-            .on_event(
+            .on_test_event(
                 &event("/help"),
                 &AuthorityQueries {
                     role: CallerRole::Admin,
@@ -451,7 +508,7 @@ mod tests {
         );
 
         let owner = plugin
-            .on_event(
+            .on_test_event(
                 &event("/help"),
                 &AuthorityQueries {
                     role: CallerRole::Owner,
@@ -466,7 +523,7 @@ mod tests {
         assert!(!owner_content.contains("需要更高权限"));
 
         let malicious_platform = plugin
-            .on_event(
+            .on_test_event(
                 &event("/help"),
                 &AuthorityQueries {
                     role: CallerRole::User,
@@ -518,7 +575,7 @@ mod tests {
             subcommands: Vec::new(),
         }]);
         let output = plugin
-            .on_event(
+            .on_test_event(
                 &event("/help"),
                 &Queries {
                     state: BTreeMap::new(),
@@ -541,7 +598,7 @@ mod tests {
             super::command_declaration(&"x".repeat(10_000), "Long command"),
         ]);
         let output = plugin
-            .on_event(
+            .on_test_event(
                 &event("/help"),
                 &Queries {
                     state: BTreeMap::new(),
@@ -565,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn counter_uses_revision_for_state_update() {
         let output = CounterPlugin::default()
-            .on_event(
+            .on_test_event(
                 &event("/count"),
                 &Queries {
                     state: BTreeMap::from([(
@@ -590,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn echo_uses_passive_reply() {
         let output = EchoPlugin::default()
-            .on_event(
+            .on_test_event(
                 &PluginEventEnvelope {
                     payload: json!({
                         "type":"message",
@@ -616,7 +673,7 @@ mod tests {
     #[cfg(feature = "coverage-probes")]
     async fn active_send_probe_confirms_then_uses_explicit_target() {
         let output = ActiveSendProbePlugin::default()
-            .on_event(
+            .on_test_event(
                 &PluginEventEnvelope {
                     payload: json!({
                         "type":"message",
@@ -644,7 +701,7 @@ mod tests {
     #[cfg(feature = "coverage-probes")]
     async fn http_probe_emits_only_host_http_command() {
         let output = HttpProbePlugin::default()
-            .on_event(
+            .on_test_event(
                 &event("/http-probe"),
                 &AuthorizedQueries(&Queries {
                     state: BTreeMap::new(),
@@ -662,7 +719,7 @@ mod tests {
     #[cfg(feature = "coverage-probes")]
     async fn scheduler_probe_emits_persistent_schedule_command() {
         let output = SchedulerProbePlugin::default()
-            .on_event(
+            .on_test_event(
                 &PluginEventEnvelope {
                     payload: json!({
                         "type":"message",
@@ -688,12 +745,12 @@ mod tests {
         assert_eq!(output.state_ops.len(), 1);
 
         let cancel = SchedulerProbePlugin::default()
-            .on_event(
+            .on_test_event(
                 &PluginEventEnvelope {
                     payload: json!({
                         "type":"message",
                         "data":{
-                            "text":"/schedule-cancel probe-6576656e742d31",
+                            "text":"/schedule-cancel  probe-6576656e742d31  ",
                             "target":{"scope":"group","group_id":"group-id"},
                             "sender":{"id":"user-id"}
                         }
@@ -736,7 +793,7 @@ mod tests {
                 error_message: None,
             };
             let output = SchedulerProbePlugin::default()
-                .on_event(
+                .on_test_event(
                     &PluginEventEnvelope {
                         event_type: "action.completed".to_owned(),
                         payload: serde_json::to_value(completion).unwrap(),
@@ -801,7 +858,7 @@ mod tests {
             role: CallerRole::Owner,
         };
         let output = AdminPlugin::default()
-            .on_event(&event("/admin grant user-2"), &queries)
+            .on_test_event(&event("/admin grant user-2"), &queries)
             .await
             .unwrap();
         assert_eq!(
@@ -817,7 +874,7 @@ mod tests {
             role: CallerRole::Admin,
         };
         let listed = AdminPlugin::default()
-            .on_event(&event("/admin list"), &administrator_queries)
+            .on_test_event(&event("/admin list"), &administrator_queries)
             .await
             .unwrap();
         assert!(
@@ -827,7 +884,7 @@ mod tests {
                 .contains("owner-id")
         );
         let administrator_grant = AdminPlugin::default()
-            .on_event(&event("/admin grant user-3"), &administrator_queries)
+            .on_test_event(&event("/admin grant user-3"), &administrator_queries)
             .await
             .unwrap();
         assert_eq!(
@@ -841,7 +898,7 @@ mod tests {
             .unwrap()
             .remove("sender");
         let anonymous = AdminPlugin::default()
-            .on_event(
+            .on_test_event(
                 &anonymous_whoami,
                 &AdminQueries {
                     owners: json!(["owner-id"]),
@@ -855,7 +912,7 @@ mod tests {
         assert_eq!(anonymous.commands[0].payload["content"], "ordinary user");
 
         let denied = AdminPlugin::default()
-            .on_event(
+            .on_test_event(
                 &PluginEventEnvelope {
                     payload: json!({
                         "type":"message",
@@ -887,7 +944,7 @@ mod tests {
             "/admin revoke user-3 extra",
         ] {
             let output = AdminPlugin::default()
-                .on_event(&event(malformed), &administrator_queries)
+                .on_test_event(&event(malformed), &administrator_queries)
                 .await
                 .unwrap();
             assert_eq!(
@@ -901,8 +958,8 @@ mod tests {
     #[tokio::test]
     async fn reminder_plugin_creates_owned_persistent_schedule() {
         let output = ReminderPlugin::default()
-            .on_event(
-                &event("/remind 30 hydrate"),
+            .on_test_event(
+                &event("/remind  30  hydrate  "),
                 &Queries {
                     state: BTreeMap::new(),
                     capabilities: BTreeSet::new(),
@@ -919,12 +976,48 @@ mod tests {
             "group-id"
         );
 
+        let state = output
+            .state_ops
+            .iter()
+            .filter_map(|operation| match operation {
+                StateOp::Put { key, value, .. } => Some((
+                    key.clone(),
+                    StateValue {
+                        value: value.clone(),
+                        revision: 1,
+                    },
+                )),
+                StateOp::Delete { .. } => None,
+            })
+            .collect();
+        let queries = Queries {
+            state,
+            capabilities: BTreeSet::new(),
+        };
+        let listed = ReminderPlugin::default()
+            .on_test_event(&event("/reminders  "), &queries)
+            .await
+            .unwrap();
+        assert!(
+            listed.commands[0].payload["content"]
+                .as_str()
+                .unwrap()
+                .contains("hydrate")
+        );
+        let task_id = output.commands[0].payload["task_id"].as_str().unwrap();
+        let cancelled = ReminderPlugin::default()
+            .on_test_event(&event(&format!("/remind-cancel  {task_id}  ")), &queries)
+            .await
+            .unwrap();
+        assert_eq!(cancelled.commands[0].kind, "schedule.cancel");
+        assert_eq!(cancelled.commands[0].payload["task_id"], task_id);
+
         let long_event = PluginEventEnvelope {
             event_id: "x".repeat(512),
             ..event("/remind 30 bounded")
         };
         let bounded = ReminderPlugin::default()
-            .on_event(
+            .on_test_event(
                 &long_event,
                 &Queries {
                     state: BTreeMap::new(),
@@ -950,7 +1043,7 @@ mod tests {
             error_message: None,
         };
         let retained = ReminderPlugin::default()
-            .on_event(
+            .on_test_event(
                 &PluginEventEnvelope {
                     event_type: "action.completed".to_owned(),
                     payload: serde_json::to_value(unknown).unwrap(),

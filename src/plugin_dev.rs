@@ -281,9 +281,12 @@ fn create_project_with_revision(
         "Description",
         "A BroKnowMyQQBot plugin",
     )?;
-    let command = value_or_prompt(options.command, interactive, "Command", "hello")?
-        .trim_start_matches('/')
-        .to_owned();
+    let command = value_or_prompt(
+        options.command,
+        interactive,
+        "Command name (without prefix)",
+        "hello",
+    )?;
 
     validate_generated_values(&plugin_id, &class_name, &locale, &command)?;
     if path.exists() {
@@ -3109,7 +3112,7 @@ fn source_template(class_name: &str, command: &str) -> String {
 
 fn readme_template(display_name: &str, command: &str) -> String {
     format!(
-        "# {display_name}\n\nGenerated BPP {} plugin.\n\n```bash\nbkmqb plugin check\nbkmqb plugin build\nbkmqb plugin inspect target/bkmqb/*.bkm-plugin\nbkmqb plugin install target/bkmqb/*.bkm-plugin\nbkmqb plugin publish\n```\n\nThe starter command is `/{command}`.\n",
+        "# {display_name}\n\nGenerated BPP {} plugin.\n\n```bash\nbkmqb plugin check\nbkmqb plugin build\nbkmqb plugin inspect target/bkmqb/*.bkm-plugin\nbkmqb plugin install target/bkmqb/*.bkm-plugin\nbkmqb plugin publish\n```\n\nThe starter command is `<configured-prefix>{command}`. The Bot configures the prefix globally.\n",
         plugin_api::BPP_VERSION
     )
 }

@@ -2,7 +2,7 @@ use super::{
     ActionCompleted, ActionStatus, BTreeMap, BTreeSet, Disposition, HandlerOutput, HostQueries,
     HttpPermission, HttpRequest, HttpResponse, PluginCommand, PluginError, PluginEventEnvelope,
     PluginManifest, StateOp, StaticPlugin, Subscription, Value, async_trait, diagnostic_authorized,
-    diagnostic_plugin_manifest, ignored, is_command, json, message_text, reply, restricted,
+    diagnostic_plugin_manifest, ignored, is_command, json, reply, restricted,
 };
 
 #[derive(Debug)]
@@ -48,7 +48,7 @@ impl StaticPlugin for HttpProbePlugin {
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
         if event.event_type == "message.created"
-            && message_text(event).is_some_and(is_command("/http-probe"))
+            && is_command(queries.command_context().as_ref(), "http-probe")
         {
             if !diagnostic_authorized(queries) {
                 return Ok(restricted(event));

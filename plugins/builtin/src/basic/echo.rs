@@ -1,6 +1,6 @@
 use super::{
     HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin,
-    async_trait, command_argument, ignored, message_plugin_manifest, message_text, reply,
+    async_trait, command_argument, ignored, message_plugin_manifest, reply,
 };
 
 #[derive(Debug)]
@@ -31,12 +31,10 @@ impl StaticPlugin for EchoPlugin {
     async fn on_event(
         &self,
         event: &PluginEventEnvelope,
-        _queries: &dyn HostQueries,
+        queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
-        let Some(text) = message_text(event) else {
-            return Ok(ignored());
-        };
-        let Some(content) = command_argument(text, "/echo") else {
+        let command = queries.command_context();
+        let Some(content) = command_argument(command.as_ref(), "echo") else {
             return Ok(ignored());
         };
         Ok(reply(event, content, Vec::new()))

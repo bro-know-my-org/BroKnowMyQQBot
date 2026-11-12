@@ -446,6 +446,10 @@ mod tests {
     }
 
     impl HostQueries for HelpQueries {
+        fn command_context(&self) -> Option<plugin_api::CommandContext> {
+            plugin_api::CommandContext::parse("/", "/help")
+        }
+
         fn config_get(&self, _key: &str) -> Option<&Value> {
             None
         }

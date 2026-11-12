@@ -1,7 +1,7 @@
 use super::super::{
     Audience, BTreeMap, CallerRole, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope,
     PluginManifest, StateOp, StaticPlugin, SubcommandDeclaration, Value, async_trait, command_tail,
-    hex_bytes, ignored, json, message_plugin_manifest, message_text, reply,
+    hex_bytes, ignored, json, message_plugin_manifest, reply,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -86,10 +86,8 @@ impl StaticPlugin for AdminPlugin {
         event: &PluginEventEnvelope,
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
-        let Some(text) = message_text(event) else {
-            return Ok(ignored());
-        };
-        let Some(arguments) = command_tail(text, "/admin") else {
+        let command = queries.command_context();
+        let Some(arguments) = command_tail(command.as_ref(), "admin") else {
             return Ok(ignored());
         };
         let mut parts = arguments.split_whitespace();
@@ -97,7 +95,7 @@ impl StaticPlugin for AdminPlugin {
         let subject = parts.next();
         let extra = parts.next();
         if extra.is_some() || subject.is_some_and(|value| !valid_identity(value)) {
-            return Ok(usage(event));
+            return Ok(usage(event, queries));
         }
         let authority = queries.caller_authority();
         match (operation, subject) {
@@ -135,7 +133,7 @@ impl StaticPlugin for AdminPlugin {
                     _ => unreachable!("operation pattern only accepts grant or revoke"),
                 }
             }
-            _ => Ok(usage(event)),
+            _ => Ok(usage(event, queries)),
         }
     }
 }
@@ -306,10 +304,13 @@ fn valid_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 124 && !value.chars().any(char::is_control)
 }
 
-fn usage(event: &PluginEventEnvelope) -> HandlerOutput {
+fn usage(event: &PluginEventEnvelope, queries: &dyn HostQueries) -> HandlerOutput {
     reply(
         event,
-        "usage: /admin whoami|list|grant <sender-id>|revoke <sender-id>",
+        &format!(
+            "usage: {}admin whoami|list|grant <sender-id>|revoke <sender-id>",
+            queries.command_prefix()
+        ),
         Vec::new(),
     )
 }

@@ -1,7 +1,7 @@
 use super::{
     HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin,
     Value, async_trait, diagnostic_authorized, diagnostic_plugin_manifest, ignored, is_command,
-    message_text, reply, restricted,
+    reply, restricted,
 };
 
 #[derive(Debug)]
@@ -37,7 +37,7 @@ impl StaticPlugin for QqExtensionProbePlugin {
         event: &PluginEventEnvelope,
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
-        if !message_text(event).is_some_and(is_command("/qq-extension")) {
+        if !is_command(queries.command_context().as_ref(), "qq-extension") {
             return Ok(ignored());
         }
         if !diagnostic_authorized(queries) {

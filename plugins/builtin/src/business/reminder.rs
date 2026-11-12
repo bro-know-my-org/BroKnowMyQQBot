@@ -2,8 +2,7 @@ use super::super::{
     ActionCompleted, ActionStatus, Audience, BTreeSet, CommandDeclaration, Disposition,
     HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest, ScheduleCancel,
     ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin, Subscription, Value, async_trait,
-    command_tail, hex_bytes, ignored, json, message_plugin_manifest, message_text, plugin_command,
-    reply,
+    command_tail, hex_bytes, ignored, json, message_plugin_manifest, plugin_command, reply,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -79,17 +78,17 @@ fn reminder_message(
     event: &PluginEventEnvelope,
     queries: &dyn HostQueries,
 ) -> Result<HandlerOutput, PluginError> {
-    let Some(text) = message_text(event) else {
-        return Ok(ignored());
-    };
-    if let Some(arguments) = command_tail(text, "/remind") {
+    let command = queries.command_context();
+    if let Some(arguments) = command_tail(command.as_ref(), "remind") {
         return create_reminder(event, queries, arguments);
     }
-    if command_tail(text, "/reminders") == Some("") {
+    if command_tail(command.as_ref(), "reminders")
+        .is_some_and(|arguments| arguments.trim().is_empty())
+    {
         return list_reminders(event, queries);
     }
-    if let Some(task_id) = command_tail(text, "/remind-cancel") {
-        return cancel_reminder(event, queries, task_id);
+    if let Some(task_id) = command_tail(command.as_ref(), "remind-cancel") {
+        return cancel_reminder(event, queries, task_id.trim());
     }
     Ok(ignored())
 }
@@ -99,15 +98,15 @@ fn create_reminder(
     queries: &dyn HostQueries,
     arguments: &str,
 ) -> Result<HandlerOutput, PluginError> {
-    let Some((delay, content)) = arguments.split_once(char::is_whitespace) else {
-        return Ok(reminder_usage(event));
+    let Some((delay, content)) = arguments.trim_start().split_once(char::is_whitespace) else {
+        return Ok(reminder_usage(event, queries));
     };
     let Ok(delay_seconds @ 1..=MAX_DELAY_SECONDS) = delay.parse::<i64>() else {
-        return Ok(reminder_usage(event));
+        return Ok(reminder_usage(event, queries));
     };
     let content = content.trim();
     if content.is_empty() || content.chars().count() > MAX_CONTENT_CHARS {
-        return Ok(reminder_usage(event));
+        return Ok(reminder_usage(event, queries));
     }
     let owner = task_owner(event)?;
     let task_id = reminder_task_id(&event.event_id);
@@ -213,7 +212,7 @@ fn cancel_reminder(
     task_id: &str,
 ) -> Result<HandlerOutput, PluginError> {
     if task_id.is_empty() || task_id.len() > 256 {
-        return Ok(reminder_usage(event));
+        return Ok(reminder_usage(event, queries));
     }
     let key = task_key(task_id);
     let Some(state) = queries.state_get(&key) else {
@@ -478,10 +477,13 @@ fn command(name: &str, description: &str) -> CommandDeclaration {
     }
 }
 
-fn reminder_usage(event: &PluginEventEnvelope) -> HandlerOutput {
+fn reminder_usage(event: &PluginEventEnvelope, queries: &dyn HostQueries) -> HandlerOutput {
     reply(
         event,
-        "usage: /remind <seconds: 1..31536000> <text>; /reminders; /remind-cancel <task-id>",
+        &format!(
+            "usage: {prefix}remind <seconds: 1..31536000> <text>; {prefix}reminders; {prefix}remind-cancel <task-id>",
+            prefix = queries.command_prefix()
+        ),
         Vec::new(),
     )
 }

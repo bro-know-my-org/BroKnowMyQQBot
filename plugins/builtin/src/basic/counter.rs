@@ -1,6 +1,6 @@
 use super::{
     Disposition, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest,
-    StateOp, StaticPlugin, async_trait, is_command, message_plugin_manifest, message_text, reply,
+    StateOp, StaticPlugin, async_trait, is_command, message_plugin_manifest, reply,
 };
 
 const RECENT_EVENT_LIMIT: usize = 256;
@@ -36,7 +36,7 @@ impl StaticPlugin for CounterPlugin {
         event: &PluginEventEnvelope,
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
-        if !message_text(event).is_some_and(is_command("/count")) {
+        if !is_command(queries.command_context().as_ref(), "count") {
             return Ok(HandlerOutput {
                 disposition: Disposition::Ignore,
                 ..HandlerOutput::default()

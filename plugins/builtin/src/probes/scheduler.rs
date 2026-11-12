@@ -3,7 +3,7 @@ use super::{
     HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest, ScheduleCancel,
     ScheduleCreate, ScheduleTriggered, StaticPlugin, Subscription, Value, async_trait,
     command_argument, command_tail, diagnostic_authorized, diagnostic_plugin_manifest, hex_bytes,
-    ignored, json, message_text, plugin_command, reply, restricted,
+    ignored, json, plugin_command, reply, restricted,
 };
 
 const MAX_PENDING_TASKS: usize = 128;
@@ -202,15 +202,13 @@ fn scheduler_message(
     event: &PluginEventEnvelope,
     queries: &dyn HostQueries,
 ) -> Result<HandlerOutput, PluginError> {
-    let Some(text) = message_text(event) else {
-        return Ok(ignored());
-    };
-    let diagnostic_command = command_tail(text, "/schedule").is_some()
-        || command_argument(text, "/schedule-cancel").is_some();
+    let command = queries.command_context();
+    let diagnostic_command = command_tail(command.as_ref(), "schedule").is_some()
+        || command_argument(command.as_ref(), "schedule-cancel").is_some();
     if diagnostic_command && !diagnostic_authorized(queries) {
         return Ok(restricted(event));
     }
-    if let Some(arguments) = command_tail(text, "/schedule") {
+    if let Some(arguments) = command_tail(command.as_ref(), "schedule") {
         if queries.state_scan("tasks/", MAX_PENDING_TASKS + 1).len() >= MAX_PENDING_TASKS {
             return Ok(reply(
                 event,
@@ -223,9 +221,9 @@ fn scheduler_message(
             (None, None) => 5,
             (Some(value), None) => match value.parse::<i64>() {
                 Ok(value @ 1..=86_400) => value,
-                _ => return Ok(schedule_usage(event)),
+                _ => return Ok(schedule_usage(event, queries)),
             },
-            _ => return Ok(schedule_usage(event)),
+            _ => return Ok(schedule_usage(event, queries)),
         };
         let task_id = format!("probe-{}", hex_bytes(event.event_id.as_bytes()));
         let create = ScheduleCreate {
@@ -251,7 +249,8 @@ fn scheduler_message(
             diagnostics: Vec::new(),
         });
     }
-    if let Some(task_id) = command_argument(text, "/schedule-cancel") {
+    if let Some(task_id) = command_argument(command.as_ref(), "schedule-cancel") {
+        let task_id = task_id.trim();
         let key = task_state_key(task_id);
         let Some(state) = queries.state_get(&key) else {
             return Ok(reply(
@@ -306,10 +305,13 @@ fn task_owner(event: &PluginEventEnvelope) -> Result<Value, PluginError> {
     Ok(json!({"sender": sender, "target": target}))
 }
 
-fn schedule_usage(event: &PluginEventEnvelope) -> HandlerOutput {
+fn schedule_usage(event: &PluginEventEnvelope, queries: &dyn HostQueries) -> HandlerOutput {
     reply(
         event,
-        "usage: /schedule [delay-seconds: 1..86400]",
+        &format!(
+            "usage: {}schedule [delay-seconds: 1..86400]",
+            queries.command_prefix()
+        ),
         Vec::new(),
     )
 }

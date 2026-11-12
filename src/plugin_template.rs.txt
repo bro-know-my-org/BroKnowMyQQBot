@@ -41,10 +41,11 @@ impl LifecycleGuest for __CLASS_NAME__ {
 
 impl HandlerGuest for __CLASS_NAME__ {
     fn on_event(event: EventEnvelope) -> Result<HandlerOutput, PluginError> {
-        let EventPayload::MessageCreated(message) = event.payload else {
+        let EventPayload::MessageCreated(_) = event.payload else {
             return Ok(ignored());
         };
-        if message.text.trim() != "/__COMMAND__" {
+        if !bkm::plugin::queries::command_context().is_some_and(|command|
+            command.name == "__COMMAND__" && command.arguments.trim().is_empty()) {
             return Ok(ignored());
         }
         Ok(HandlerOutput {

@@ -1,6 +1,6 @@
 use super::{
     Disposition, HandlerOutput, HostQueries, PluginError, PluginEventEnvelope, PluginManifest,
-    StaticPlugin, async_trait, is_command, message_plugin_manifest, message_text, reply,
+    StaticPlugin, async_trait, is_command, message_plugin_manifest, reply,
 };
 
 #[derive(Debug)]
@@ -31,9 +31,9 @@ impl StaticPlugin for PingPlugin {
     async fn on_event(
         &self,
         event: &PluginEventEnvelope,
-        _queries: &dyn HostQueries,
+        queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
-        if message_text(event).is_some_and(is_command("/ping")) {
+        if is_command(queries.command_context().as_ref(), "ping") {
             return Ok(reply(event, "pong", Vec::new()));
         }
         Ok(HandlerOutput {

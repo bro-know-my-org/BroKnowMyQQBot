@@ -7,8 +7,7 @@ use super::{
     HttpRequest, HttpResponse, MediaReply, PluginCommand, PluginError, PluginEventEnvelope,
     PluginManifest, ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StaticPlugin,
     Subscription, Value, async_trait, command_argument, command_declaration, command_tail,
-    diagnostic_plugin_manifest, hex_bytes, ignored, is_command, json, message_text, plugin_command,
-    reply,
+    diagnostic_plugin_manifest, hex_bytes, ignored, is_command, json, plugin_command, reply,
 };
 
 fn diagnostic_authorized(queries: &dyn HostQueries) -> bool {
@@ -41,6 +40,7 @@ pub use scheduler::SchedulerProbePlugin;
 
 #[cfg(test)]
 mod authorization_tests {
+    use crate::test_queries::TestPlugin as _;
     use plugin_api::{CallerAuthority, ExtensionPayload, StateValue};
 
     use super::*;
@@ -149,7 +149,7 @@ mod authorization_tests {
         ];
         for (plugin, command) in cases {
             let output = plugin
-                .on_event(&event(command), &OrdinaryQueries::default())
+                .on_test_event(&event(command), &OrdinaryQueries::default())
                 .await
                 .unwrap();
             assert_eq!(output.commands.len(), 1, "unexpected output for {command}");
@@ -166,7 +166,7 @@ mod authorization_tests {
     #[tokio::test]
     async fn privileged_roles_from_other_platforms_cannot_trigger_diagnostics() {
         let output = HttpProbePlugin::default()
-            .on_event(
+            .on_test_event(
                 &event("/http-probe"),
                 &OrdinaryQueries {
                     capabilities: BTreeSet::new(),

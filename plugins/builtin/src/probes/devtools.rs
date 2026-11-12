@@ -4,7 +4,7 @@ use super::{
     ActionCompleted, ActionStatus, Audience, BTreeSet, Disposition, HandlerOutput, HostQueries,
     PluginCommand, PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin, Subscription,
     Value, async_trait, command_argument, command_declaration, diagnostic_authorized,
-    diagnostic_plugin_manifest, ignored, is_command, json, message_text, reply, restricted,
+    diagnostic_plugin_manifest, ignored, is_command, json, reply, restricted,
 };
 use std::collections::BTreeMap;
 
@@ -107,22 +107,21 @@ impl StaticPlugin for DevToolsPlugin {
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
         if event.event_type == "action.completed" {
-            return handle_action_completed(event);
+            return handle_action_completed(event, &queries.command_prefix());
         }
-        let Some(text) = message_text(event) else {
-            return Ok(ignored());
-        };
-        if is_command("/whoami")(text) {
+        let command = queries.command_context();
+        if is_command(command.as_ref(), "whoami") {
             return if diagnostic_authorized(queries) {
                 Ok(whoami(event))
             } else {
                 Ok(restricted(event))
             };
         }
-        let view = if is_command("/api-permissions")(text) {
+        let view = if is_command(command.as_ref(), "api-permissions") {
             Some(PermissionView::Summary)
         } else {
-            match command_argument(text, "/api-permissions") {
+            match command_argument(command.as_ref(), "api-permissions").map(str::trim) {
+                Some("") => Some(PermissionView::Summary),
                 Some("channels") => Some(PermissionView::Channels),
                 Some("all") => Some(PermissionView::All),
                 Some(_) => None,
@@ -135,14 +134,20 @@ impl StaticPlugin for DevToolsPlugin {
         let Some(view) = view else {
             return Ok(reply(
                 event,
-                "Usage: /api-permissions [channels|all]",
+                &format!(
+                    "Usage: {}api-permissions [channels|all]",
+                    queries.command_prefix()
+                ),
                 Vec::new(),
             ));
         };
         let Some(guild_id) = qq_guild_id(event)? else {
             return Ok(reply(
                 event,
-                "QQ guild context is unavailable; run /api-permissions in a QQ channel",
+                &format!(
+                    "QQ guild context is unavailable; run {}api-permissions in a QQ channel",
+                    queries.command_prefix()
+                ),
                 Vec::new(),
             ));
         };
@@ -181,7 +186,10 @@ fn whoami(event: &PluginEventEnvelope) -> HandlerOutput {
     )
 }
 
-fn handle_action_completed(event: &PluginEventEnvelope) -> Result<HandlerOutput, PluginError> {
+fn handle_action_completed(
+    event: &PluginEventEnvelope,
+    prefix: &str,
+) -> Result<HandlerOutput, PluginError> {
     let completion: ActionCompleted = serde_json::from_value(event.payload.clone())
         .map_err(|error| PluginError::Permanent(error.to_string()))?;
     if completion.kind != API_PERMISSIONS_ACTION {
@@ -196,7 +204,7 @@ fn handle_action_completed(event: &PluginEventEnvelope) -> Result<HandlerOutput,
             .as_ref()
             .ok_or_else(|| PluginError::Permanent("API permission result is missing".to_owned()))?;
         match view {
-            PermissionView::Summary => format_api_permission_summary(result)?,
+            PermissionView::Summary => format_api_permission_summary(result, prefix)?,
             PermissionView::Channels => format_channel_permissions(result)?,
             PermissionView::All => format_all_api_permissions(result)?,
         }
@@ -248,7 +256,7 @@ fn api_permission_entries(result: &Value) -> Result<Vec<PermissionEntry<'_>>, Pl
     Ok(entries)
 }
 
-fn format_api_permission_summary(result: &Value) -> Result<String, PluginError> {
+fn format_api_permission_summary(result: &Value, prefix: &str) -> Result<String, PluginError> {
     let entries = api_permission_entries(result)?;
     let mut status_counts = BTreeMap::<i64, usize>::new();
     for entry in &entries {
@@ -271,7 +279,7 @@ fn format_api_permission_summary(result: &Value) -> Result<String, PluginError> 
         |entry| format_permission_entry(entry),
     );
     Ok(format!(
-        "API permissions: {} total\nauth_status: {counts}\ncreate channel:\n{create_channel_line}\nUse /api-permissions channels for Channel CRUD; /api-permissions all for the full list.",
+        "API permissions: {} total\nauth_status: {counts}\ncreate channel:\n{create_channel_line}\nUse {prefix}api-permissions channels for Channel CRUD; {prefix}api-permissions all for the full list.",
         entries.len()
     ))
 }
@@ -379,6 +387,7 @@ fn qq_guild_id(event: &PluginEventEnvelope) -> Result<Option<String>, PluginErro
 
 #[cfg(test)]
 mod tests {
+    use crate::test_queries::TestPlugin as _;
     use std::collections::BTreeSet;
 
     use plugin_api::{
@@ -463,7 +472,7 @@ mod tests {
     async fn whoami_reports_sender_adapter_and_target_for_admin_and_owner() {
         for role in [CallerRole::Admin, CallerRole::Owner] {
             let output = DevToolsPlugin::default()
-                .on_event(&event("/whoami"), &Queries { role, ..queries() })
+                .on_test_event(&event("/whoami"), &Queries { role, ..queries() })
                 .await
                 .unwrap();
             let content = output.commands[0].payload["content"].as_str().unwrap();
@@ -481,9 +490,12 @@ mod tests {
                 ("/api-permissions", "api-permissions"),
                 ("/api-permissions channels", "api-permissions-channels"),
                 ("/api-permissions all", "api-permissions-all"),
+                ("/api-permissions  all  ", "api-permissions-all"),
+                ("/api-permissions channels  ", "api-permissions-channels"),
+                ("/api-permissions  ", "api-permissions"),
             ] {
                 let output = DevToolsPlugin::default()
-                    .on_event(&event(text), &queries)
+                    .on_test_event(&event(text), &queries)
                     .await
                     .unwrap();
                 assert_eq!(output.commands.len(), 1);
@@ -497,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn api_permissions_rejects_users() {
         let output = DevToolsPlugin::default()
-            .on_event(
+            .on_test_event(
                 &event("/api-permissions"),
                 &Queries {
                     role: CallerRole::User,
@@ -519,7 +531,7 @@ mod tests {
     #[tokio::test]
     async fn whoami_rejects_users() {
         let output = DevToolsPlugin::default()
-            .on_event(
+            .on_test_event(
                 &event("/whoami"),
                 &Queries {
                     role: CallerRole::User,
@@ -547,7 +559,7 @@ mod tests {
             };
             for command in ["/whoami", "/api-permissions"] {
                 let output = DevToolsPlugin::default()
-                    .on_event(&event(command), &queries)
+                    .on_test_event(&event(command), &queries)
                     .await
                     .unwrap();
                 assert_eq!(output.commands.len(), 1);
@@ -565,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn api_permissions_authorizes_before_reporting_invalid_arguments() {
         let output = DevToolsPlugin::default()
-            .on_event(
+            .on_test_event(
                 &event("/api-permissions invalid"),
                 &Queries {
                     role: CallerRole::User,
@@ -607,7 +619,7 @@ mod tests {
         })
         .unwrap();
         let output = DevToolsPlugin::default()
-            .on_event(&completion, &queries())
+            .on_test_event(&completion, &queries())
             .await
             .unwrap();
         let content = output.commands[0].payload["content"].as_str().unwrap();
@@ -657,7 +669,7 @@ mod tests {
             })
             .unwrap();
             let output = DevToolsPlugin::default()
-                .on_event(&completion, &queries())
+                .on_test_event(&completion, &queries())
                 .await
                 .unwrap();
             let content = output.commands[0].payload["content"].as_str().unwrap();
@@ -700,7 +712,7 @@ mod tests {
             })
             .unwrap();
             let output = DevToolsPlugin::default()
-                .on_event(&completion, &queries())
+                .on_test_event(&completion, &queries())
                 .await
                 .unwrap();
             let content = output.commands[0].payload["content"].as_str().unwrap();

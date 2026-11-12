@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use super::{
     Audience, CallerAuthority, CallerRole, CommandDeclaration, HandlerOutput, HostQueries,
     PluginError, PluginEventEnvelope, PluginManifest, StaticPlugin, async_trait,
-    command_declaration, ignored, is_command, message_plugin_manifest, message_text, reply,
+    command_declaration, ignored, is_command, message_plugin_manifest, reply,
 };
 
 const MAX_HELP_COLUMN_WIDTH: usize = 32;
@@ -46,7 +46,7 @@ impl HelpPlugin {
             .flat_map(|command| {
                 if command.subcommands.is_empty() {
                     vec![HelpEntry {
-                        invocation: format!("/{}", command.name.escape_debug()),
+                        invocation: command.name.escape_debug().to_string(),
                         description: command.description.escape_debug().to_string(),
                         audience: command.audience,
                     }]
@@ -58,7 +58,7 @@ impl HelpPlugin {
                         .into_iter()
                         .map(|subcommand| HelpEntry {
                             invocation: format!(
-                                "/{} {}",
+                                "{} {}",
                                 command.name.escape_debug(),
                                 subcommand.name.escape_debug()
                             ),
@@ -74,12 +74,17 @@ impl HelpPlugin {
         Self { manifest, entries }
     }
 
-    fn format_help(&self, caller: &CallerAuthority) -> String {
-        let visible = self
+    fn format_help(&self, caller: &CallerAuthority, prefix: &str) -> String {
+        let entries = self
             .entries
             .iter()
             .filter(|entry| visible_to(entry.audience, caller.role))
+            .map(|entry| HelpEntry {
+                invocation: format!("{prefix}{}", entry.invocation),
+                ..entry.clone()
+            })
             .collect::<Vec<_>>();
+        let visible = entries.iter().collect::<Vec<_>>();
         let width = visible
             .iter()
             .map(|entry| entry.invocation.chars().count())
@@ -120,10 +125,12 @@ impl StaticPlugin for HelpPlugin {
         event: &PluginEventEnvelope,
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
-        if message_text(event).is_some_and(is_command("/help")) {
+        if is_command(queries.command_context().as_ref(), "help") {
+            let current = queries.command_declarations().map(Self::with_commands);
+            let catalog = current.as_ref().unwrap_or(self);
             return Ok(reply(
                 event,
-                &self.format_help(&queries.caller_authority()),
+                &catalog.format_help(&queries.caller_authority(), &queries.command_prefix()),
                 Vec::new(),
             ));
         }

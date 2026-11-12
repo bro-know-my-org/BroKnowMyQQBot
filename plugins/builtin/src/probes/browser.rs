@@ -3,7 +3,7 @@ use super::{
     BrowserRunResult, BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil,
     Disposition, HandlerOutput, HostQueries, MediaReply, PluginCommand, PluginError,
     PluginEventEnvelope, PluginManifest, StaticPlugin, Subscription, async_trait, command_argument,
-    diagnostic_authorized, diagnostic_plugin_manifest, ignored, message_text, restricted,
+    diagnostic_authorized, diagnostic_plugin_manifest, ignored, restricted,
 };
 
 #[derive(Debug)]
@@ -12,6 +12,7 @@ pub struct BrowserProbePlugin {
 }
 
 fn normalize_screenshot_url(url: &str) -> String {
+    let url = url.trim();
     let has_scheme = url.split_once("://").is_some_and(|(scheme, _)| {
         let mut characters = scheme.chars();
         matches!(characters.next(), Some(first) if first.is_ascii_alphabetic())
@@ -77,10 +78,9 @@ impl StaticPlugin for BrowserProbePlugin {
         event: &PluginEventEnvelope,
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
+        let command = queries.command_context();
         if event.event_type == "message.created" {
-            let Some(url) =
-                message_text(event).and_then(|text| command_argument(text, "/screenshot"))
-            else {
+            let Some(url) = command_argument(command.as_ref(), "screenshot") else {
                 return Ok(ignored());
             };
             if !diagnostic_authorized(queries) {
@@ -172,7 +172,7 @@ mod tests {
             "https://example.com/?next=https://other.example"
         );
         assert_eq!(
-            normalize_screenshot_url("https://example.com/"),
+            normalize_screenshot_url("  https://example.com/  "),
             "https://example.com/"
         );
     }
