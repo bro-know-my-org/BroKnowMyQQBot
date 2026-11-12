@@ -221,6 +221,8 @@ impl BotConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        plugin_api::validate_command_prefix(&self.commands.prefix)
+            .map_err(|error| ConfigError::InvalidValue(error.to_string()))?;
         if !self.qq.enabled && !self.onebot11.enabled {
             return Err(ConfigError::InvalidValue(
                 "at least one Adapter must be enabled".to_owned(),
@@ -933,6 +935,23 @@ impl ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_prefix_defaults_and_validation() {
+        assert_eq!(BotConfig::default().commands.prefix, "/");
+        for prefix in ["!!", "机器人："] {
+            let mut config = BotConfig::default();
+            config.commands.prefix = prefix.to_owned();
+            config.validate().unwrap();
+            let restored: BotConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(restored.commands.prefix, prefix);
+        }
+        for prefix in ["", "a b", "a\nb", "\u{2003}", &"喵".repeat(33)] {
+            let mut config = BotConfig::default();
+            config.commands.prefix = prefix.to_owned();
+            assert!(config.validate().is_err());
+        }
+    }
 
     #[test]
     fn parses_structured_non_secret_configuration() {

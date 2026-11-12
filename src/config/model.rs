@@ -7,12 +7,27 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct BotConfig {
+    pub(crate) commands: CommandsConfig,
     pub(crate) qq: QqConfig,
     pub(crate) onebot11: OneBot11Config,
     pub(crate) runtime: RuntimeConfig,
     pub(crate) management: ManagementConfig,
     pub(crate) plugins: PluginsConfig,
     pub(crate) logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct CommandsConfig {
+    pub(crate) prefix: String,
+}
+
+impl Default for CommandsConfig {
+    fn default() -> Self {
+        Self {
+            prefix: plugin_api::DEFAULT_COMMAND_PREFIX.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -84,6 +84,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     }
     let plugin_store = PluginStore::open(plugin_db)?;
     let mut plugins = StaticPluginHost::new(plugin_store.clone())
+        .with_command_prefix(&config.commands.prefix)?
         .with_http_executor(Arc::new(SecureHttpExecutor::from_environment()?));
     if let Some(executor) = discover_browser_executor().await {
         plugins = plugins.with_browser_executor(Arc::new(executor));

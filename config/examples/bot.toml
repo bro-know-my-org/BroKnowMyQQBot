@@ -65,3 +65,6 @@ runtime_max_file_mb = 64
 runtime_max_total_mb = 512
 messages_max_file_mb = 256
 messages_max_total_mb = 2048
+
+[commands]
+prefix = "/"
