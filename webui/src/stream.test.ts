@@ -47,7 +47,7 @@ describe('Cookie SSE API', () => {
     api = createApi(vi.fn()); const callbacks = handlers(); api.subscribeLogs({ level: 'INFO' }, callbacks);
     source().readyState = MockEventSource.CLOSED; source().onerror!(); await flush();
     expect(source().close).toHaveBeenCalledOnce();
-    expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('手动刷新重试') }));
+    expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('手动重试') }));
   });
   it('构造同源URL与成对游标，原生连接持续收页并原地自动重连', async () => {
     api = createApi(vi.fn()); const callbacks = handlers();
@@ -105,7 +105,7 @@ describe('Cookie SSE API', () => {
   ])('无效JSON或LogPage明确停止，可重新订阅', invalid => {
     api = createApi(vi.fn()); const callbacks = handlers(); api.subscribeLogs({ level: 'INFO' }, callbacks); const old = source();
     old.send(invalid); expect(old.close).toHaveBeenCalledOnce(); expect(callbacks.onPage).not.toHaveBeenCalled();
-    expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('手动刷新重试') }));
+    expect(callbacks.onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('手动重试') }));
     old.send(page()); expect(callbacks.onPage).not.toHaveBeenCalled();
     api.subscribeLogs({ level: 'INFO' }, callbacks); source().send(page()); expect(callbacks.onPage).toHaveBeenCalledOnce();
   });

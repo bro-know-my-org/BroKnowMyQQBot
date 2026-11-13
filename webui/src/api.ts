@@ -10,7 +10,7 @@ const levels = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
 const integer = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 const text = (value: unknown, max: number): value is string => typeof value === 'string' && value.length <= max;
 export function readLogPage(value: unknown, after?: number, session?: string): LogPage {
-  const invalid = () => new ApiError('日志响应格式异常，已停止接收，请手动刷新重试。');
+  const invalid = () => new ApiError('日志响应格式异常，已停止接收，请手动重试。');
   if (!isObject(value) || !text(value.session_id, 128) || !value.session_id || !integer(value.next_cursor)
     || typeof value.dropped !== 'boolean' || typeof value.has_more !== 'boolean' || !Array.isArray(value.entries) || value.entries.length > 200) throw invalid();
   const nextCursor = value.next_cursor;
@@ -81,7 +81,7 @@ export function createApi(onUnauthorized: () => void) {
     let closed = false, checking = false, after = query.after, session = query.session_id;
     const live = () => !closed && current === generation;
     const close = () => { if (closed) return; closed = true; source.close(); probe?.abort(); streams.delete(close); };
-    const fail = () => { close(); handlers.onError(new ApiError('日志响应格式异常，已停止接收，请手动刷新重试。')); };
+    const fail = () => { close(); handlers.onError(new ApiError('日志响应格式异常，已停止接收，请手动重试。')); };
     streams.add(close); handlers.onState('connecting');
     source.onopen = () => { if (live()) handlers.onState('open'); };
     source.addEventListener('logs', event => {
@@ -106,7 +106,7 @@ export function createApi(onUnauthorized: () => void) {
         .finally(() => {
           checking = false;
           if (live() && source.readyState === EventSource.CLOSED) {
-            close(); handlers.onError(new ApiError('日志连接已停止，请手动刷新重试。'));
+            close(); handlers.onError(new ApiError('日志连接已停止，请手动重试。'));
           }
         });
     };

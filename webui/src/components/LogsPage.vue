@@ -47,7 +47,7 @@ function subscribe() {
       onState: value => { if (live()) state.value = value; },
       onError: cause => { if (live()) { stop(); error.value = cause.message; } },
     });
-  } catch (cause) { if (live()) { stop(); error.value = cause instanceof Error ? cause.message : '无法连接日志，请手动刷新重试。'; } }
+  } catch (cause) { if (live()) { stop(); error.value = cause instanceof Error ? cause.message : '无法连接日志，请手动重试。'; } }
 }
 async function refresh() {
   if (!alive || busy.value) return;
@@ -92,13 +92,13 @@ onBeforeUnmount(() => { alive = false; stop(); });
     <div class="logs-toolbar">
       <div><label :for="`${uid}-level`">最低级别</label><select :id="`${uid}-level`" v-model="level"><option v-for="item in levels" :key="item" :value="item">{{ item }}</option></select></div>
       <div v-if="instanceId === undefined" class="logs-instance"><label :for="`${uid}-instance`">插件实例</label><select :id="`${uid}-instance`" v-model="selected"><option value="">全部运行日志</option><option v-for="plugin in plugins ?? []" :key="plugin.instance_id" :value="plugin.instance_id">{{ plugin.name || plugin.plugin_id }} · {{ plugin.instance_id }}</option></select></div>
-      <div class="actions"><button type="button" :aria-pressed="paused" @click="togglePause">{{ paused ? '继续刷新' : '暂停刷新' }}</button><button type="button" :disabled="busy" @click="refresh">{{ busy ? '读取中…' : '手动刷新' }}</button></div>
+      <div class="actions"><button type="button" :aria-pressed="paused" @click="togglePause">{{ paused ? '继续接收' : '暂停接收' }}</button><button type="button" :disabled="busy" @click="refresh">{{ busy ? '读取中…' : paused ? '读取最新日志' : '重新连接' }}</button></div>
     </div>
     <p v-if="instanceId !== undefined" class="hint logs-scope">当前实例：<code>{{ instanceId }}</code>。仅包含明确关联到此实例的日志。</p>
     <p v-if="error" class="notice error" role="alert">{{ error }}</p>
     <p v-if="notice" class="notice" role="status">{{ notice }}</p>
     <div class="logs-view-switch" role="group" aria-label="日志显示方式"><button type="button" :aria-pressed="view === 'terminal'" @click="view = 'terminal'">实时输出</button><button type="button" :aria-pressed="view === 'structured'" @click="view = 'structured'">结构化记录</button></div>
-    <TerminalOutput v-if="view === 'terminal'" :entries="entries" :session-id="session" :empty-message="busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动刷新重试。' : '当前筛选暂无日志，等待新的输出。'" />
+    <TerminalOutput v-if="view === 'terminal'" :entries="entries" :session-id="session" :empty-message="busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动重试。' : '当前筛选暂无日志，等待新的输出。'" />
     <p v-if="view === 'structured'" class="hint logs-count">已显示 {{ entries.length }} / 1000 条 · 按时间先后排列</p>
     <ol v-if="view === 'structured' && entries.length" class="log-list" tabindex="0" aria-label="日志条目">
       <li v-for="entry in entries" :key="`${session}-${entry.id}`" class="log-entry">
@@ -107,6 +107,6 @@ onBeforeUnmount(() => { alive = false; stop(); });
         <details v-if="Object.keys(entry.fields).length"><summary>结构化字段（{{ Object.keys(entry.fields).length }}）</summary><dl class="log-fields"><template v-for="(value, key) in entry.fields" :key="key"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></dl></details>
       </li>
     </ol>
-    <p v-else-if="view === 'structured'" class="empty">{{ busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动刷新重试。' : '当前筛选暂无日志。' }}</p>
+    <p v-else-if="view === 'structured'" class="empty">{{ busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动重试。' : '当前筛选暂无日志。' }}</p>
   </section>
 </template>

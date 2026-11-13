@@ -41,18 +41,18 @@ describe('持续日志的实际 DOM 交互', () => {
     await nextTick(); expect(content.children).toHaveLength(1); expect(changes).toHaveLength(0);
     await flush(); expect(content.children).toHaveLength(1000); expect(get('.terminal-message').textContent).toBe('日志 9001');
     expect(content.lastElementChild?.textContent).toContain('日志 10000'); observer.disconnect();
-    await click('暂停刷新'); await click('继续刷新'); expect(latest().query.after).toBe(10000);
+    await click('暂停接收'); await click('继续接收'); expect(latest().query.after).toBe(10000);
   });
   it('暂停快照跨进程时无游标重取最近窗口，进程连续变化时明确失败', async () => {
-    await mount(); await emit(page([entry(10)])); await click('暂停刷新');
+    await mount(); await emit(page([entry(10)])); await click('暂停接收');
     request.mockResolvedValueOnce(page([entry(11)], { session_id: 'second' }))
       .mockResolvedValueOnce(page([entry(1), entry(11)], { session_id: 'second' }));
-    await click('手动刷新'); expect(request).toHaveBeenCalledTimes(2);
+    await click('读取最新日志'); expect(request).toHaveBeenCalledTimes(2);
     expect(request.mock.calls[1]![0]).not.toContain('after='); expect(get('.terminal-message').textContent).toBe('日志 1');
     expect(document.body.textContent).toContain('日志会话已变化');
     request.mockResolvedValueOnce(page([entry(12)], { session_id: 'third' }))
       .mockResolvedValueOnce(page([entry(13)], { session_id: 'fourth' }));
-    await click('手动刷新'); expect(request).toHaveBeenCalledTimes(4);
+    await click('读取最新日志'); expect(request).toHaveBeenCalledTimes(4);
     expect(document.body.textContent).toContain('日志会话持续变化'); expect(get('.terminal-message').textContent).toBe('日志 1');
   });
   it('按真实文本渲染，固定实例锁定筛选，两种视图共享同一订阅和暂停状态', async () => {
@@ -62,10 +62,10 @@ describe('持续日志的实际 DOM 交互', () => {
     expect(latest().query).toEqual({ level: 'INFO', limit: 200, instance_id: 'sample / #中文' });
     expect(document.body.textContent).toContain('<img src=x onerror=alert(1)>');
     expect(document.body.textContent).toContain('<script>bad</script>'); expect(document.querySelector('img, script')).toBeNull();
-    await click('暂停刷新'); await click('结构化记录');
+    await click('暂停接收'); await click('结构化记录');
     expect(document.querySelector('.terminal-viewport')).toBeNull();
     expect(document.querySelector('.log-list details')?.textContent).toContain('<script>bad</script>');
-    await click('实时输出'); expect(button('继续刷新').getAttribute('aria-pressed')).toBe('true');
+    await click('实时输出'); expect(button('继续接收').getAttribute('aria-pressed')).toBe('true');
     expect(subscribeLogs).toHaveBeenCalledTimes(1); expect(request).not.toHaveBeenCalled();
   });
   it('无2秒轮询，空控制页不修改终端节点或文字，游标仍用于续接', async () => {
@@ -78,7 +78,7 @@ describe('持续日志的实际 DOM 交互', () => {
     expect(get('.terminal-line')).toBe(row); expect(get('.terminal-viewport')).toBe(viewport);
     expect(document.body.textContent).toBe(text); expect(mutations).toEqual([]); observer.disconnect();
     expect(subscribeLogs).toHaveBeenCalledTimes(1); expect(request).not.toHaveBeenCalled();
-    await click('手动刷新'); expect(latest().query).toMatchObject({ after: 5, session_id: 'first' });
+    await click('重新连接'); expect(latest().query).toMatchObject({ after: 5, session_id: 'first' });
   });
   it('追加、重放去重、保留旧行和最多1000条，两种视图数量一致', async () => {
     await mount(); await emit(page([entry(1)])); const row = get('.terminal-line');
@@ -95,15 +95,15 @@ describe('持续日志的实际 DOM 交互', () => {
     expect(subscribeLogs).toHaveBeenCalledTimes(1); expect(request).not.toHaveBeenCalled();
   });
   it('暂停关闭流，手动更新只GET一次，继续使用新的游标和会话', async () => {
-    await mount(); await emit(page([entry(1)])); const old = latest(); await click('暂停刷新');
+    await mount(); await emit(page([entry(1)])); const old = latest(); await click('暂停接收');
     expect(old.close).toHaveBeenCalledTimes(1);
     old.handlers.onPage(page([entry(2)])); await flush(); expect(document.querySelectorAll('.terminal-line')).toHaveLength(1);
-    request.mockResolvedValueOnce(page([entry(3)])); await click('手动刷新');
+    request.mockResolvedValueOnce(page([entry(3)])); await click('读取最新日志');
     const query = new URL(request.mock.calls[0]![0], 'http://localhost').searchParams;
     expect(query.get('after')).toBe('1'); expect(query.get('limit')).toBe('200');
-    expect(button('继续刷新')).toBeDefined(); await vi.advanceTimersByTimeAsync(10000);
+    expect(button('继续接收')).toBeDefined(); await vi.advanceTimersByTimeAsync(10000);
     expect(request).toHaveBeenCalledTimes(1); expect(subscribeLogs).toHaveBeenCalledTimes(1);
-    await click('继续刷新'); expect(latest().query).toMatchObject({ after: 3, session_id: 'first' });
+    await click('继续接收'); expect(latest().query).toMatchObject({ after: 3, session_id: 'first' });
     expect(document.querySelectorAll('.terminal-line')).toHaveLength(2);
   });
   it('筛选切换与实例props更新关闭旧流并丢弃迟到回调，暂停中筛选不恢复采集', async () => {
@@ -113,8 +113,8 @@ describe('持续日志的实际 DOM 交互', () => {
     expect(document.querySelectorAll('.terminal-line')).toHaveLength(0); expect(document.querySelector('[role="alert"]')).toBeNull();
     expect(latest().query).toEqual({ level: 'WARN', limit: 200, instance_id: 'first' });
     props.instanceId = 'second'; await flush(); expect(latest().query.instance_id).toBe('second');
-    await click('暂停刷新'); const count = streams.length; await select(0, 'ERROR'); expect(streams).toHaveLength(count);
-    await click('手动刷新'); expect(request.mock.calls[0]![0]).toContain('level=ERROR'); expect(streams).toHaveLength(count);
+    await click('暂停接收'); const count = streams.length; await select(0, 'ERROR'); expect(streams).toHaveLength(count);
+    await click('读取最新日志'); expect(request.mock.calls[0]![0]).toContain('level=ERROR'); expect(streams).toHaveLength(count);
   });
   it('全局实例筛选重开流并移除旧游标', async () => {
     await mount({ plugins: [{ instance_id: 'other', name: '其他', plugin_id: 'example' } as PluginView] });
@@ -125,7 +125,7 @@ describe('持续日志的实际 DOM 交互', () => {
     await mount(); await emit(page([entry(1)])); const row = get('.terminal-line');
     latest().handlers.onState('reconnecting'); await flush();
     expect(document.body.textContent).toContain('连接中断，重连中'); expect(get('.terminal-line')).toBe(row);
-    expect(button('手动刷新').disabled).toBe(false); expect(button('暂停刷新')).toBeDefined();
+    expect(button('重新连接').disabled).toBe(false); expect(button('暂停接收')).toBeDefined();
     latest().handlers.onState('open'); await emit(page([], { next_cursor: 2 }));
     expect(get('.terminal-line')).toBe(row); expect(document.body.textContent).toContain('实时接收中');
     expect(subscribeLogs).toHaveBeenCalledTimes(1); expect(request).not.toHaveBeenCalled();
@@ -136,25 +136,25 @@ describe('持续日志的实际 DOM 交互', () => {
     expect(document.body.textContent).toContain('日志会话已变化'); expect(get('.terminal-message').textContent).toBe('日志 1');
     await emit(page([], { session_id: 'second', next_cursor: 2 })); expect(document.body.textContent).toContain('日志会话已变化');
     await emit(page([entry(9)], { session_id: 'second', dropped: true }));
-    expect(document.body.textContent).toContain('可能不连续'); await click('手动刷新');
+    expect(document.body.textContent).toContain('可能不连续'); await click('重新连接');
     expect(latest().query).toMatchObject({ after: 9, session_id: 'second' });
   });
   it('损坏消息关闭流并明确手动重试，保留已有记录', async () => {
     await mount(); await emit(page([entry(1)])); const old = latest();
-    old.handlers.onError(new Error('日志响应格式异常，已停止接收，请手动刷新重试。')); await flush();
+    old.handlers.onError(new Error('日志响应格式异常，已停止接收，请手动重试。')); await flush();
     expect(old.close).toHaveBeenCalledTimes(1); expect(document.body.textContent).toContain('日志响应格式异常');
     expect(get('.terminal-message').textContent).toBe('日志 1'); await vi.advanceTimersByTimeAsync(10000);
-    expect(subscribeLogs).toHaveBeenCalledTimes(1); await click('手动刷新'); expect(streams).toHaveLength(2);
+    expect(subscribeLogs).toHaveBeenCalledTimes(1); await click('重新连接'); expect(streams).toHaveLength(2);
     await emit(page([entry(2)])); expect(document.querySelector('[role="alert"]')).toBeNull();
   });
   it('暂停快照失败或格式损坏可重试，迟到HTTP不污染新订阅，卸载释放流', async () => {
-    await mount(); await emit(page([entry(1)])); await click('暂停刷新');
-    request.mockResolvedValueOnce(page([entry(3), entry(2)], { next_cursor: 3 })); await click('手动刷新');
+    await mount(); await emit(page([entry(1)])); await click('暂停接收');
+    request.mockResolvedValueOnce(page([entry(3), entry(2)], { next_cursor: 3 })); await click('读取最新日志');
     expect(document.body.textContent).toContain('日志响应格式异常');
-    request.mockRejectedValueOnce(new Error('服务不可用')); await click('手动刷新'); expect(document.body.textContent).toContain('服务不可用');
+    request.mockRejectedValueOnce(new Error('服务不可用')); await click('读取最新日志'); expect(document.body.textContent).toContain('服务不可用');
     let resolve!: (value: unknown) => void;
-    request.mockImplementationOnce(() => new Promise(finish => { resolve = finish; })); await click('手动刷新');
-    await click('继续刷新'); resolve(page([entry(8)])); await flush();
+    request.mockImplementationOnce(() => new Promise(finish => { resolve = finish; })); await click('读取最新日志');
+    await click('继续接收'); resolve(page([entry(8)])); await flush();
     expect(document.body.textContent).not.toContain('日志 8'); const old = latest(); app!.unmount(); app = undefined;
     expect(old.close).toHaveBeenCalledTimes(1); old.handlers.onPage(page([entry(9)])); await flush();
     await vi.advanceTimersByTimeAsync(10000); expect(request).toHaveBeenCalledTimes(3);
