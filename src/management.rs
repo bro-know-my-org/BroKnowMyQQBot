@@ -2,6 +2,7 @@
 
 mod auth;
 mod logs;
+mod logs_stream;
 mod plugins;
 mod settings;
 
@@ -92,7 +93,8 @@ pub(crate) async fn serve(
         .await
         .map_err(|source| ManagementError::Bind { listen, source })?;
     info!(listen = %listen, auth = ?config.auth, "management server listening");
-    let (app, validation_jobs) = router_parts(observer, Some((manager, auth, live_logs)));
+    let (app, validation_jobs) =
+        router_parts(observer, Some((manager, auth, live_logs, shutdown.clone())));
     let mut validation_supervisor = tokio::spawn(run_validation_workers(validation_jobs));
     let (serve_result, shutdown_deadline) = {
         let mut graceful_shutdown = shutdown.clone();
@@ -163,6 +165,7 @@ fn router_parts(
         PluginManager,
         auth::AuthState,
         crate::logging::live::LogBuffer,
+        ShutdownSignal,
     )>,
 ) -> (Router, mpsc::Receiver<ValidationJob>) {
     let (validation_jobs, validation_receiver) = mpsc::channel(MAX_CONCURRENT_CONFIG_CHECKS);
@@ -185,9 +188,14 @@ fn router_parts(
             validation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CONFIG_CHECKS)),
             validation_jobs,
         });
-    let router = if let Some((manager, auth, live_logs)) = api {
+    let router = if let Some((manager, auth, live_logs, shutdown)) = api {
         router
-            .merge(plugins::router_with_logs(manager, auth, live_logs))
+            .merge(plugins::router_with_logs_and_shutdown(
+                manager,
+                auth,
+                live_logs,
+                Some(shutdown),
+            ))
             .merge(plugins::assets())
     } else {
         router

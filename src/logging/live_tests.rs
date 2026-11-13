@@ -178,3 +178,27 @@ fn ring_overflow_and_process_reset_report_dropped_windows() {
     assert_ne!(fresh.session_id, reset.session_id);
     assert_eq!(fresh.next_cursor, 0);
 }
+
+#[test]
+fn watch_retains_latest_without_receivers_and_reset_checks_session() {
+    let buffer = LogBuffer::new(Vec::new());
+    capture(&buffer, || tracing::info!("before subscription"));
+    let mut updates = buffer.subscribe();
+    assert_eq!(*updates.borrow_and_update(), 1);
+    capture(&buffer, || {
+        tracing::info!("second");
+        tracing::info!("third");
+    });
+    assert!(updates.has_changed().unwrap());
+    assert_eq!(*updates.borrow_and_update(), 3);
+    for after in [0, 2, 3, 99] {
+        let page = buffer.stream_snapshot(Some(after), Some("old-session"), 2, None, None);
+        assert!(page.dropped);
+        assert_eq!(page.entries[0].id, 2);
+        assert_eq!(page.next_cursor, 3);
+    }
+    let fresh =
+        LogBuffer::new(Vec::new()).stream_snapshot(Some(0), Some("old-session"), 2, None, None);
+    assert!(fresh.dropped);
+    assert_eq!(fresh.next_cursor, 0);
+}

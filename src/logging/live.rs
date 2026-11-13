@@ -7,6 +7,7 @@ use std::{
 };
 
 use serde::Serialize;
+use tokio::sync::watch;
 use tracing::{
     Event, Subscriber,
     field::{Field, Visit},
@@ -22,6 +23,7 @@ pub(crate) struct LogBuffer {
     session_id: Arc<str>,
     entries: Arc<Mutex<(u64, VecDeque<LogEntry>)>>,
     redactions: Arc<Vec<String>>,
+    updates: watch::Sender<u64>,
 }
 
 impl fmt::Debug for LogBuffer {
@@ -94,11 +96,30 @@ impl LogBuffer {
             session_id: uuid::Uuid::new_v4().to_string().into(),
             entries: Arc::new(Mutex::new((0, VecDeque::with_capacity(CAPACITY)))),
             redactions: Arc::new(redactions),
+            updates: watch::channel(0).0,
         }
     }
 
     pub(crate) fn layer(&self) -> LiveLayer {
         LiveLayer(self.clone())
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.updates.subscribe()
+    }
+
+    pub(crate) fn stream_snapshot(
+        &self,
+        after: Option<u64>,
+        session_id: Option<&str>,
+        limit: usize,
+        level: Option<&str>,
+        instance: Option<&str>,
+    ) -> LogPage {
+        let reset = session_id.is_some_and(|session| session != self.session_id.as_ref());
+        let mut page = self.snapshot(if reset { None } else { after }, limit, level, instance);
+        page.dropped |= reset;
+        page
     }
 
     pub(crate) fn snapshot(
@@ -401,6 +422,9 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for LiveLayer {
             state.1.pop_front();
         }
         state.1.push_back(entry);
+        // Publish while holding the ring lock so concurrent writers cannot
+        // announce IDs out of order. Watch coalesces updates without a queue.
+        self.0.updates.send_replace(state.0);
     }
 }
 

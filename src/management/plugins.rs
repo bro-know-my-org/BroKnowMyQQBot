@@ -38,11 +38,22 @@ pub(super) fn router(manager: PluginManager, token: [u8; 32]) -> Router {
     )
 }
 
+#[cfg(test)]
 pub(super) fn router_with_logs(
     manager: PluginManager,
     auth: AuthState,
     logs: crate::logging::live::LogBuffer,
 ) -> Router {
+    router_with_logs_and_shutdown(manager, auth, logs, None)
+}
+
+pub(super) fn router_with_logs_and_shutdown(
+    manager: PluginManager,
+    auth: AuthState,
+    logs: crate::logging::live::LogBuffer,
+    shutdown: Option<bot_core::ShutdownSignal>,
+) -> Router {
+    let streams = super::logs_stream::router(logs.clone(), auth.clone(), shutdown);
     Router::new()
         .route("/api/plugins", get(list))
         .route("/api/plugins/config", post(save_config))
@@ -60,6 +71,7 @@ pub(super) fn router_with_logs(
             auth::authenticate,
         ))
         .merge(auth::router(auth))
+        .merge(streams)
         .layer(
             tower::ServiceBuilder::new()
                 .layer(axum::error_handling::HandleErrorLayer::new(

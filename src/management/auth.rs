@@ -66,7 +66,7 @@ impl AuthState {
         })
     }
 
-    fn authenticated(&self, headers: &HeaderMap) -> bool {
+    pub(super) fn authenticated(&self, headers: &HeaderMap) -> bool {
         if self.expected.is_none() {
             return true;
         }
@@ -340,3 +340,54 @@ fn unauthorized() -> Response {
 #[cfg(test)]
 #[path = "auth_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod stream_expiration_test {
+    use super::*;
+    use axum::body::Body;
+    use futures_util::StreamExt as _;
+    use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn expiration_terminates_an_established_log_stream() {
+        let auth: AuthState = [0; 32].into();
+        let id = uuid::Uuid::new_v4().to_string();
+        let digest = Sha256::digest(id.as_bytes()).into();
+        auth.sessions
+            .lock()
+            .unwrap()
+            .insert(digest, Instant::now() + SESSION_TTL);
+        let app = super::super::logs_stream::router(
+            crate::logging::live::LogBuffer::default(),
+            auth.clone(),
+            None,
+        );
+        let response = app
+            .oneshot(
+                Request::get("/api/logs/stream")
+                    .header(header::COOKIE, format!("{COOKIE}={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        assert!(
+            std::str::from_utf8(&body.next().await.unwrap().unwrap())
+                .unwrap()
+                .contains("event: logs")
+        );
+        auth.sessions.lock().unwrap().insert(
+            digest,
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        );
+        let event = body.next().await.unwrap().unwrap();
+        assert!(
+            std::str::from_utf8(&event)
+                .unwrap()
+                .contains("event: auth-required")
+        );
+        assert!(body.next().await.is_none());
+    }
+}

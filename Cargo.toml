@@ -44,6 +44,7 @@ dialoguer.workspace = true
 dotenvy.workspace = true
 flate2.workspace = true
 fs2.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 libc.workspace = true
 plugin-api = { path = "crates/plugin-api" }
@@ -70,9 +71,6 @@ uuid.workspace = true
 wit-component.workspace = true
 zip.workspace = true
 zstd.workspace = true
-
-[dev-dependencies]
-futures-util.workspace = true
 
 [build-dependencies]
 chrono.workspace = true

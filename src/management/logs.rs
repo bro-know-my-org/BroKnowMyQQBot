@@ -13,24 +13,26 @@ use serde_json::json;
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct LogQuery {
-    after: Option<u64>,
-    limit: Option<usize>,
-    level: Option<String>,
-    instance_id: Option<String>,
+    pub(super) after: Option<u64>,
+    pub(super) limit: Option<usize>,
+    pub(super) level: Option<String>,
+    pub(super) instance_id: Option<String>,
+}
+
+impl LogQuery {
+    pub(super) fn valid(&self) -> bool {
+        (1..=200).contains(&self.limit.unwrap_or(200))
+            && !self.level.as_deref().is_some_and(|level| {
+                !matches!(level, "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR")
+            })
+            && !self.instance_id.as_ref().is_some_and(|id| {
+                id.is_empty() || id.len() > 256 || id.chars().any(char::is_control)
+            })
+    }
 }
 
 pub(super) async fn get(State(state): State<ApiState>, Query(query): Query<LogQuery>) -> Response {
-    let limit = query.limit.unwrap_or(200);
-    if !(1..=200).contains(&limit)
-        || query
-            .level
-            .as_deref()
-            .is_some_and(|level| !matches!(level, "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR"))
-        || query
-            .instance_id
-            .as_ref()
-            .is_some_and(|id| id.is_empty() || id.len() > 256 || id.chars().any(char::is_control))
-    {
+    if !query.valid() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"日志筛选参数无效"})),
@@ -39,7 +41,7 @@ pub(super) async fn get(State(state): State<ApiState>, Query(query): Query<LogQu
     }
     Json(state.logs.snapshot(
         query.after,
-        limit,
+        query.limit.unwrap_or(200),
         query.level.as_deref(),
         query.instance_id.as_deref(),
     ))
