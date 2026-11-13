@@ -32,11 +32,13 @@
 .terminal-toolbar, .terminal-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; padding: 0 16px; background: #1e2a2d; font-family: var(--font-mono); font-size: 12px; }
 .terminal-toolbar { min-height: 48px; border-bottom: 1px solid #495554; }
 .terminal-toolbar > span { letter-spacing: .06em; }
+.terminal-controls { display: flex; flex-wrap: wrap; gap: 8px; }
 .terminal-toolbar button { min-height: 44px; padding: 8px; border: 0; background: transparent; color: var(--terminal-ink); font-family: var(--font-sans); font-size: 13px; }
 .terminal-toolbar button:hover:enabled { background: #334144; border-color: transparent; }
 .terminal-panel :focus-visible { outline-color: var(--terminal-ink); }
 .terminal-viewport { height: clamp(320px, 58vh, 720px); overflow: auto; padding: 12px 16px; scrollbar-color: #7c8580 #101d21; overflow-anchor: none; font-family: var(--font-mono); font-size: 13px; line-height: 1.55; font-variant-numeric: tabular-nums; }
-.terminal-line { white-space: pre-wrap; overflow-wrap: anywhere; }
+.terminal-line { white-space: pre; overflow-wrap: normal; }
+.terminal-viewport.is-wrapping .terminal-line { white-space: pre-wrap; overflow-wrap: anywhere; }
 .terminal-line time, .terminal-field { color: var(--terminal-muted); }
 .terminal-level { font-weight: 700; }
 .terminal-source { color: #c7cbbb; }

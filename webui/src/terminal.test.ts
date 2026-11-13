@@ -70,3 +70,31 @@ it('缓冲淘汰上方记录时保持正在阅读的行，当前行被淘汰时�
   expect(position).toBe(0);
   expect(document.querySelector('.terminal-toolbar button')?.getAttribute('aria-pressed')).toBe('false');
 });
+
+it('追加输出保留已有行节点和选中的文本区域，不重写旧行', async () => {
+  const entries = ref([entry(1)]), host = document.createElement('div'); document.body.append(host);
+  app = createApp(defineComponent(() => () => h(TerminalOutput, { entries: entries.value, emptyMessage: '等待输出' }))); app.mount(host);
+  const first = document.querySelector('.terminal-line')!, text = first.querySelector('.terminal-message')!.firstChild!;
+  const changes: MutationRecord[] = [], observer = new MutationObserver(records => changes.push(...records));
+  observer.observe(first, { childList: true, characterData: true, subtree: true });
+  try {
+    entries.value = [...entries.value, entry(2), entry(3)]; await flush();
+    expect(document.querySelector('.terminal-line')).toBe(first);
+    expect(first.querySelector('.terminal-message')!.firstChild).toBe(text);
+    expect(changes).toHaveLength(0);
+  } finally { observer.disconnect(); }
+});
+
+it('默认长行横向滚动，换行开关保留行节点和跟随状态', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  app = createApp(TerminalOutput, { entries: [{ ...entry(1), message: '很长的日志 '.repeat(200) }], emptyMessage: '等待输出' }); app.mount(host);
+  const viewport = document.querySelector<HTMLElement>('.terminal-viewport')!, line = document.querySelector('.terminal-line');
+  const controls = document.querySelectorAll<HTMLButtonElement>('.terminal-controls button'), wrap = controls[1]!;
+  expect(viewport.classList.contains('is-wrapping')).toBe(false); expect(wrap.getAttribute('aria-pressed')).toBe('false');
+  viewport.scrollLeft = 240; viewport.dispatchEvent(new Event('scroll')); await flush();
+  expect(controls[0]!.getAttribute('aria-pressed')).toBe('true');
+  wrap.click(); await flush(); expect(viewport.classList.contains('is-wrapping')).toBe(true);
+  expect(wrap.textContent).toBe('自动换行：开'); expect(document.querySelector('.terminal-line')).toBe(line);
+  wrap.click(); await flush(); expect(viewport.classList.contains('is-wrapping')).toBe(false);
+  expect(controls[0]!.getAttribute('aria-pressed')).toBe('true');
+});

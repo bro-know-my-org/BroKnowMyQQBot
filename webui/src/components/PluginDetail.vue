@@ -6,8 +6,8 @@ import LogsPage from "./LogsPage.vue";
 import type { Request } from "../api";
 import { pluginRoute } from "../navigation";
 import { json, runtimeNames } from "../types";
-import type { Mutation, PluginView } from "../types";
-const props = defineProps<{ plugin: PluginView; request: Request; tab: "overview" | "config" | "logs"; busy: boolean; conflict: boolean }>();
+import type { Mutation, PluginView, SubscribeLogs } from "../types";
+const props = defineProps<{ plugin: PluginView; request: Request; subscribeLogs: SubscribeLogs; tab: "overview" | "config" | "logs"; busy: boolean; conflict: boolean }>();
 const emit = defineEmits<{ mutate: [change: Mutation]; dirty: [value: boolean]; error: [message: string] }>();
 const editor = ref<InstanceType<typeof SchemaEditor>>(), dirty = ref(false);
 watch(dirty, value => emit("dirty", value));
@@ -38,7 +38,7 @@ function discard() { if (window.confirm("有未保存更改，是否放弃这些
         </form>
         <details><summary>查看已保存配置</summary><pre>{{ json(plugin.config) }}</pre></details><details v-if="plugin.schema"><summary>查看配置 Schema</summary><pre>{{ json(plugin.schema) }}</pre></details>
       </section>
-      <LogsPage v-else :request="request" :instance-id="plugin.instance_id" />
+      <LogsPage v-else :request="request" :subscribe-logs="subscribeLogs" :instance-id="plugin.instance_id" />
     </div>
   </article>
 </template>

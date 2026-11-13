@@ -3,6 +3,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { LogEntry } from '../types';
 const props = defineProps<{ entries: LogEntry[]; sessionId?: string; emptyMessage: string }>();
 const viewport = ref<HTMLElement>(), content = ref<HTMLElement>(), following = ref(true);
+const wrapping = ref(false);
 let observer: ResizeObserver | undefined;
 let geometry = '';
 function measure() { const element = viewport.value; return element ? `${element.clientWidth}/${element.clientHeight}/${element.scrollHeight}` : ''; }
@@ -45,6 +46,11 @@ watch([() => props.entries, () => props.sessionId], async ([, newSession], [, ol
   }
 });
 function resized() { if (following.value) scrollToBottom(); else geometry = measure(); }
+async function toggleWrap() {
+  wrapping.value = !wrapping.value;
+  await nextTick();
+  resized();
+}
 onMounted(() => {
   scrollToBottom(); window.addEventListener('resize', resized);
   if (typeof ResizeObserver !== 'undefined') {
@@ -57,10 +63,10 @@ onBeforeUnmount(() => { observer?.disconnect(); window.removeEventListener('resi
 </script>
 <template>
   <div class="terminal-panel">
-    <div class="terminal-toolbar"><span>BKMQB / LIVE OUTPUT</span><button type="button" :aria-pressed="following" @click="toggleFollow">{{ following ? '正在跟随输出 ↓' : '跟随输出 ↓' }}</button></div>
-    <div ref="viewport" class="terminal-viewport" tabindex="0" role="region" aria-label="实时日志输出" @scroll="onScroll">
+    <div class="terminal-toolbar"><span>BKMQB / LIVE OUTPUT</span><div class="terminal-controls"><button type="button" :aria-pressed="following" @click="toggleFollow">{{ following ? '正在跟随输出 ↓' : '跟随输出 ↓' }}</button><button type="button" :aria-pressed="wrapping" @click="toggleWrap">自动换行：{{ wrapping ? '开' : '关' }}</button></div></div>
+    <div ref="viewport" class="terminal-viewport" :class="{ 'is-wrapping': wrapping }" tabindex="0" role="region" aria-label="实时日志输出" @scroll="onScroll">
       <div ref="content" class="terminal-lines">
-      <div v-for="entry in entries" :key="`${sessionId}-${entry.id}`" class="terminal-line" :data-entry-id="entry.id"><time :datetime="entry.timestamp" :title="entry.timestamp">{{ time(entry.timestamp) }}</time>{{ ' ' }}<strong class="terminal-level">{{ entry.level.padEnd(5) }}</strong>{{ ' ' }}<span class="terminal-source">{{ entry.target }}</span>{{ entry.instance_id ? ` [${entry.instance_id}]` : '' }}{{ ': ' }}<span class="terminal-message">{{ entry.message || '（无消息文本）' }}</span><span v-for="(value, key) in entry.fields" :key="key" class="terminal-field">{{ ` ${key}=${field(value)}` }}</span></div>
+      <div v-for="entry in entries" v-memo="[entry, sessionId]" :key="`${sessionId}-${entry.id}`" class="terminal-line" :data-entry-id="entry.id"><time :datetime="entry.timestamp" :title="entry.timestamp">{{ time(entry.timestamp) }}</time>{{ ' ' }}<strong class="terminal-level">{{ entry.level.padEnd(5) }}</strong>{{ ' ' }}<span class="terminal-source">{{ entry.target }}</span>{{ entry.instance_id ? ` [${entry.instance_id}]` : '' }}{{ ': ' }}<span class="terminal-message">{{ entry.message || '（无消息文本）' }}</span><span v-for="(value, key) in entry.fields" :key="key" class="terminal-field">{{ ` ${key}=${field(value)}` }}</span></div>
       <p v-if="!entries.length" class="terminal-empty">{{ emptyMessage }}</p>
       </div>
     </div>
