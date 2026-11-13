@@ -19,6 +19,7 @@ use crate::plugin_management::{ManagementError, PluginManager};
 #[derive(Clone)]
 pub(super) struct ApiState {
     pub(super) manager: PluginManager,
+    pub(super) logs: crate::logging::live::LogBuffer,
 }
 
 pub(super) fn token_digest(token: &str) -> Result<[u8; 32], super::ManagementError> {
@@ -30,20 +31,29 @@ pub(super) fn token_digest(token: &str) -> Result<[u8; 32], super::ManagementErr
 
 #[cfg(test)]
 pub(super) fn router(manager: PluginManager, token: [u8; 32]) -> Router {
-    router_with_auth(manager, token.into())
+    router_with_logs(
+        manager,
+        token.into(),
+        crate::logging::live::LogBuffer::default(),
+    )
 }
 
-pub(super) fn router_with_auth(manager: PluginManager, auth: AuthState) -> Router {
+pub(super) fn router_with_logs(
+    manager: PluginManager,
+    auth: AuthState,
+    logs: crate::logging::live::LogBuffer,
+) -> Router {
     Router::new()
         .route("/api/plugins", get(list))
         .route("/api/plugins/config", post(save_config))
         .route("/api/plugins/enabled", post(save_enabled))
         .route("/api/plugins/apply", post(apply))
+        .route("/api/logs", get(super::logs::get))
         .route(
             "/api/settings/commands",
             get(super::settings::get).post(super::settings::save),
         )
-        .with_state(ApiState { manager })
+        .with_state(ApiState { manager, logs })
         .route_layer(middleware::from_fn(read_body))
         .route_layer(middleware::from_fn_with_state(
             auth.clone(),
@@ -258,6 +268,7 @@ mod tests {
     async fn all_plugin_operations_require_bearer_auth_before_body_parsing() {
         for (path, method) in [
             ("/api/plugins", "GET"),
+            ("/api/logs", "GET"),
             ("/api/plugins/config", "POST"),
             ("/api/plugins/enabled", "POST"),
             ("/api/plugins/apply", "POST"),

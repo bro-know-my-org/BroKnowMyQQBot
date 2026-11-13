@@ -63,7 +63,11 @@ async fn start(management_auth: Option<ManagementAuth>) -> Result<(), Box<dyn st
     if let Some(auth) = management_auth {
         config.management.auth = auth;
     }
-    let _logging_guards = logging::init(&config.logging)?;
+    let live_logs = logging::live::LogBuffer::default();
+    let _logging_guards = logging::init(
+        &config.logging,
+        config.management.enabled.then(|| live_logs.clone()),
+    )?;
     if let Some(path) = secrets_file {
         info!(path = %path.display(), "loaded local secrets environment file");
     }
@@ -133,6 +137,7 @@ async fn start(management_auth: Option<ManagementAuth>) -> Result<(), Box<dyn st
         config.management,
         observer,
         manager,
+        live_logs,
         shutdown_timeout,
     )
     .await;
@@ -222,6 +227,7 @@ async fn supervise_runtime(
     management_config: ManagementConfig,
     observer: RuntimeObserver,
     manager: PluginManager,
+    live_logs: logging::live::LogBuffer,
     shutdown_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
@@ -230,6 +236,7 @@ async fn supervise_runtime(
         management_config,
         observer,
         manager,
+        live_logs,
         shutdown_signal,
         shutdown_timeout,
     );

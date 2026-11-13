@@ -1348,6 +1348,7 @@ impl StaticPluginHost {
         for diagnostic in &output.diagnostics {
             warn!(
                 plugin_id = %plugin.manifest.id,
+                instance_id = %plugin.instance_id,
                 code = diagnostic.code,
                 level = diagnostic.level,
                 message = diagnostic.message,

@@ -1,6 +1,7 @@
 //! Loopback-only runtime diagnostics and authenticated plugin management.
 
 mod auth;
+mod logs;
 mod plugins;
 mod settings;
 
@@ -74,6 +75,7 @@ pub(crate) async fn serve(
     config: ManagementConfig,
     observer: RuntimeObserver,
     manager: PluginManager,
+    live_logs: crate::logging::live::LogBuffer,
     mut shutdown: ShutdownSignal,
     shutdown_timeout: Duration,
 ) -> Result<(), ManagementError> {
@@ -90,7 +92,7 @@ pub(crate) async fn serve(
         .await
         .map_err(|source| ManagementError::Bind { listen, source })?;
     info!(listen = %listen, auth = ?config.auth, "management server listening");
-    let (app, validation_jobs) = router_parts(observer, Some((manager, auth)));
+    let (app, validation_jobs) = router_parts(observer, Some((manager, auth, live_logs)));
     let mut validation_supervisor = tokio::spawn(run_validation_workers(validation_jobs));
     let (serve_result, shutdown_deadline) = {
         let mut graceful_shutdown = shutdown.clone();
@@ -157,7 +159,11 @@ pub(crate) fn check_access(config: &ManagementConfig) -> Result<(), ManagementEr
 
 fn router_parts(
     observer: RuntimeObserver,
-    api: Option<(PluginManager, auth::AuthState)>,
+    api: Option<(
+        PluginManager,
+        auth::AuthState,
+        crate::logging::live::LogBuffer,
+    )>,
 ) -> (Router, mpsc::Receiver<ValidationJob>) {
     let (validation_jobs, validation_receiver) = mpsc::channel(MAX_CONCURRENT_CONFIG_CHECKS);
     let router = Router::new()
@@ -179,9 +185,9 @@ fn router_parts(
             validation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CONFIG_CHECKS)),
             validation_jobs,
         });
-    let router = if let Some((manager, auth)) = api {
+    let router = if let Some((manager, auth, live_logs)) = api {
         router
-            .merge(plugins::router_with_auth(manager, auth))
+            .merge(plugins::router_with_logs(manager, auth, live_logs))
             .merge(plugins::assets())
     } else {
         router

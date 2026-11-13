@@ -1,6 +1,7 @@
 //! Multi-sink tracing initialization and log lifecycle management.
 
 mod console;
+pub(crate) mod live;
 mod writer;
 
 use std::io::{self, IsTerminal as _};
@@ -51,7 +52,10 @@ impl Drop for LoggingGuards {
     }
 }
 
-pub(crate) fn init(config: &LoggingConfig) -> Result<LoggingGuards, LoggingError> {
+pub(crate) fn init(
+    config: &LoggingConfig,
+    live: Option<live::LogBuffer>,
+) -> Result<LoggingGuards, LoggingError> {
     let language = ConsoleLanguage::parse(&config.console.language);
     let ansi = config.console.ansi && std::io::stderr().is_terminal();
     let console_filter =
@@ -67,6 +71,18 @@ pub(crate) fn init(config: &LoggingConfig) -> Result<LoggingGuards, LoggingError
     });
 
     let mut guards = LoggingGuards::default();
+    let live_layer = live
+        .map(|buffer| {
+            live_filter(config).map(|filter| {
+                buffer
+                    .layer()
+                    .with_filter(filter)
+                    .with_filter(filter_fn(|metadata| {
+                        metadata.target() != MESSAGE_LOG_TARGET
+                    }))
+            })
+        })
+        .transpose()?;
     let session = session_id();
     let file_filter = config
         .files
@@ -132,9 +148,18 @@ pub(crate) fn init(config: &LoggingConfig) -> Result<LoggingGuards, LoggingError
         .with(console_layer)
         .with(runtime_layer)
         .with(message_layer)
+        .with(live_layer)
         .try_init()
         .map_err(|error| LoggingError::Subscriber(error.to_string()))?;
     Ok(guards)
+}
+
+fn live_filter(config: &LoggingConfig) -> Result<EnvFilter, LoggingError> {
+    if config.files.enabled {
+        EnvFilter::try_new(&config.files.filter).map_err(LoggingError::FileFilter)
+    } else {
+        EnvFilter::try_new(&config.console.filter).map_err(LoggingError::ConsoleFilter)
+    }
 }
 
 fn mib_bytes(value: u64, name: &str) -> Result<u64, LoggingError> {
@@ -169,6 +194,26 @@ mod tests {
     use tracing_subscriber::{filter::filter_fn, fmt};
 
     use super::*;
+
+    #[test]
+    fn live_filter_ignores_disabled_file_sink_and_uses_console_threshold() {
+        let mut config = LoggingConfig::default();
+        config.files.enabled = false;
+        config.files.filter = "[broken".to_owned();
+        config.console.filter = "warn".to_owned();
+        let buffer = live::LogBuffer::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(buffer.layer().with_filter(live_filter(&config).unwrap()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("filtered");
+            tracing::warn!("captured");
+        });
+        let page = buffer.snapshot(None, 10, None, None);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].message, "captured");
+        config.files.enabled = true;
+        assert!(live_filter(&config).is_err());
+    }
 
     #[test]
     fn structured_file_sinks_separate_runtime_and_message_content() {
