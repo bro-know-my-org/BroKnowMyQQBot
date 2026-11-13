@@ -232,3 +232,7 @@ impl StreamState {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "logs_stream_tests.rs"]
+mod tests;
