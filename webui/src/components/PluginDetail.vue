@@ -2,10 +2,12 @@
 import { ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import SchemaEditor from "./SchemaEditor.vue";
+import LogsPage from "./LogsPage.vue";
+import type { Request } from "../api";
 import { pluginRoute } from "../navigation";
 import { json, runtimeNames } from "../types";
 import type { Mutation, PluginView } from "../types";
-const props = defineProps<{ plugin: PluginView; tab: "overview" | "config" | "logs"; busy: boolean; conflict: boolean }>();
+const props = defineProps<{ plugin: PluginView; request: Request; tab: "overview" | "config" | "logs"; busy: boolean; conflict: boolean }>();
 const emit = defineEmits<{ mutate: [change: Mutation]; dirty: [value: boolean]; error: [message: string] }>();
 const editor = ref<InstanceType<typeof SchemaEditor>>(), dirty = ref(false);
 watch(dirty, value => emit("dirty", value));
@@ -36,7 +38,7 @@ function discard() { if (window.confirm("有未保存更改，是否放弃这些
         </form>
         <details><summary>查看已保存配置</summary><pre>{{ json(plugin.config) }}</pre></details><details v-if="plugin.schema"><summary>查看配置 Schema</summary><pre>{{ json(plugin.schema) }}</pre></details>
       </section>
-      <section v-else class="panel empty-state"><span class="status-marker"><span class="status-shape is-offline" aria-hidden="true" />日志尚未接入</span><p class="muted">当前无法在网页中读取此插件的日志。请在 Bot 的运行终端或部署环境中查看。</p></section>
+      <LogsPage v-else :request="request" :instance-id="plugin.instance_id" />
     </div>
   </article>
 </template>

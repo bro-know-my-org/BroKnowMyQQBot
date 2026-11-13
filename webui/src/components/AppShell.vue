@@ -3,7 +3,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { RouterLink, useRoute } from 'vue-router';
 import { navigation } from '../navigation';
 import NavIcon from './NavIcon.vue';
-defineProps<{ busy: boolean }>();
+defineProps<{ busy: boolean; authMode?: 'token' | 'none' }>();
 defineEmits<{ logout: [] }>();
 const route = useRoute(), collapsed = ref(false), mobileOpen = ref(false);
 const sidebar = ref<HTMLElement>(), menu = ref<HTMLButtonElement>(), content = ref<HTMLElement>();
@@ -61,7 +61,7 @@ onBeforeUnmount(() => { document.body.style.overflow = originalOverflow; documen
       <div class="sidebar-bottom"><button id="sidebar-toggle" class="sidebar-toggle" type="button" :aria-label="collapsed ? '展开侧栏' : '收起侧栏'" :title="collapsed ? '展开侧栏' : undefined" :aria-expanded="!collapsed" @click="toggleCollapsed"><NavIcon :name="collapsed ? 'expand' : 'collapse'" /><span class="nav-label">收起侧栏</span></button><p class="sidebar-footnote">BKMQB / CONTROL PANEL</p></div>
     </aside>
     <div class="app-body" :inert="mobileOpen">
-      <header class="topbar"><div class="breadcrumb"><button ref="menu" class="icon-button mobile-menu-toggle" type="button" aria-label="打开导航菜单" aria-controls="main-sidebar" :aria-expanded="mobileOpen" @click="openMenu"><NavIcon name="menu" /></button><span class="muted">控制台</span><span aria-hidden="true">/</span><span>{{ route.meta.title }}</span></div><div class="topbar-actions"><button id="logout" class="quiet" type="button" :disabled="busy" @click="$emit('logout')">退出登录</button></div></header>
+      <header class="topbar"><div class="breadcrumb"><button ref="menu" class="icon-button mobile-menu-toggle" type="button" aria-label="打开导航菜单" aria-controls="main-sidebar" :aria-expanded="mobileOpen" @click="openMenu"><NavIcon name="menu" /></button><span class="muted">控制台</span><span aria-hidden="true">/</span><span>{{ route.meta.title }}</span></div><div class="topbar-actions"><span v-if="authMode === 'none'" class="status-marker"><span class="status-shape is-offline" aria-hidden="true" />本地免认证</span><button v-else id="logout" class="quiet" type="button" :disabled="busy" @click="$emit('logout')">退出登录</button></div></header>
       <main id="page-content" ref="content" class="page-content" tabindex="-1"><slot /></main>
     </div>
   </div>

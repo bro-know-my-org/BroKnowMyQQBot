@@ -1,0 +1,25 @@
+.logs-page { min-width: 0; }
+.logs-page > .section-heading { flex-wrap: wrap; }
+.logs-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 16px; margin: 24px 0; }
+.logs-toolbar > div { min-width: 0; }
+.logs-instance { flex: 1 1 240px; }
+.logs-toolbar .actions { margin: 0; }
+.logs-toolbar select { max-width: 100%; }
+.logs-scope { overflow-wrap: anywhere; margin-bottom: 20px; }
+.logs-count { margin-bottom: 12px; }
+.log-list { max-height: 640px; overflow: auto; margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--e-ink-rule); }
+.log-entry { padding: 16px 0; border-bottom: 1px solid var(--e-ink-rule); overflow-wrap: anywhere; }
+.log-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 16px; color: var(--e-ink-muted); font-family: var(--font-mono); font-size: 12px; }
+.log-meta > * { max-width: 100%; overflow-wrap: anywhere; }
+.log-level { color: var(--e-ink-text); font-weight: 600; }
+.log-message { margin-top: 8px; white-space: pre-wrap; font-family: var(--font-mono); font-size: 13px; }
+.log-entry details { margin-top: 8px; }
+.log-entry summary { min-height: 44px; }
+.log-fields { grid-template-columns: minmax(72px, 160px) minmax(0, 1fr); gap: 8px 16px; margin: 8px 0; padding: 16px; background: var(--e-ink-panel); font-family: var(--font-mono); }
+.log-fields dt, .log-fields dd { overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  .logs-toolbar > div { flex: 1 1 100%; }
+  .logs-toolbar .actions > button { flex: 1; }
+  .log-fields { grid-template-columns: minmax(0, 1fr); }
+  .log-fields dd { margin-bottom: 8px; }
+}

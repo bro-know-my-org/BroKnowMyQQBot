@@ -1,21 +1,21 @@
 import { assertSafeNumbers, parseSafeJson } from './json';
-type Path = '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply'}` | '/api/settings/commands';
+type Path = '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply'}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
 export class ApiError extends Error {
   constructor(message: string, public readonly status = 0) { super(message); }
 }
 export type Request = <T>(path: Path, body?: unknown) => Promise<T>;
 export function createApi(onUnauthorized: () => void) {
-  let token = '', generation = 0;
+  let generation = 0;
   const active = new Set<AbortController>();
-  const clear = () => { token = ''; generation++; active.forEach(c => c.abort()); active.clear(); };
+  const clear = () => { generation++; active.forEach(c => c.abort()); active.clear(); };
   const request: Request = async <T>(path: Path, body?: unknown): Promise<T> => {
     const current = generation, controller = new AbortController(); active.add(controller);
     const timer = setTimeout(() => controller.abort(), 30000);
     try {
       assertSafeNumbers(body);
       const response = await fetch(path, {
-        method: body === undefined ? 'GET' : 'POST', mode: 'same-origin', credentials: 'omit', cache: 'no-store', redirect: 'error', signal: controller.signal,
-        headers: { Authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
+        method: body === undefined ? 'GET' : 'POST', mode: 'same-origin', credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal,
+        headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       if (current !== generation) throw new ApiError('会话已结束。');
@@ -34,5 +34,5 @@ export function createApi(onUnauthorized: () => void) {
       throw error;
     } finally { clearTimeout(timer); active.delete(controller); }
   };
-  return { request, clear, setToken(value: string) { clear(); token = value; } };
+  return { request, clear };
 }

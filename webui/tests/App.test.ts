@@ -13,11 +13,19 @@ const fixture = (overrides: Partial<PluginView> = {}): PluginView => ({
 });
 let app: ReturnType<typeof createApp>, plugins: PluginView[], commands: Commands, fail: { path: string; method: string; status: number } | null;
 let router: ReturnType<typeof createManagementRouter>;
+let sessionAuthenticated: boolean, sessionMode: 'token' | 'none', unsafePluginResponse: boolean;
 const requests: Array<{ path: string; method: string; body: Record<string, unknown> | undefined; init: RequestInit }> = [];
 const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
   const path = String(input), method = init.method ?? 'GET', body = init.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
   requests.push({ path, method, body, init });
-  if (fail?.path === path && fail.method === method) { const status = fail.status; fail = null; return new Response(JSON.stringify({ error: '服务拒绝此次更改' }), { status }); }
+  if (fail?.path === path && fail.method === method) { const status = fail.status; fail = null; if (status === 401) sessionAuthenticated = false; return new Response(JSON.stringify({ error: '服务拒绝此次更改' }), { status }); }
+  if (path.startsWith('/api/session')) {
+    if (path.endsWith('/login')) sessionAuthenticated = true;
+    if (path.endsWith('/logout')) sessionAuthenticated = false;
+    return new Response(JSON.stringify({ mode: sessionMode, authenticated: sessionMode === 'none' || sessionAuthenticated }));
+  }
+  if (!sessionAuthenticated && sessionMode !== 'none') return new Response('{}', { status: 401 });
+  if (path === '/api/plugins' && unsafePluginResponse) { unsafePluginResponse = false; return new Response(JSON.stringify({ plugins }).replace('"count":1', '"count":9007199254740993')); }
   if (path === '/api/settings/commands') {
     if (body) { expect(body.expected_revision).toBe(commands.revision); commands = { prefix: String(body.prefix), revision: String(Number(commands.revision) + 1) }; }
     return new Response(JSON.stringify(commands));
@@ -44,19 +52,62 @@ const submit = async (selector: string) => { get(selector).dispatchEvent(new Eve
 const disabled = (selector: string) => get<HTMLButtonElement>(selector).disabled;
 const value = (selector: string) => get<HTMLInputElement>(selector).value;
 const text = () => document.body.textContent;
-const posts = () => requests.filter(r => r.method === 'POST');
+const posts = () => requests.filter(r => r.method === 'POST' && !r.path.startsWith('/api/session'));
 const go = async (target: RouteLocationRaw) => { await router.push(target); await flush(); };
-async function login(target: RouteLocationRaw = pluginRoute(plugins[0]?.instance_id ?? 'sample', 'config')) {
+async function mount(target: RouteLocationRaw = pluginRoute(plugins[0]?.instance_id ?? 'sample', 'config')) {
   router = createManagementRouter(true); await router.push(target); await router.isReady();
   const root = document.createElement('div'); document.body.append(root); app = createApp(App).use(router); app.mount(root);
+  await flush();
+}
+async function login(target: RouteLocationRaw = pluginRoute(plugins[0]?.instance_id ?? 'sample', 'config')) {
+  await mount(target);
   await input('#token', 'test-token'); await submit('#login-form');
 }
 beforeEach(() => {
   plugins = [fixture()]; commands = { prefix: '/', revision: '1' }; fail = null; requests.length = 0;
+  sessionAuthenticated = false; sessionMode = 'token'; unsafePluginResponse = false;
   vi.stubGlobal('fetch', fetcher); vi.spyOn(window, 'confirm').mockReturnValue(true);
   vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('credentials must stay in memory'); });
 });
 afterEach(() => { app?.unmount(); document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+describe('浏览器管理会话', () => {
+  it('重新挂载时通过 Cookie 恢复登录和目标路由，不重复提交 Token', async () => {
+    await login(); app.unmount(); document.body.replaceChildren(); requests.length = 0;
+    await mount(pluginRoute('sample', 'config'));
+    expect(value('#field-0')).toBe('1'); expect(document.querySelector('#token')).toBeNull();
+    expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins']);
+    expect(requests.every(r => r.init.credentials === 'same-origin' && !r.body?.token)).toBe(true);
+    expect(Storage.prototype.setItem).not.toHaveBeenCalled();
+  });
+  it('显式退出撤销会话，刷新后仍显示登录表单', async () => {
+    await login(); await click('#logout'); expect(sessionAuthenticated).toBe(false);
+    expect(value('#token')).toBe(''); expect(requests.at(-1)!.path).toBe('/api/session/logout');
+    app.unmount(); document.body.replaceChildren(); requests.length = 0; await mount();
+    expect(document.querySelector('#login-form')).not.toBeNull(); expect(requests.map(r => r.path)).toEqual(['/api/session']);
+  });
+  it('免认证模式自动进入并显示当前模式', async () => {
+    sessionMode = 'none'; await mount({ name: 'overview' });
+    expect(text()).toContain('本地免认证'); expect(document.querySelector('#token')).toBeNull(); expect(document.querySelector('#logout')).toBeNull();
+    expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins']);
+  });
+  it('浏览器往返缓存恢复时重新核对会话，失效时不会显示旧管理数据', async () => {
+    await login(); window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })); await flush();
+    expect(document.querySelector('[aria-label="插件详情"]')).toBeNull();
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })); await flush();
+    expect(value('#field-0')).toBe('1');
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })); sessionAuthenticated = false;
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })); await flush();
+    expect(document.querySelector('#login-form')).not.toBeNull(); expect(document.querySelector('[aria-label="插件详情"]')).toBeNull();
+  });
+  it('登录成功但插件读取失败时保留会话，可直接重试加载', async () => {
+    fail = { path: '/api/plugins', method: 'GET', status: 500 }; await login();
+    expect(sessionAuthenticated).toBe(true); expect(document.querySelector('#token')).toBeNull(); expect(text()).toContain('服务拒绝此次更改');
+    expect(text()).toContain('插件状态暂不可用'); expect(text()).not.toContain('未找到插件实例');
+    await click('#retry-plugins'); expect(value('#field-0')).toBe('1'); expect(document.querySelector('#retry-plugins')).toBeNull();
+    expect(requests.filter(r => r.path === '/api/session/login')).toHaveLength(1);
+  });
+});
 
 describe('插件管理的实际组件交互', () => {
   it('整数 Schema 的小数边界不会让有效整数被原生 step 校验阻止', async () => {
@@ -78,7 +129,8 @@ describe('插件管理的实际组件交互', () => {
     const config = posts()[0]!.body!.config as Config;
     expect(config).toEqual({ count: 7, enabled: false, mode: 2, unknown: { keep: ['unchanged'] } });
     expect(config).not.toHaveProperty('greeting'); expect(config).not.toHaveProperty('absent');
-    expect(requests.every(r => r.init.mode === 'same-origin' && (r.init.headers as Record<string, string>).Authorization === 'Bearer test-token')).toBe(true);
+    expect(requests.every(r => r.init.mode === 'same-origin' && r.init.credentials === 'same-origin' && !(r.init.headers as Record<string, string>).Authorization)).toBe(true);
+    expect(requests.filter(r => r.body?.token).map(r => r.path)).toEqual(['/api/session/login']);
     expect(Storage.prototype.setItem).not.toHaveBeenCalled();
   });
   it('保存配置和启停不改变运行态，应用携带保存后的版本', async () => {
@@ -112,7 +164,8 @@ describe('插件管理的实际组件交互', () => {
     await login(); fail = { path: '/api/plugins', method: 'GET', status: 401 }; await click('#refresh');
     expect(document.querySelector('[aria-label="插件详情"]')).toBeNull(); expect(value('#token')).toBe(''); expect(text()).toContain('登录已失效');
     await input('#token', 'new-token'); await submit('#login-form');
-    expect((requests.at(-1)!.init.headers as Record<string, string>).Authorization).toBe('Bearer new-token'); expect(Storage.prototype.setItem).not.toHaveBeenCalled();
+    expect(requests.filter(r => r.path === '/api/session/login').at(-1)!.body).toEqual({ token: 'new-token' });
+    expect((requests.at(-1)!.init.headers as Record<string, string>).Authorization).toBeUndefined(); expect(Storage.prototype.setItem).not.toHaveBeenCalled();
   });
   it('复杂 Schema 用 JSON 编辑并拒绝非对象；文件插件不可编辑', async () => {
     plugins = [fixture({ schema: { allOf: [{ type: 'object' }] } }), fixture({ instance_id: 'file', editable: false, name: '文件插件' })]; await login();
@@ -137,8 +190,8 @@ describe('插件管理的实际组件交互', () => {
     await input('#config-json', '{"safe":9007199254740991,"exact":"9007199254740993"}'); await click('#save'); expect(plugins[0]!.config).toEqual({ safe: Number.MAX_SAFE_INTEGER, exact: '9007199254740993' });
   });
   it('服务端返回大整数时拒绝读取，避免把舍入后的配置放入编辑器', async () => {
-    fetcher.mockImplementationOnce(async () => new Response(JSON.stringify({ plugins }).replace('"count":1', '"count":9007199254740993')));
-    await login(); expect(text()).toContain('安全整数范围'); expect(document.querySelector('[aria-label="插件详情"]')).toBeNull(); expect(value('#token')).toBe('');
+    unsafePluginResponse = true;
+    await login(); expect(text()).toContain('安全整数范围'); expect(document.querySelector('[aria-label="插件详情"]')).toBeNull(); expect(document.querySelector('#retry-plugins')).not.toBeNull();
   });
   it('前缀待生效时分别显示已保存值和运行值', async () => {
     commands = { prefix: '/', revision: '1', saved_prefix: '!!', pending: true }; await login({ name: 'settings' });
@@ -190,8 +243,8 @@ describe('插件管理的实际组件交互', () => {
     get('#command-prefix').focus(); await go({ name: 'settings', query: { view: 'advanced' }, hash: '#prefix' }); expect(document.activeElement).toBe(get('#command-prefix'));
     vi.mocked(window.confirm).mockReturnValue(false); await go({ name: 'overview' }); expect(value('#command-prefix')).toBe('!!');
   });
-  it.each(['marketplace', 'logs', 'adapters', 'not-found'])('未接入页面 %s 明示边界且不发起不存在的接口请求', async name => {
+  it.each(['marketplace', 'adapters', 'not-found'])('未接入页面 %s 明示边界且不发起不存在的接口请求', async name => {
     await login(name === 'not-found' ? '/unknown-page' : { name });
-    expect(text()).toContain(name === 'not-found' ? '未找到页面' : '尚未接入'); expect(requests.map(r => r.path)).toEqual(['/api/plugins']);
+    expect(text()).toContain(name === 'not-found' ? '未找到页面' : '尚未接入'); expect(requests.filter(r => !r.path.startsWith('/api/session')).map(r => r.path)).toEqual(['/api/plugins']);
   });
 });

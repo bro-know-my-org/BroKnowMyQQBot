@@ -11,6 +11,9 @@ export interface PluginView {
 export type PluginAction = 'config' | 'enabled' | 'apply';
 export interface Mutation { action: PluginAction; config?: Config; enabled?: boolean }
 export interface Commands { prefix: string; revision: string; saved_prefix?: string; pending?: boolean }
+export interface Session { mode: 'token' | 'none'; authenticated: boolean }
+export interface LogEntry { id: number; timestamp: string; level: string; target: string; message: string; instance_id: string | null; fields: Record<string, string> }
+export interface LogPage { session_id: string; entries: LogEntry[]; next_cursor: number; dropped: boolean; has_more: boolean }
 export const runtimeNames: Record<PluginView['runtime_state'], string> = {
   ready: '运行中', stopped: '已停止', disabled: '已禁用', not_loaded: '未加载', draining: '正在停止接收任务',
 };
