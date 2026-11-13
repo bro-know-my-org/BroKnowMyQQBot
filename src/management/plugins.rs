@@ -1,5 +1,6 @@
 //! Authenticated management routes; credentials never enter plugin configuration.
 
+use super::auth::{self, AuthState};
 use axum::{
     Json, Router,
     extract::{Request, State},
@@ -12,7 +13,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::time::Duration;
-use subtle::ConstantTimeEq as _;
 
 use crate::plugin_management::{ManagementError, PluginManager};
 
@@ -28,7 +28,12 @@ pub(super) fn token_digest(token: &str) -> Result<[u8; 32], super::ManagementErr
     Ok(Sha256::digest(token.as_bytes()).into())
 }
 
+#[cfg(test)]
 pub(super) fn router(manager: PluginManager, token: [u8; 32]) -> Router {
+    router_with_auth(manager, token.into())
+}
+
+pub(super) fn router_with_auth(manager: PluginManager, auth: AuthState) -> Router {
     Router::new()
         .route("/api/plugins", get(list))
         .route("/api/plugins/config", post(save_config))
@@ -40,7 +45,11 @@ pub(super) fn router(manager: PluginManager, token: [u8; 32]) -> Router {
         )
         .with_state(ApiState { manager })
         .route_layer(middleware::from_fn(read_body))
-        .route_layer(middleware::from_fn_with_state(token, authenticate))
+        .route_layer(middleware::from_fn_with_state(
+            auth.clone(),
+            auth::authenticate,
+        ))
+        .merge(auth::router(auth))
         .layer(
             tower::ServiceBuilder::new()
                 .layer(axum::error_handling::HandleErrorLayer::new(
@@ -54,7 +63,7 @@ pub(super) fn router(manager: PluginManager, token: [u8; 32]) -> Router {
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-async fn read_body(request: Request, next: Next) -> Response {
+pub(super) async fn read_body(request: Request, next: Next) -> Response {
     let (parts, body) = request.into_parts();
     match tokio::time::timeout(
         BODY_READ_TIMEOUT,
@@ -77,27 +86,6 @@ async fn read_body(request: Request, next: Next) -> Response {
         )
             .into_response(),
     }
-}
-
-async fn authenticate(State(expected): State<[u8; 32]>, request: Request, next: Next) -> Response {
-    let authenticated = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| {
-            let actual: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-            bool::from(expected.ct_eq(&actual))
-        });
-    if !authenticated {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            Json(json!({"error":"管理令牌无效或未提供"})),
-        )
-            .into_response();
-    }
-    next.run(request).await
 }
 
 async fn list(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {

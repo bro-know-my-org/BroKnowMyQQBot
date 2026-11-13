@@ -36,7 +36,7 @@ async fn main() -> ExitCode {
     };
     match cli::run(arguments).await {
         Ok(cli::RunOutcome::Complete) => ExitCode::SUCCESS,
-        Ok(cli::RunOutcome::StartBot) => bootstrap::run().await,
+        Ok(cli::RunOutcome::StartBot { management_auth }) => bootstrap::run(management_auth).await,
         Err(error) => {
             eprintln!("bkmqb failed: {}", cli::terminal_safe(&error.to_string()));
             ExitCode::FAILURE

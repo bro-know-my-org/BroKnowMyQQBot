@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::{
     browser,
-    config::BotConfig,
+    config::{BotConfig, ManagementAuth},
     plugin_configuration, plugin_dev,
     plugin_marketplace::{MarketplaceClient, MarketplacePlugin, validate_selector},
     plugins, version,
@@ -33,7 +33,9 @@ const MAX_PLUGIN_CONFIG_FILE_BYTES: usize = 256 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunOutcome {
     Complete,
-    StartBot,
+    StartBot {
+        management_auth: Option<ManagementAuth>,
+    },
 }
 
 pub(crate) async fn run(arguments: Vec<String>) -> Result<RunOutcome, Box<dyn std::error::Error>> {
@@ -44,8 +46,14 @@ pub(crate) async fn run(arguments: Vec<String>) -> Result<RunOutcome, Box<dyn st
     match command {
         "help" | "--help" | "-h" => print_help(),
         "run" => {
-            require_argument_count(&arguments, 1, "bkmqb run")?;
-            return Ok(RunOutcome::StartBot);
+            let management_auth = match arguments.as_slice() {
+                [_] => None,
+                [_, flag, value] if flag == "--management-auth" => {
+                    Some(value.parse::<ManagementAuth>()?)
+                }
+                _ => return Err("usage: bkmqb run [--management-auth token|none]".into()),
+            };
+            return Ok(RunOutcome::StartBot { management_auth });
         }
         "version" | "--version" | "-V" => println!("{}", version::display()),
         "config" => run_config(&arguments[1..])?,
@@ -1338,7 +1346,7 @@ fn now_ms() -> i64 {
 
 fn print_help() {
     println!(
-        "BroKnowMyQQBot command line\n\nUsage:\n  bkmqb run\n  bkmqb browser <command>\n  bkmqb config check\n  bkmqb plugin <command>\n  bkmqb version"
+        "BroKnowMyQQBot command line\n\nUsage:\n  bkmqb run [--management-auth token|none]\n  bkmqb browser <command>\n  bkmqb config check\n  bkmqb plugin <command>\n  bkmqb version"
     );
 }
 
@@ -1410,7 +1418,9 @@ mod tests {
         assert_eq!(run(Vec::new()).await.unwrap(), RunOutcome::Complete);
         assert_eq!(
             run(vec!["run".to_owned()]).await.unwrap(),
-            RunOutcome::StartBot
+            RunOutcome::StartBot {
+                management_auth: None
+            }
         );
         assert!(
             run(vec!["run".to_owned(), "extra".to_owned()])
@@ -1418,6 +1428,33 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("usage: bkmqb run")
+        );
+    }
+
+    #[tokio::test]
+    async fn management_auth_override_is_explicit() {
+        for (value, expected) in [
+            ("none", ManagementAuth::None),
+            ("token", ManagementAuth::Token),
+        ] {
+            assert_eq!(
+                run(vec!["run".into(), "--management-auth".into(), value.into()])
+                    .await
+                    .unwrap(),
+                RunOutcome::StartBot {
+                    management_auth: Some(expected)
+                }
+            );
+        }
+        assert!(
+            run(vec!["run".into(), "--management-auth".into(), "off".into()])
+                .await
+                .is_err()
+        );
+        assert!(
+            run(vec!["run".into(), "--management-auth".into()])
+                .await
+                .is_err()
         );
     }
 

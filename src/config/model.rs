@@ -157,6 +157,27 @@ impl Default for RuntimeConfig {
 pub(crate) struct ManagementConfig {
     pub(crate) enabled: bool,
     pub(crate) listen: String,
+    pub(crate) auth: ManagementAuth,
+    pub(crate) session_cookie_secure: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ManagementAuth {
+    #[default]
+    Token,
+    None,
+}
+
+impl std::str::FromStr for ManagementAuth {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "token" => Ok(Self::Token),
+            "none" => Ok(Self::None),
+            _ => Err("management auth must be token or none"),
+        }
+    }
 }
 
 impl Default for ManagementConfig {
@@ -164,6 +185,8 @@ impl Default for ManagementConfig {
         Self {
             enabled: false,
             listen: "127.0.0.1:9090".to_owned(),
+            auth: ManagementAuth::Token,
+            session_cookie_secure: false,
         }
     }
 }

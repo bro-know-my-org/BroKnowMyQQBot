@@ -14,7 +14,7 @@ use std::{
 
 use crate::{
     browser::InstalledBrowserExecutor,
-    config::{self, BotConfig, ManagementConfig, load_secret_environment},
+    config::{self, BotConfig, ManagementAuth, ManagementConfig, load_secret_environment},
     logging, management,
     plugin_management::PluginManager,
     plugins::load_plugins,
@@ -46,8 +46,8 @@ struct AdapterSet {
     qq_api: Option<OpenApiClient>,
 }
 
-pub(crate) async fn run() -> ExitCode {
-    match start().await {
+pub(crate) async fn run(management_auth: Option<ManagementAuth>) -> ExitCode {
+    match start(management_auth).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("BroKnowMyQQBot failed: {error}");
@@ -56,23 +56,13 @@ pub(crate) async fn run() -> ExitCode {
     }
 }
 
-async fn start() -> Result<(), Box<dyn std::error::Error>> {
+async fn start(management_auth: Option<ManagementAuth>) -> Result<(), Box<dyn std::error::Error>> {
     let mut config = BotConfig::load()?;
     let secrets_file = load_secret_environment()?;
-    let qq_credentials = if config.qq.enabled {
-        Some(match configured_credentials() {
-            Ok(credentials) => credentials,
-            Err(_error) if config::setup::is_interactive() => {
-                let path = secrets_file
-                    .as_deref()
-                    .ok_or("interactive setup requires a writable secrets file path")?;
-                config::setup::run(&mut config, path)?
-            }
-            Err(error) => return Err(error.into()),
-        })
-    } else {
-        None
-    };
+    let qq_credentials = resolve_credentials(&mut config, secrets_file.as_deref())?;
+    if let Some(auth) = management_auth {
+        config.management.auth = auth;
+    }
     let _logging_guards = logging::init(&config.logging)?;
     if let Some(path) = secrets_file {
         info!(path = %path.display(), "loaded local secrets environment file");
@@ -155,6 +145,24 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     runtime_result?;
     info!("BroKnowMyQQBot stopped");
     Ok(())
+}
+
+fn resolve_credentials(
+    config: &mut BotConfig,
+    secrets_file: Option<&std::path::Path>,
+) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
+    if !config.qq.enabled {
+        return Ok(None);
+    }
+    match configured_credentials() {
+        Ok(credentials) => Ok(Some(credentials)),
+        Err(_error) if config::setup::is_interactive() => {
+            let path =
+                secrets_file.ok_or("interactive setup requires a writable secrets file path")?;
+            Ok(Some(config::setup::run(config, path)?))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn preflight(

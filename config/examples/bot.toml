@@ -41,6 +41,8 @@ dedup_capacity = 16384
 [management]
 enabled = false
 listen = "127.0.0.1:9090"
+auth = "token" # "none" skips login for local development; CLI: bkmqb run --management-auth none
+session_cookie_secure = false # set true when accessing through an HTTPS reverse proxy
 
 [plugins]
 database = "data/plugins.db"

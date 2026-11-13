@@ -13,7 +13,7 @@ use std::{
 
 use thiserror::Error;
 
-pub(crate) use model::{BotConfig, LoggingConfig, ManagementConfig};
+pub(crate) use model::{BotConfig, LoggingConfig, ManagementAuth, ManagementConfig};
 pub(crate) use persistence::{ConfigFileLock, config_revision};
 
 #[derive(Debug, Clone)]
@@ -207,6 +207,7 @@ impl BotConfig {
         )?;
         apply_parse_override("BKMQB_DEDUP_CAPACITY", &mut self.runtime.dedup_capacity)?;
         apply_bool_override("BKMQB_MANAGEMENT_ENABLED", &mut self.management.enabled)?;
+        apply_parse_override("BKMQB_MANAGEMENT_AUTH", &mut self.management.auth)?;
         if let Ok(value) = env::var("BKMQB_MANAGEMENT_LISTEN") {
             self.management.listen = value;
         }
@@ -1207,6 +1208,19 @@ mod tests {
 
         config.management.listen = "[::1]:9090".to_owned();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn management_auth_is_explicit_and_defaults_to_token() {
+        assert_eq!(BotConfig::default().management.auth, ManagementAuth::Token);
+        let config: BotConfig = toml::from_str("[management]\nauth = 'none'\n").unwrap();
+        assert_eq!(config.management.auth, ManagementAuth::None);
+        assert!(toml::from_str::<BotConfig>("[management]\nauth = 'disabled'\n").is_err());
+        assert_eq!(
+            "token".parse::<ManagementAuth>().unwrap(),
+            ManagementAuth::Token
+        );
+        assert!("TOKEN".parse::<ManagementAuth>().is_err());
     }
 
     #[test]

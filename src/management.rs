@@ -1,5 +1,6 @@
 //! Loopback-only runtime diagnostics and authenticated plugin management.
 
+mod auth;
 mod plugins;
 mod settings;
 
@@ -80,7 +81,7 @@ pub(crate) async fn serve(
         shutdown.cancelled().await;
         return Ok(());
     }
-    let token = access_token()?;
+    let auth = auth::AuthState::from_config(&config)?;
     let listen = config
         .listen
         .parse::<SocketAddr>()
@@ -88,8 +89,8 @@ pub(crate) async fn serve(
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|source| ManagementError::Bind { listen, source })?;
-    info!(listen = %listen, "management server listening");
-    let (app, validation_jobs) = router_parts(observer, Some((manager, token)));
+    info!(listen = %listen, auth = ?config.auth, "management server listening");
+    let (app, validation_jobs) = router_parts(observer, Some((manager, auth)));
     let mut validation_supervisor = tokio::spawn(run_validation_workers(validation_jobs));
     let (serve_result, shutdown_deadline) = {
         let mut graceful_shutdown = shutdown.clone();
@@ -149,20 +150,14 @@ fn router(observer: RuntimeObserver) -> Router {
 
 pub(crate) fn check_access(config: &ManagementConfig) -> Result<(), ManagementError> {
     if config.enabled {
-        access_token()?;
+        auth::AuthState::from_config(config)?;
     }
     Ok(())
 }
 
-fn access_token() -> Result<[u8; 32], ManagementError> {
-    let token =
-        std::env::var("BKMQB_MANAGEMENT_TOKEN").map_err(|_| ManagementError::InvalidToken)?;
-    plugins::token_digest(&token)
-}
-
 fn router_parts(
     observer: RuntimeObserver,
-    api: Option<(PluginManager, [u8; 32])>,
+    api: Option<(PluginManager, auth::AuthState)>,
 ) -> (Router, mpsc::Receiver<ValidationJob>) {
     let (validation_jobs, validation_receiver) = mpsc::channel(MAX_CONCURRENT_CONFIG_CHECKS);
     let router = Router::new()
@@ -184,9 +179,9 @@ fn router_parts(
             validation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CONFIG_CHECKS)),
             validation_jobs,
         });
-    let router = if let Some((manager, token)) = api {
+    let router = if let Some((manager, auth)) = api {
         router
-            .merge(plugins::router(manager, token))
+            .merge(plugins::router_with_auth(manager, auth))
             .merge(plugins::assets())
     } else {
         router
