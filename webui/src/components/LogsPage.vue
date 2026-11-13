@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue';
 import type { Request } from '../api';
+import TerminalOutput from './TerminalOutput.vue';
 import { isObject } from '../types';
 import type { LogEntry, LogPage, PluginView } from '../types';
 
@@ -8,6 +9,7 @@ const props = defineProps<{ request: Request; plugins?: PluginView[]; instanceId
 const uid = useId(), levels = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
 const level = ref('INFO'), selected = ref(''), paused = ref(false), busy = ref(false);
 const entries = ref<LogEntry[]>([]), error = ref(''), notice = ref('');
+const view = ref<'terminal' | 'structured'>('terminal');
 const instance = computed(() => props.instanceId ?? selected.value);
 let alive = false, generation = 0, pending = false, resetting = false, cursor: number | undefined, session: string | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -92,14 +94,16 @@ onBeforeUnmount(() => { alive = false; generation++; pending = false; stopTimer(
     <p v-if="instanceId !== undefined" class="hint logs-scope">当前实例：<code>{{ instanceId }}</code>。仅包含明确关联到此实例的日志。</p>
     <p v-if="error" class="notice error" role="alert">{{ error }}</p>
     <p v-if="notice" class="notice" role="status">{{ notice }}</p>
-    <p class="hint logs-count">已显示 {{ entries.length }} / 1000 条 · 按时间先后排列</p>
-    <ol v-if="entries.length" class="log-list" tabindex="0" aria-label="日志条目">
+    <div class="logs-view-switch" role="group" aria-label="日志显示方式"><button type="button" :aria-pressed="view === 'terminal'" @click="view = 'terminal'">实时输出</button><button type="button" :aria-pressed="view === 'structured'" @click="view = 'structured'">结构化记录</button></div>
+    <TerminalOutput v-if="view === 'terminal'" :entries="entries" :session-id="session" :empty-message="busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动刷新重试。' : '当前筛选暂无日志，等待新的输出。'" />
+    <p v-if="view === 'structured'" class="hint logs-count">已显示 {{ entries.length }} / 1000 条 · 按时间先后排列</p>
+    <ol v-if="view === 'structured' && entries.length" class="log-list" tabindex="0" aria-label="日志条目">
       <li v-for="entry in entries" :key="`${session}-${entry.id}`" class="log-entry">
         <div class="log-meta"><time :datetime="entry.timestamp">{{ entry.timestamp }}</time><strong class="log-level">{{ entry.level }}</strong><span>{{ entry.target }}</span><code v-if="entry.instance_id">{{ entry.instance_id }}</code></div>
         <p class="log-message">{{ entry.message || '（无消息文本）' }}</p>
         <details v-if="Object.keys(entry.fields).length"><summary>结构化字段（{{ Object.keys(entry.fields).length }}）</summary><dl class="log-fields"><template v-for="(value, key) in entry.fields" :key="key"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></dl></details>
       </li>
     </ol>
-    <p v-else class="empty">{{ busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动刷新重试。' : '当前筛选暂无日志。' }}</p>
+    <p v-else-if="view === 'structured'" class="empty">{{ busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动刷新重试。' : '当前筛选暂无日志。' }}</p>
   </section>
 </template>

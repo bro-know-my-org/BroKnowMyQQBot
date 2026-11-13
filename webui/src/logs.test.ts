@@ -36,6 +36,17 @@ describe('运行日志的实际 DOM 交互', () => {
     expect(document.body.textContent).toContain('<script>bad</script>');
     expect(document.querySelector('img, script')).toBeNull();
   });
+  it('默认终端输出，结构化记录共享筛选和暂停状态，切换不重新请求', async () => {
+    request.mockResolvedValue(page([entry(1, { fields: { detail: '保留详情' } })])); await mount();
+    expect(document.querySelector('.terminal-viewport')).not.toBeNull();
+    expect(document.querySelector('.log-list')).toBeNull();
+    await click('暂停刷新'); await click('结构化记录');
+    expect(document.querySelector('.terminal-viewport')).toBeNull();
+    expect(document.querySelector('.log-list details')?.textContent).toContain('保留详情');
+    expect(button('结构化记录').getAttribute('aria-pressed')).toBe('true');
+    await click('实时输出'); expect(document.querySelector('.terminal-message')?.textContent).toBe('日志 1');
+    expect(request).toHaveBeenCalledTimes(1); expect(button('继续刷新')).toBeDefined();
+  });
   it('非重叠轮询从完成时间计时，携带游标，卸载后停止', async () => {
     let resolve!: (value: unknown) => void;
     request.mockImplementationOnce(() => new Promise(finish => { resolve = finish; }));
@@ -94,8 +105,8 @@ describe('运行日志的实际 DOM 交互', () => {
     await mount(); expect(request).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(99); expect(request).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(401); expect(request).toHaveBeenCalledTimes(6);
-    expect(document.querySelectorAll('.log-entry')).toHaveLength(1000);
-    expect(get('.log-entry .log-message').textContent).toBe('日志 201');
+    expect(document.querySelectorAll('.terminal-line')).toHaveLength(1000);
+    expect(get('.terminal-line .terminal-message').textContent).toBe('日志 201');
   });
   it('连续变化的会话停止重试，避免立即轮询循环', async () => {
     request.mockResolvedValueOnce(page([entry(1)])); await mount();
@@ -124,7 +135,7 @@ describe('运行日志的实际 DOM 交互', () => {
     let resolve!: (value: unknown) => void;
     request.mockImplementationOnce(() => new Promise(finish => { resolve = finish; }));
     await click('手动刷新'); await click('暂停刷新'); resolve(page([entry(1)])); await flush();
-    expect(document.querySelectorAll('.log-entry')).toHaveLength(0);
+    expect(document.querySelectorAll('.terminal-line')).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(10000); expect(request).toHaveBeenCalledTimes(2);
   });
 });

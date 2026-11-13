@@ -1,0 +1,69 @@
+<script setup lang="ts">
+import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import type { LogEntry } from '../types';
+const props = defineProps<{ entries: LogEntry[]; sessionId?: string; emptyMessage: string }>();
+const viewport = ref<HTMLElement>(), content = ref<HTMLElement>(), following = ref(true);
+let observer: ResizeObserver | undefined;
+let geometry = '';
+function measure() { const element = viewport.value; return element ? `${element.clientWidth}/${element.clientHeight}/${element.scrollHeight}` : ''; }
+function scrollToBottom() {
+  if (viewport.value) viewport.value.scrollTop = viewport.value.scrollHeight;
+  geometry = measure();
+}
+function toggleFollow() { following.value = !following.value; if (following.value) scrollToBottom(); }
+function onScroll() {
+  const element = viewport.value;
+  if (!element) return;
+  const current = measure();
+  // Resizing/reflow and DOM changes can scroll too; retain follow through geometry changes.
+  if (following.value && current !== geometry) { scrollToBottom(); return; }
+  if (element.scrollHeight - element.scrollTop - element.clientHeight > 16) following.value = false;
+  geometry = current;
+}
+const clock = new Intl.DateTimeFormat('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+function time(timestamp: string) {
+  const date = new Date(timestamp);
+  return `${clock.format(date)}.${String(date.getMilliseconds()).padStart(3, '0')}`;
+}
+function field(value: string) { return /\s|["=]/u.test(value) ? JSON.stringify(value) : value; }
+watch([() => props.entries, () => props.sessionId], async ([, newSession], [, oldSession]) => {
+  const element = viewport.value;
+  if (!element) return;
+  const top = element.getBoundingClientRect().top;
+  const anchor = !following.value && newSession === oldSession
+    ? Array.from(element.querySelectorAll<HTMLElement>('.terminal-line')).find(row => row.getBoundingClientRect().bottom > top)
+    : undefined;
+  const anchorId = anchor?.dataset.entryId, offset = anchor?.getBoundingClientRect().top;
+  await nextTick();
+  if (viewport.value !== element) return;
+  if (following.value) scrollToBottom();
+  else if (newSession !== oldSession) element.scrollTop = 0;
+  else if (anchorId !== undefined && offset !== undefined) {
+    const retained = Array.from(element.querySelectorAll<HTMLElement>('.terminal-line')).find(row => row.dataset.entryId === anchorId);
+    if (retained) element.scrollTop += retained.getBoundingClientRect().top - offset;
+    else element.scrollTop = 0;
+  }
+});
+function resized() { if (following.value) scrollToBottom(); else geometry = measure(); }
+onMounted(() => {
+  scrollToBottom(); window.addEventListener('resize', resized);
+  if (typeof ResizeObserver !== 'undefined') {
+    observer = new ResizeObserver(resized);
+    if (viewport.value) observer.observe(viewport.value);
+    if (content.value) observer.observe(content.value);
+  }
+});
+onBeforeUnmount(() => { observer?.disconnect(); window.removeEventListener('resize', resized); });
+</script>
+<template>
+  <div class="terminal-panel">
+    <div class="terminal-toolbar"><span>BKMQB / LIVE OUTPUT</span><button type="button" :aria-pressed="following" @click="toggleFollow">{{ following ? '正在跟随输出 ↓' : '跟随输出 ↓' }}</button></div>
+    <div ref="viewport" class="terminal-viewport" tabindex="0" role="region" aria-label="实时日志输出" @scroll="onScroll">
+      <div ref="content" class="terminal-lines">
+      <div v-for="entry in entries" :key="`${sessionId}-${entry.id}`" class="terminal-line" :data-entry-id="entry.id"><time :datetime="entry.timestamp" :title="entry.timestamp">{{ time(entry.timestamp) }}</time>{{ ' ' }}<strong class="terminal-level">{{ entry.level.padEnd(5) }}</strong>{{ ' ' }}<span class="terminal-source">{{ entry.target }}</span>{{ entry.instance_id ? ` [${entry.instance_id}]` : '' }}{{ ': ' }}<span class="terminal-message">{{ entry.message || '（无消息文本）' }}</span><span v-for="(value, key) in entry.fields" :key="key" class="terminal-field">{{ ` ${key}=${field(value)}` }}</span></div>
+      <p v-if="!entries.length" class="terminal-empty">{{ emptyMessage }}</p>
+      </div>
+    </div>
+    <div class="terminal-footer"><span>{{ following ? '跟随最新输出' : '正在查看较早记录' }}</span><span>{{ entries.length }} / 1000 行记录 · 本地时间</span></div>
+  </div>
+</template>
