@@ -86,12 +86,16 @@ impl From<ConfigurationError> for ManagementError {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(clippy::struct_excessive_bools)] // Independent persisted, lifecycle and UI flags in the API view.
 pub(crate) struct PluginView {
     instance_id: String,
     plugin_id: String,
     name: String,
     description: String,
     version: String,
+    saved_version: Option<String>,
+    loaded_version: Option<String>,
+    restart_required: bool,
     source: String,
     trust_level: String,
     signature_status: String,
@@ -233,13 +237,7 @@ impl PluginManager {
             let snapshot = snapshots
                 .iter()
                 .find(|item| item.instance_id == installation.instance_id);
-            let view = managed_view(
-                &installation,
-                snapshot,
-                &runtime.packages,
-                &self.file_instances,
-            )
-            .await;
+            let view = managed_view(&installation, snapshot, &runtime, &self.file_instances).await;
             views.insert(installation.instance_id, view);
         }
         Ok(views.into_values().collect())
@@ -262,7 +260,7 @@ impl PluginManager {
             Ok(managed_view(
                 &installation,
                 snapshot.as_ref(),
-                &runtime.packages,
+                &runtime,
                 &self.file_instances,
             )
             .await)
@@ -473,6 +471,9 @@ fn readonly_view(snapshot: &PluginInstanceSnapshot) -> Result<PluginView, Manage
         name: metadata.name.clone(),
         description: metadata.description.clone(),
         version: snapshot.manifest.version.clone(),
+        saved_version: None,
+        loaded_version: Some(snapshot.manifest.version.clone()),
+        restart_required: false,
         source: "声明式配置 / 随包插件".to_owned(),
         trust_level: "file-managed".to_owned(),
         signature_status: "n/a".to_owned(),
@@ -496,24 +497,37 @@ fn readonly_view(snapshot: &PluginInstanceSnapshot) -> Result<PluginView, Manage
 async fn managed_view(
     installation: &PluginInstallation,
     snapshot: Option<&PluginInstanceSnapshot>,
-    packages: &BTreeMap<String, String>,
+    runtime: &RuntimeState,
     file_instances: &BTreeSet<String>,
 ) -> PluginView {
     let mut view = installed_view(installation, snapshot);
-    view.pending |= installation.enabled
-        && packages.get(&installation.instance_id) != Some(&installation.package_sha256);
+    view.restart_required = restart_required(installation, snapshot, runtime);
+    view.pending |= view.restart_required;
     match checked_package(installation).await {
         Ok(package) => view.schema = package.config_schema().cloned(),
         Err(error) => view.error = Some(error.to_string()),
     }
     if crate::plugins::is_reserved_bundled_instance_id(&installation.instance_id)
         || file_instances.contains(&installation.instance_id)
-        || (snapshot.is_some() && !packages.contains_key(&installation.instance_id))
+        || (snapshot.is_some() && !runtime.packages.contains_key(&installation.instance_id))
     {
         view.editable = false;
         view.error = Some("实例 ID 与文件管理的插件冲突，请移除重复安装记录".to_owned());
     }
     view
+}
+
+fn restart_required(
+    installation: &PluginInstallation,
+    snapshot: Option<&PluginInstanceSnapshot>,
+    runtime: &RuntimeState,
+) -> bool {
+    runtime.restart_required.contains(&installation.instance_id)
+        || snapshot.is_some_and(|snapshot| {
+            runtime.packages.get(&installation.instance_id) != Some(&installation.package_sha256)
+                || snapshot.granted_capabilities
+                    != installation.granted_permissions.iter().cloned().collect()
+        })
 }
 
 fn installed_view(
@@ -535,7 +549,6 @@ fn installed_view(
         || (item.enabled
             && snapshot.is_some_and(|snapshot| {
                 snapshot.config != item.config
-                    || snapshot.manifest.version != item.version
                     || snapshot.granted_capabilities
                         != item.granted_permissions.iter().cloned().collect()
             }));
@@ -545,6 +558,9 @@ fn installed_view(
         name,
         description,
         version: item.version.clone(),
+        saved_version: Some(item.version.clone()),
+        loaded_version: snapshot.map(|snapshot| snapshot.manifest.version.clone()),
+        restart_required: false,
         source: item.source.clone(),
         trust_level: item.trust_level.clone(),
         signature_status: item.signature_status.clone(),

@@ -497,14 +497,74 @@ async fn startup_provenance_uses_the_loaded_package_even_if_the_installation_rec
     record.enabled = false;
     fixture.store.upsert_installation(&record).unwrap();
     let manager = PluginManager::new(host, fixture.store.clone(), loaded, BTreeSet::new());
-    assert!(manager.view(&record.instance_id).await.unwrap().editable);
+    let view = manager.view(&record.instance_id).await.unwrap();
+    assert!(view.editable);
+    assert!(
+        view.restart_required,
+        "same version with different package is pending"
+    );
+    assert_eq!(view.saved_version.as_deref(), Some(record.version.as_str()));
+    assert_eq!(
+        view.loaded_version.as_deref(),
+        Some(record.version.as_str())
+    );
+    record.version = "9.9.9".to_owned();
     record.enabled = true;
     fixture.store.upsert_installation(&record).unwrap();
+    let view = manager.view(&record.instance_id).await.unwrap();
+    assert_eq!(view.saved_version.as_deref(), Some("9.9.9"));
+    assert_eq!(
+        view.loaded_version,
+        Some(fixture.installation.version.clone())
+    );
     assert!(matches!(
         manager.apply(&record.instance_id, 1).await,
         Err(ManagementError::RestartRequired)
     ));
     manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn version_status_uses_host_identity_and_explicit_restart_boundaries() {
+    let fixture = Fixture::new(true);
+    let manager = fixture.manager().await;
+    let id = &fixture.installation.instance_id;
+    let view = manager.view(id).await.unwrap();
+    assert_eq!(
+        view.loaded_version,
+        Some(fixture.installation.version.clone())
+    );
+    assert!(!view.restart_required);
+    manager
+        .runtime
+        .write()
+        .unwrap()
+        .restart_required
+        .insert(id.clone());
+    assert!(manager.view(id).await.unwrap().restart_required);
+    manager.shutdown().await.unwrap();
+    // A fresh process establishes a new package identity and clears the marker.
+    let restarted = fixture.manager().await;
+    assert!(!restarted.view(id).await.unwrap().restart_required);
+    restarted.shutdown().await.unwrap();
+
+    let fixture = Fixture::new(false);
+    let manager = fixture.manager().await;
+    let id = &fixture.installation.instance_id;
+    manager
+        .runtime
+        .write()
+        .unwrap()
+        .restart_required
+        .insert(id.clone());
+    let view = manager.view(id).await.unwrap();
+    assert_eq!(view.runtime_state, "not_loaded");
+    assert_eq!(view.loaded_version, None);
+    assert_eq!(
+        view.saved_version,
+        Some(fixture.installation.version.clone())
+    );
+    assert!(view.restart_required);
 }
 
 #[tokio::test]

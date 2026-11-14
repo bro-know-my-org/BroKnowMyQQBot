@@ -37,6 +37,9 @@ pub(crate) struct CatalogueItem {
 #[derive(Serialize)]
 struct Installed {
     version: String,
+    saved_version: Option<String>,
+    loaded_version: Option<String>,
+    restart_required: bool,
     enabled: bool,
     updated_at_ms: i64,
     granted_permissions: Vec<String>,
@@ -152,6 +155,9 @@ impl PluginManager {
                 .as_ref()
                 .map(|record: &PluginInstallation| Installed {
                     version: record.version.clone(),
+                    saved_version: Some(record.version.clone()),
+                    loaded_version: snapshot.map(|s| s.manifest.version.clone()),
+                    restart_required: super::restart_required(record, snapshot, &runtime),
                     enabled: record.enabled,
                     updated_at_ms: record.updated_at_ms,
                     granted_permissions: record.granted_permissions.clone(),
@@ -160,6 +166,9 @@ impl PluginManager {
                 .or_else(|| {
                     snapshot.map(|s| Installed {
                         version: s.manifest.version.clone(),
+                        saved_version: None,
+                        loaded_version: Some(s.manifest.version.clone()),
+                        restart_required: false,
                         enabled: s.state == plugin_host::PluginInstanceState::Ready,
                         updated_at_ms: 0,
                         granted_permissions: s.granted_capabilities.iter().cloned().collect(),
