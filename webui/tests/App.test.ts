@@ -316,6 +316,7 @@ it('卸载明确确认后携带 CAS，移除实例并将焦点带回插件列表
   expect(posts()).toHaveLength(1);
   expect(posts()[0]).toMatchObject({ path: '/api/plugins/uninstall', body: { instance_id: 'sample', expected_updated_at_ms: 1, confirm: true } });
   expect(window.confirm).toHaveBeenLastCalledWith(expect.stringContaining('保留私有数据'));
+  expect(window.confirm).toHaveBeenLastCalledWith(expect.stringContaining('实例 sample'));
   expect(router.currentRoute.value.name).toBe('plugins');
   expect(document.querySelectorAll('.plugin-item')).toHaveLength(0);
   expect(document.activeElement).toBe(get('#page-content h1'));
@@ -332,6 +333,19 @@ it('恢复明确准备重启，不宣称运行中或自动应用', async () => {
   expect(text()).toContain('需要重启 Bot');
   expect(disabled('#apply')).toBe(true);
   expect(get('.detail-header').textContent).toContain('已禁用');
+  expect(window.confirm).toHaveBeenCalledTimes(1);
+  for (const boundary of ['实例 sample', '保留私有数据', '需要重启 Bot', '重启后可能产生消息', '本次不会立即重放']) {
+    expect(window.confirm).toHaveBeenLastCalledWith(expect.stringContaining(boundary));
+  }
+});
+
+it.each(['uninstall', 'recover'])('取消或 ESC 关闭 %s 确认框不发送写请求', async operation => {
+  await login(pluginRoute('sample'));
+  vi.mocked(window.confirm).mockReturnValue(false);
+  await click(`#${operation}-plugin`);
+  expect(window.confirm).toHaveBeenCalledTimes(1);
+  expect(posts()).toHaveLength(0);
+  expect(router.currentRoute.value.name).toBe('plugin-overview');
 });
 
 it.each([409, 503])('运维失败 %s 后只读取核对并阻止重复写入直到显式刷新', async status => {
@@ -354,6 +368,8 @@ it('卸载进行中阻止导航，迟到的确认响应完成后才离开', asyn
   get<HTMLButtonElement>('#uninstall-plugin').click(); await nextTick();
   await go({ name: 'plugins' }); expect(router.currentRoute.value.name).toBe('plugin-overview');
   expect(disabled('#recover-plugin')).toBe(true);
+  get<HTMLButtonElement>('#uninstall-plugin').click(); get<HTMLButtonElement>('#recover-plugin').click(); await nextTick();
+  expect(window.confirm).toHaveBeenCalledTimes(1);
   finish(new Response(JSON.stringify({ removed: true, instance_id: 'sample', private_state_retained: true })));
   await flush(); await flush();
   expect(router.currentRoute.value.name).toBe('plugins');

@@ -19,9 +19,10 @@ function save() { if (props.busy || !props.plugin.editable || props.conflict || 
 function discard() { if (window.confirm("有未保存更改，是否放弃这些更改？")) editor.value?.reset(); }
 function operate(action: 'uninstall' | 'recover') {
   if (props.busy || !props.plugin.editable || props.conflict || dirty.value) return;
+  const target = `“${props.plugin.name || props.plugin.plugin_id}”（实例 ${props.plugin.instance_id}）`;
   const question = action === 'uninstall'
-    ? `确认卸载“${props.plugin.name || props.plugin.plugin_id}”？将停止当前实例并移除安装记录，保留私有数据。`
-    : '恢复会停止并退休当前实例，准备失败投递供下次重启重试。重启后可能产生消息，本次不会立即重放。确认继续？';
+    ? `确认卸载${target}？将停止当前实例并移除安装记录，保留私有数据。`
+    : `确认恢复${target}？保留私有数据，停止并退休当前实例，准备失败投递供下次重启重试。需要重启 Bot；重启后可能产生消息，本次不会立即重放。`;
   if (window.confirm(question)) emit('mutate', { action, confirm: true });
 }
 </script>
