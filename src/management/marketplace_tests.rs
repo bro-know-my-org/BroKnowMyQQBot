@@ -152,6 +152,8 @@ async fn marketplace_install_is_explicit_disabled_without_grants_and_restart_onl
     let (status, result) = send(app.clone(), "/api/marketplace/install", Some(body.clone())).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(result["restart_required"], true);
+    assert_eq!(result["loaded_version"], Value::Null);
+    assert_eq!(result["runtime_state"], "not_loaded");
     assert_eq!(result["enabled"], false);
     assert_eq!(result["missing_permissions"], json!(["message.reply"]));
     let id = "dev.bkm.wasm-ping/default";

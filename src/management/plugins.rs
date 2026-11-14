@@ -86,6 +86,18 @@ pub(super) fn router_with_runtime(
         .route("/api/plugins/config", post(save_config))
         .route("/api/plugins/enabled", post(save_enabled))
         .route("/api/plugins/apply", post(apply))
+        .route(
+            "/api/plugins/uninstall",
+            post(super::plugin_operations::uninstall),
+        )
+        .route(
+            "/api/plugins/recover",
+            post(super::plugin_operations::recover),
+        )
+        .route(
+            "/api/plugins/failures",
+            get(super::plugin_operations::failures),
+        )
         .route("/api/logs", get(super::logs::get))
         .route(
             "/api/settings/system",
@@ -232,7 +244,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self.0 {
             ManagementError::NotManaged => StatusCode::NOT_FOUND,
-            ManagementError::InvalidMarketRequest => StatusCode::BAD_REQUEST,
+            ManagementError::InvalidMarketRequest | ManagementError::InvalidOperation => {
+                StatusCode::BAD_REQUEST
+            }
             ManagementError::Conflict | ManagementError::StaleMarketplace => StatusCode::CONFLICT,
             ManagementError::Busy => StatusCode::TOO_MANY_REQUESTS,
             ManagementError::Store => StatusCode::INTERNAL_SERVER_ERROR,
@@ -323,6 +337,9 @@ mod tests {
             ("/api/plugins/config", "POST"),
             ("/api/plugins/enabled", "POST"),
             ("/api/plugins/apply", "POST"),
+            ("/api/plugins/uninstall", "POST"),
+            ("/api/plugins/recover", "POST"),
+            ("/api/plugins/failures", "GET"),
             ("/api/settings/commands", "GET"),
             ("/api/settings/commands", "POST"),
         ] {

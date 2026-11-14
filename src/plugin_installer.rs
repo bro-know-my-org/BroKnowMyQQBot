@@ -47,6 +47,16 @@ pub(crate) fn finish_installation(
     existing: Option<&PluginInstallation>,
     pending: &PendingInstallation,
 ) -> Result<PluginInstallation, Box<dyn std::error::Error>> {
+    finish_installation_retaining(store, database, existing, pending, &BTreeSet::new())
+}
+
+pub(crate) fn finish_installation_retaining(
+    store: &PluginStore,
+    database: &Path,
+    existing: Option<&PluginInstallation>,
+    pending: &PendingInstallation,
+    loaded_hashes: &BTreeSet<String>,
+) -> Result<PluginInstallation, Box<dyn std::error::Error>> {
     let _lifecycle_lock = lock_managed_package_lifecycle(database)?;
     let destination = persist_installed_package(
         database,
@@ -79,6 +89,7 @@ pub(crate) fn finish_installation(
         &installation,
         existing.map(|item| item.updated_at_ms),
         existing,
+        loaded_hashes,
     )?;
     Ok(installation)
 }
@@ -95,17 +106,22 @@ fn write_installation_and_cleanup(
     installation: &PluginInstallation,
     expected_updated_at_ms: Option<i64>,
     previous: Option<&PluginInstallation>,
+    loaded_hashes: &BTreeSet<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = store.write_installation(installation, expected_updated_at_ms) {
-        let _ = cleanup_unreferenced_managed_package(
-            store,
-            database,
-            Path::new(&installation.package_path),
-        );
+        if !loaded_hashes.contains(&installation.package_sha256) {
+            let _ = cleanup_unreferenced_managed_package(
+                store,
+                database,
+                Path::new(&installation.package_path),
+            );
+        }
         return Err(error.into());
     }
     if let Some(previous) = previous {
-        if previous.package_path != installation.package_path {
+        if previous.package_path != installation.package_path
+            && !loaded_hashes.contains(&previous.package_sha256)
+        {
             let _ = cleanup_unreferenced_managed_package(
                 store,
                 database,

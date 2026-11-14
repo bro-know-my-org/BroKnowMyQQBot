@@ -10,7 +10,7 @@ use super::*;
 use crate::plugin_configuration::fixture::Fixture;
 
 impl Fixture {
-    async fn manager(&self) -> PluginManager {
+    pub(crate) async fn manager(&self) -> PluginManager {
         let mut host = StaticPluginHost::new(self.store.clone());
         if self.installation.enabled {
             host.register(
@@ -36,6 +36,157 @@ impl Fixture {
         };
         PluginManager::new(host, self.store.clone(), packages, BTreeSet::new())
     }
+}
+
+#[tokio::test]
+async fn uninstall_stops_active_host_retains_private_state_and_survives_request_cancellation() {
+    let mut fixture = Fixture::new(true);
+    let directory = fixture.directory.join("plugins");
+    fs::create_dir(&directory).unwrap();
+    let package = directory.join("installed.bkm-plugin");
+    fs::rename(&fixture.installation.package_path, &package).unwrap();
+    fixture.installation.package_path = package.to_str().unwrap().to_owned();
+    fixture
+        .store
+        .upsert_installation(&fixture.installation)
+        .unwrap();
+    let manager = fixture
+        .manager()
+        .await
+        .with_marketplace(
+            fixture.directory.join("plugins.db"),
+            None,
+            crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+        )
+        .unwrap();
+    let id = &fixture.installation.instance_id;
+    let old_host = manager.snapshot().unwrap().host;
+    fixture
+        .store
+        .commit(
+            id,
+            "private",
+            &[plugin_api::StateOp::Put {
+                key: "private/value".to_owned(),
+                value: b"keep".to_vec(),
+                expected_revision: None,
+            }],
+            &[],
+            plugin_host::CommitOptions::new(1024),
+        )
+        .unwrap();
+    let write = manager.writes.lock().await;
+    let mut request = Box::pin(manager.uninstall(id, 1));
+    assert!(futures_util::poll!(request.as_mut()).is_pending());
+    drop(request);
+    drop(write);
+    manager.shutdown().await.unwrap();
+    assert!(fixture.store.installation(id).unwrap().is_none());
+    assert!(!package.exists());
+    assert_eq!(
+        fixture
+            .store
+            .state_get(id, "private/value")
+            .unwrap()
+            .unwrap()
+            .value,
+        b"keep"
+    );
+    assert!(manager.list().await.unwrap().is_empty());
+    assert_eq!(
+        old_host.instance_snapshots().unwrap()[0].state,
+        PluginInstanceState::Disabled
+    );
+    assert!(old_host.set_instance_enabled(id, true).await.is_err());
+}
+
+#[tokio::test]
+async fn recovery_stops_current_guest_and_only_prepares_restart_without_reusing_it() {
+    let fixture = Fixture::new(true);
+    let manager = fixture
+        .manager()
+        .await
+        .with_marketplace(
+            fixture.directory.join("plugins.db"),
+            None,
+            crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+        )
+        .unwrap();
+    let id = &fixture.installation.instance_id;
+    assert!(matches!(
+        manager.recover(id, 0).await,
+        Err(ManagementError::Conflict)
+    ));
+    let old_host = manager.snapshot().unwrap().host;
+    manager.recover(id, 1).await.unwrap();
+    assert!(old_host.set_instance_enabled(id, true).await.is_err());
+    let view = manager.view(id).await.unwrap();
+    assert_eq!(view.runtime_state, "disabled");
+    assert!(view.restart_required);
+    assert!(view.updated_at_ms > 1);
+    assert!(matches!(
+        manager.apply(id, view.updated_at_ms).await,
+        Err(ManagementError::RestartRequired)
+    ));
+    assert!(matches!(
+        manager.recover(id, 1).await,
+        Err(ManagementError::Conflict)
+    ));
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn package_update_keeps_a_previous_package_pinned_by_a_loaded_guest() {
+    use crate::plugin_installer::{PendingInstallation, finish_installation_retaining};
+    let fixture = Fixture::new(false);
+    let package = checked_package(&fixture.installation).await.unwrap();
+    let mut old = fixture.installation.clone();
+    fs::create_dir(fixture.directory.join("plugins")).unwrap();
+    let old_path = fixture.directory.join("plugins/old.bkm-plugin");
+    fs::copy(&old.package_path, &old_path).unwrap();
+    old.package_path = old_path.to_str().unwrap().to_owned();
+    old.package_sha256 = "old-loaded-package".to_owned();
+    fixture.store.upsert_installation(&old).unwrap();
+    let pending = PendingInstallation {
+        manifest: package.manifest().clone(),
+        instance_id: old.instance_id.clone(),
+        package_sha256: package.package_sha256().to_owned(),
+        package_bytes: fs::read(&fixture.installation.package_path).unwrap(),
+        source: "local".to_owned(),
+        requested: BTreeSet::new(),
+        granted: BTreeSet::new(),
+        config: BTreeMap::new(),
+        permissions_complete: true,
+        config_error: None,
+        update: true,
+    };
+    let installed = finish_installation_retaining(
+        &fixture.store,
+        &fixture.directory.join("plugins.db"),
+        Some(&old),
+        &pending,
+        &BTreeSet::from([old.package_sha256.clone()]),
+    )
+    .unwrap();
+    assert_ne!(installed.package_path, old.package_path);
+    assert!(old_path.exists());
+    let manager = fixture
+        .manager()
+        .await
+        .with_marketplace(
+            fixture.directory.join("plugins.db"),
+            None,
+            crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+        )
+        .unwrap();
+    manager
+        .runtime
+        .write()
+        .unwrap()
+        .retained_packages
+        .insert(old_path.clone());
+    manager.shutdown().await.unwrap();
+    assert!(!old_path.exists());
 }
 
 #[tokio::test]
@@ -130,6 +281,9 @@ type Pause = Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
 
 impl Fixture {
     async fn rejecting_manager(&self, pause: Option<Pause>) -> PluginManager {
+        self.rejecting_manager_inner(pause, false).await
+    }
+    async fn rejecting_manager_inner(&self, pause: Option<Pause>, stop: bool) -> PluginManager {
         let mut host = StaticPluginHost::new(self.store.clone());
         let manifest = checked_package(&self.installation)
             .await
@@ -137,7 +291,11 @@ impl Fixture {
             .manifest()
             .clone();
         host.register_trusted(
-            Arc::new(RejectingPlugin { manifest, pause }),
+            Arc::new(RejectingPlugin {
+                manifest,
+                pause,
+                stop,
+            }),
             &self.installation.instance_id,
             BTreeMap::new(),
         )
@@ -169,6 +327,7 @@ fn runtime_config(manager: &PluginManager) -> BTreeMap<String, Value> {
 struct RejectingPlugin {
     manifest: PluginManifest,
     pause: Option<Pause>,
+    stop: bool,
 }
 
 #[async_trait]
@@ -190,6 +349,16 @@ impl StaticPlugin for RejectingPlugin {
         }
         Ok(())
     }
+    async fn shutdown(&self) -> Result<(), PluginError> {
+        if self.stop {
+            let Some(pause) = self.pause.as_ref() else {
+                return Err(PluginError::Permanent("shutdown failed".to_owned()));
+            };
+            pause.0.notify_one();
+            pause.1.notified().await;
+        }
+        Ok(())
+    }
     async fn on_event(
         &self,
         _: &PluginEventEnvelope,
@@ -199,6 +368,72 @@ impl StaticPlugin for RejectingPlugin {
             disposition: plugin_api::Disposition::Ignore,
             ..HandlerOutput::default()
         })
+    }
+}
+
+#[tokio::test]
+async fn failed_shutdown_operations_keep_installation_and_report_restart_required() {
+    for recovering in [false, true] {
+        let fixture = Fixture::new(true);
+        let manager = fixture
+            .rejecting_manager_inner(None, true)
+            .await
+            .with_marketplace(
+                fixture.directory.join("plugins.db"),
+                None,
+                crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+            )
+            .unwrap();
+        let id = &fixture.installation.instance_id;
+        let result = if recovering {
+            manager.recover(id, 1).await.map(|_| ())
+        } else {
+            manager.uninstall(id, 1).await
+        };
+        assert!(matches!(result, Err(ManagementError::Lifecycle)));
+        let view = manager.view(id).await.unwrap();
+        assert_eq!(view.runtime_state, "disabled");
+        assert!(view.restart_required);
+        assert!(fixture.store.installation(id).unwrap().is_some());
+        manager.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn operation_cas_conflict_after_stop_keeps_the_restart_boundary_visible() {
+    for recovering in [false, true] {
+        let fixture = Fixture::new(true);
+        let pause = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        let manager = fixture
+            .rejecting_manager_inner(Some(pause.clone()), true)
+            .await
+            .with_marketplace(
+                fixture.directory.join("plugins.db"),
+                None,
+                crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+            )
+            .unwrap();
+        let id = &fixture.installation.instance_id;
+        let removal = async {
+            if recovering {
+                manager.recover(id, 1).await.map(|_| ())
+            } else {
+                manager.uninstall(id, 1).await
+            }
+        };
+        tokio::pin!(removal);
+        assert!(futures_util::poll!(&mut removal).is_pending());
+        pause.0.notified().await;
+        let mut edited = fixture.installation.clone();
+        edited.updated_at_ms = 2;
+        fixture.store.write_installation(&edited, Some(1)).unwrap();
+        pause.1.notify_one();
+        assert!(matches!(removal.await, Err(ManagementError::Conflict)));
+        let view = manager.view(id).await.unwrap();
+        assert_eq!(view.runtime_state, "disabled");
+        assert!(view.restart_required);
+        assert!(fixture.store.installation(id).unwrap().is_some());
+        manager.shutdown().await.unwrap();
     }
 }
 

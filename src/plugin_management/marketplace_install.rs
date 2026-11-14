@@ -1,7 +1,7 @@
 use super::marketplace::selection;
 use super::{ManagementError, PluginManager};
 use crate::plugin_installer::{
-    PendingInstallation, finish_installation, validate_install_candidate,
+    PendingInstallation, finish_installation_retaining, validate_install_candidate,
 };
 use plugin_host::{PluginInstallation, ValidatedPluginPackage};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,8 @@ pub(crate) struct InstallResult {
     version: String,
     enabled: bool,
     restart_required: bool,
+    loaded_version: Option<String>,
+    runtime_state: &'static str,
     missing_permissions: Vec<String>,
     config_incomplete: bool,
     updated_at_ms: i64,
@@ -71,6 +73,10 @@ impl PluginManager {
             .cloned()
             .collect();
         let config_incomplete = pending.config_error.is_some();
+        let loaded_hashes = self.snapshot()?.packages.into_values().collect();
+        let previous_package = existing
+            .as_ref()
+            .map(|i| (i.package_path.clone(), i.package_sha256.clone()));
         let installation = tokio::task::spawn_blocking(move || {
             if crate::plugins::is_declared_instance_id(
                 context.declarations.as_deref(),
@@ -80,37 +86,57 @@ impl PluginManager {
             {
                 return Err(ManagementError::NotManaged);
             }
-            finish_installation(&store, &context.database, existing.as_ref(), &pending).map_err(
-                |error| {
-                    if let Some(error) = error.downcast_ref::<plugin_host::StoreError>() {
-                        if matches!(error, plugin_host::StoreError::InstallationConflict) {
-                            ManagementError::Conflict
-                        } else {
-                            ManagementError::Store
-                        }
-                    } else if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
-                    {
-                        ManagementError::Busy
+            finish_installation_retaining(
+                &store,
+                &context.database,
+                existing.as_ref(),
+                &pending,
+                &loaded_hashes,
+            )
+            .map_err(|error| {
+                if let Some(error) = error.downcast_ref::<plugin_host::StoreError>() {
+                    if matches!(error, plugin_host::StoreError::InstallationConflict) {
+                        ManagementError::Conflict
                     } else {
                         ManagementError::Store
                     }
-                },
-            )
+                } else if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
+                {
+                    ManagementError::Busy
+                } else {
+                    ManagementError::Store
+                }
+            })
         })
         .await
         .map_err(|_| ManagementError::Store)??;
-        self.runtime
-            .write()
+        {
+            let mut runtime = self.runtime.write().map_err(|_| ManagementError::Store)?;
+            if let Some((path, hash)) = previous_package {
+                if path != installation.package_path
+                    && runtime.packages.values().any(|loaded| loaded == &hash)
+                {
+                    runtime.retained_packages.insert(path.into());
+                }
+            }
+            runtime.restart_required.insert(id.clone());
+        }
+        let loaded = self
+            .snapshot()?
+            .host
+            .instance_snapshots()
             .map_err(|_| ManagementError::Store)?
-            .restart_required
-            .insert(id.clone());
+            .into_iter()
+            .find(|s| s.instance_id == id);
         Ok(InstallResult {
             instance_id: id,
             version: installation.version,
             enabled: installation.enabled,
             restart_required: true,
+            loaded_version: loaded.as_ref().map(|s| s.manifest.version.clone()),
+            runtime_state: loaded.map_or("not_loaded", |s| super::state_name(s.state)),
             missing_permissions,
             config_incomplete,
             updated_at_ms: installation.updated_at_ms,

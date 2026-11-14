@@ -2,6 +2,7 @@
 
 pub(crate) mod marketplace;
 pub(crate) mod marketplace_install;
+mod operations;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -34,6 +35,8 @@ pub(crate) enum ManagementError {
     StaleMarketplace,
     #[error("市场请求无效，请重新选择插件")]
     InvalidMarketRequest,
+    #[error("插件操作无效，请重新确认操作与当前实例")]
+    InvalidOperation,
     #[error("插件不存在，或由声明式文件管理")]
     NotManaged,
     #[error("插件记录已改变，请刷新后重试")]
@@ -136,6 +139,7 @@ struct RuntimeState {
     host: StaticPluginHost,
     packages: BTreeMap<String, String>,
     restart_required: BTreeSet<String>,
+    retained_packages: BTreeSet<std::path::PathBuf>,
 }
 
 impl PluginManager {
@@ -163,6 +167,7 @@ impl PluginManager {
                 host,
                 packages,
                 restart_required: BTreeSet::new(),
+                retained_packages: BTreeSet::new(),
             })),
             writes: Arc::new(Mutex::new(())),
             operations: Arc::new(StdMutex::new(Operations::default())),
@@ -184,6 +189,7 @@ impl PluginManager {
         // the lock, while the supervisor keeps ownership of operations and Host.
         let mut worker = self.shutdown_worker.lock().await;
         if worker.is_none() {
+            let manager = self.clone();
             let runtime = Arc::clone(&self.runtime);
             let mut operations = self
                 .operations
@@ -202,6 +208,10 @@ impl PluginManager {
                     .host
                     .clone();
                 host.shutdown().await?;
+                manager
+                    .cleanup_retained_packages()
+                    .await
+                    .map_err(|_| PluginHostError::Store(StoreError::Poisoned))?;
                 if failed {
                     return Err(PluginHostError::Store(StoreError::Poisoned));
                 }
@@ -380,7 +390,11 @@ impl PluginManager {
                 return Err(ManagementError::RestartRequired);
             }
             if existing.state == PluginInstanceState::Disabled {
-                return Err(ManagementError::Disabled);
+                return Err(if runtime.restart_required.contains(instance_id) {
+                    ManagementError::RestartRequired
+                } else {
+                    ManagementError::Disabled
+                });
             }
         } else if !installation.enabled {
             return Ok(());

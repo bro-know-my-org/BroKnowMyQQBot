@@ -7,6 +7,7 @@ mod logs_stream;
 mod marketplace;
 #[cfg(test)]
 mod message_flow_tests;
+mod plugin_operations;
 mod plugins;
 mod runtime;
 mod settings;
