@@ -110,3 +110,58 @@ it('发送结果只展示状态，不把结果记录误标为正文未采集', a
   expect(host.textContent).toContain('正文=pong');
   expect(host.textContent).not.toContain('正文未采集');
 });
+
+it("中文阅读与原始日志切换保留节点，已采集正文仍按独立开关显示", async () => {
+  const includeContent = ref(false), host = document.createElement("div"); document.body.append(host);
+  const entries: LogEntry[] = [{ ...entry(1), category: "message", target: "bkm::message_trace", message: "received message", fields: { record_kind: "message.received", message_scope: "private", event_id: "event-1", adapter_id: "qq-official" }, content: "<img src=x>" }];
+  app = createApp(defineComponent(() => () => h(TerminalOutput, { entries, includeContent: includeContent.value, emptyMessage: "等待输出" }))); app.mount(host);
+  const line = document.querySelector(".terminal-line"), raw = [...document.querySelectorAll("button")].find(button => button.textContent === "原始日志：关")!;
+  expect(line?.textContent).toContain("[已收到] qq-official: 收到一条私聊消息");
+  expect(line?.textContent).not.toContain("event_id"); expect(line?.textContent).not.toContain("<img");
+  raw.click(); await flush();
+  expect(document.querySelector(".terminal-line")).toBe(line); expect(raw.getAttribute("aria-pressed")).toBe("true");
+  expect(line?.textContent).toContain("INFO  bkm::message_trace: [方向未标注] received message");
+  expect(line?.textContent).toContain("event_id=event-1"); expect(line?.textContent).not.toContain("<img");
+  includeContent.value = true; await flush(); expect(line?.textContent).toContain("正文=<img src=x>");
+  raw.click(); await flush(); expect(line?.textContent).toContain("收到一条私聊消息"); expect(line?.textContent).toContain("正文=<img src=x>");
+  expect(document.querySelector("img")).toBeNull();
+});
+it("阅读层中的插件展示名称和指令保持转义，追加记录不重写已有摘要", async () => {
+  const host = document.createElement("div"); document.body.append(host);
+  const entries = ref<LogEntry[]>([{ ...entry(1), instance_id: "plugin/default", fields: { record_kind: "plugin.completed", status: "output_committed", plugin_id: "dev.bkm.plugin", command_name: "<script>bad</script>", command_count: "1" } }]);
+  app = createApp(defineComponent(() => () => h(TerminalOutput, { entries: entries.value, plugins: [{ instance_id: "plugin/default", plugin_id: "dev.bkm.plugin", name: "<img src=x>" } as import("./types").PluginView], emptyMessage: "等待输出" }))); app.mount(host);
+  const row = document.querySelector(".terminal-line"), text = row?.querySelector(".terminal-message")?.firstChild;
+  expect(row?.textContent).toContain("<img src=x> · plugin/default: 插件产生了输出");
+  expect(row?.textContent).toContain("候选指令：<script>bad</script>"); expect(document.querySelector("script,img")).toBeNull();
+  entries.value = [...entries.value, entry(2)]; await flush();
+  expect(document.querySelector(".terminal-line")).toBe(row); expect(row?.querySelector(".terminal-message")?.firstChild).toBe(text);
+});
+
+it("向上阅读并换行时，异步插件名称和原始日志切换均保留可见行锚点", async () => {
+  const host = document.createElement("div"); document.body.append(host);
+  const entries = Array.from({ length: 10 }, (_, index): LogEntry => ({ ...entry(index + 1), instance_id: "plugin/default", fields: { record_kind: "plugin.completed", status: "no_output" } }));
+  const plugins = ref([{ instance_id: "plugin/default", name: "短名" } as import("./types").PluginView]);
+  app = createApp(defineComponent(() => () => h(TerminalOutput, { entries, plugins: plugins.value, emptyMessage: "等待输出" }))); app.mount(host);
+  const viewport = document.querySelector<HTMLElement>(".terminal-viewport")!;
+  let position = 0;
+  const height = () => document.querySelector(".terminal-field") ? 60 : document.querySelector(".terminal-source")?.textContent?.startsWith("长") ? 40 : 20;
+  Object.defineProperties(viewport, {
+    clientHeight: { get: () => 60 }, scrollHeight: { get: () => 10 * height() },
+    scrollTop: { get: () => position, set: (value: number) => { position = Math.max(0, Math.min(value, viewport.scrollHeight - 60)); } },
+  });
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+    const line = this.classList.contains("terminal-line"), index = line ? Array.from(this.parentElement!.children).indexOf(this) : 0;
+    const top = line ? index * height() - position : 0;
+    return { top, bottom: top + (line ? height() : 60) } as DOMRect;
+  });
+  const controls = document.querySelectorAll<HTMLButtonElement>(".terminal-controls button");
+  controls[1]!.click(); await flush(); window.dispatchEvent(new Event("resize"));
+  viewport.scrollTop = 100; viewport.dispatchEvent(new Event("scroll")); await flush();
+  const anchor = document.querySelector("[data-entry-id=\"6\"]")!;
+  expect(anchor.getBoundingClientRect().top).toBe(0);
+  plugins.value = [{ ...plugins.value[0]!, name: "长名称需要换行" }]; await flush();
+  expect(position).toBe(200); expect(anchor.getBoundingClientRect().top).toBe(0);
+  controls[2]!.click(); await flush();
+  expect(position).toBe(300); expect(anchor.getBoundingClientRect().top).toBe(0);
+  expect(controls[0]!.getAttribute("aria-pressed")).toBe("false");
+});

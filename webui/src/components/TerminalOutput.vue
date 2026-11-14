@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import type { LogEntry } from '../types';
-import { isMessageResult, messageDirection } from '../logPresentation';
-const props = defineProps<{ entries: LogEntry[]; sessionId?: string; emptyMessage: string; includeContent?: boolean }>();
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import type { LogEntry, PluginView } from '../types';
+import { isMessageResult, logSource, messageDirection, readLog } from '../logPresentation';
+const props = defineProps<{ entries: LogEntry[]; sessionId?: string; emptyMessage: string; includeContent?: boolean; plugins?: PluginView[] }>();
 const viewport = ref<HTMLElement>(), content = ref<HTMLElement>(), following = ref(true);
-const wrapping = ref(false);
+const wrapping = ref(false), raw = ref(false);
+const pluginLabels = computed(() => new Map((props.plugins ?? []).map(plugin => [plugin.instance_id, plugin])));
 let observer: ResizeObserver | undefined;
 let geometry = '';
 function measure() { const element = viewport.value; return element ? `${element.clientWidth}/${element.clientHeight}/${element.scrollHeight}` : ''; }
@@ -28,7 +29,7 @@ function time(timestamp: string) {
   return `${clock.format(date)}.${String(date.getMilliseconds()).padStart(3, '0')}`;
 }
 function field(value: string) { return /\s|["=]/u.test(value) ? JSON.stringify(value) : value; }
-watch([() => props.entries, () => props.sessionId], async ([, newSession], [, oldSession]) => {
+watch([() => props.entries, () => props.sessionId, raw, pluginLabels], async ([, newSession], [, oldSession]) => {
   const element = viewport.value;
   if (!element) return;
   const top = element.getBoundingClientRect().top;
@@ -64,10 +65,10 @@ onBeforeUnmount(() => { observer?.disconnect(); window.removeEventListener('resi
 </script>
 <template>
   <div class="terminal-panel">
-    <div class="terminal-toolbar"><span>BKMQB / LIVE OUTPUT</span><div class="terminal-controls"><button type="button" :aria-pressed="following" @click="toggleFollow">{{ following ? '正在跟随输出 ↓' : '跟随输出 ↓' }}</button><button type="button" :aria-pressed="wrapping" @click="toggleWrap">自动换行：{{ wrapping ? '开' : '关' }}</button></div></div>
+    <div class="terminal-toolbar"><span>BKMQB / LIVE OUTPUT</span><div class="terminal-controls"><button type="button" :aria-pressed="following" @click="toggleFollow">{{ following ? '正在跟随输出 ↓' : '跟随输出 ↓' }}</button><button type="button" :aria-pressed="wrapping" @click="toggleWrap">自动换行：{{ wrapping ? '开' : '关' }}</button><button type="button" :aria-pressed="raw" @click="raw = !raw">原始日志：{{ raw ? '开' : '关' }}</button></div></div>
     <div ref="viewport" class="terminal-viewport" :class="{ 'is-wrapping': wrapping }" tabindex="0" role="region" aria-label="实时日志输出" @scroll="onScroll">
       <div ref="content" class="terminal-lines">
-      <div v-for="entry in entries" v-memo="[entry, sessionId, includeContent]" :key="`${sessionId}-${entry.id}`" class="terminal-line" :data-entry-id="entry.id"><time :datetime="entry.timestamp" :title="entry.timestamp">{{ time(entry.timestamp) }}</time>{{ ' ' }}<strong class="terminal-level">{{ entry.level.padEnd(5) }}</strong>{{ ' ' }}<span class="terminal-source">{{ entry.target }}</span>{{ entry.instance_id ? ` [${entry.instance_id}]` : '' }}{{ ': ' }}<span v-if="entry.category === 'message'">{{ `[${messageDirection(entry)}] ` }}</span><span class="terminal-message">{{ entry.message || '（无消息文本）' }}</span><span v-for="(value, key) in entry.fields" :key="key" class="terminal-field">{{ ` ${key}=${field(value)}` }}</span><span v-if="entry.category === 'message' && includeContent && (!isMessageResult(entry) || entry.content !== undefined)" class="terminal-body">{{ ` 正文=${entry.content ?? '正文未采集'}` }}</span></div>
+      <div v-for="entry in entries" v-memo="[entry, sessionId, includeContent, raw, pluginLabels]" :key="`${sessionId}-${entry.id}`" class="terminal-line" :data-entry-id="entry.id"><time :datetime="entry.timestamp" :title="entry.timestamp">{{ time(entry.timestamp) }}</time>{{ ' ' }}<template v-for="reading in [raw ? undefined : readLog(entry)]"><template v-if="reading"><strong class="terminal-status">{{ `[${reading.status}]` }}</strong>{{ ' ' }}<span class="terminal-source">{{ logSource(entry, pluginLabels) }}</span>{{ ': ' }}<span class="terminal-message">{{ reading.summary }}</span><span v-if="reading.detail" class="terminal-detail">{{ ` · ${reading.detail}` }}</span><span v-if="entry.level === 'WARN' || entry.level === 'ERROR'" class="terminal-level">{{ ` [${entry.level}]` }}</span></template><template v-else><strong class="terminal-level">{{ entry.level.padEnd(5) }}</strong>{{ ' ' }}<span class="terminal-source">{{ entry.target }}</span>{{ entry.instance_id ? ` [${entry.instance_id}]` : '' }}{{ ': ' }}<span v-if="entry.category === 'message'">{{ `[${messageDirection(entry)}] ` }}</span><span class="terminal-message">{{ entry.message || '（无消息文本）' }}</span><span v-for="(value, key) in entry.fields" :key="key" class="terminal-field">{{ ` ${key}=${field(value)}` }}</span></template></template><span v-if="entry.category === 'message' && includeContent && (!isMessageResult(entry) || entry.content !== undefined)" class="terminal-body">{{ ` 正文=${entry.content ?? '正文未采集'}` }}</span></div>
       <p v-if="!entries.length" class="terminal-empty">{{ emptyMessage }}</p>
       </div>
     </div>

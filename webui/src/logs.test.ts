@@ -64,8 +64,9 @@ describe('持续日志的实际 DOM 交互', () => {
     const rows = document.querySelectorAll('.terminal-line');
     expect(rows[0]!.textContent).toContain('[入站]'); expect(rows[0]!.textContent).not.toContain('dev.actual.plugin');
     expect(rows[0]!.textContent).toContain('正文=<img src=x onerror=alert(1)>\n第二行');
-    expect(rows[1]!.textContent).toContain('[出站]'); expect(rows[1]!.textContent).not.toContain('正文未采集');
-    expect(rows[2]!.textContent).toContain('plugin_id=dev.actual.plugin command_name=echo event_id=event/1');
+    expect(rows[1]!.textContent).toContain('[发送失败]'); expect(rows[1]!.textContent).not.toContain('正文未采集');
+    expect(rows[2]!.textContent).toContain('dev.actual.plugin · actual/instance');
+    expect(rows[2]!.textContent).toContain('候选指令：echo'); expect(rows[2]!.textContent).not.toContain('event_id=');
     expect(rows[2]!.textContent).toContain('未产生输出'); expect(rows[2]!.textContent).not.toContain('已处理');
     await click('结构化记录'); expect(get('.log-list').textContent).toContain('<img src=x onerror=alert(1)>');
     expect(get('.log-list').textContent).toContain('正文未采集'); expect(document.querySelector('img,script')).toBeNull();
@@ -228,4 +229,22 @@ describe('持续日志的实际 DOM 交互', () => {
     expect(old.close).toHaveBeenCalledTimes(1); old.handlers.onPage(page([entry(9)])); await flush();
     await vi.advanceTimersByTimeAsync(10000); expect(request).toHaveBeenCalledTimes(3);
   });
+});
+
+it("原始日志只改变阅读方式，不重开SSE、不采集正文，暂停和正文设置保持独立", async () => {
+  await mount(); await select(1, "all");
+  await emit(page([entry(1, { category: "message", message: "received message", fields: { record_kind: "message.received", message_scope: "private" } })]));
+  const active = latest(), row = get(".terminal-line"), count = streams.length;
+  await click("原始日志：关");
+  expect(get(".terminal-line")).toBe(row); expect(row.textContent).toContain("received message");
+  expect(streams).toHaveLength(count); expect(active.close).not.toHaveBeenCalled();
+  expect(get<HTMLInputElement>("input[type=checkbox]").checked).toBe(false); expect(request).not.toHaveBeenCalled();
+  await click("暂停接收"); await click("原始日志：开"); expect(row.textContent).toContain("收到一条私聊消息");
+  expect(streams).toHaveLength(count); expect(button("继续接收")).toBeDefined();
+  await toggleBody(); expect(streams).toHaveLength(count); await click("继续接收");
+  expect(latest().query.include_content).toBe(true);
+  await emit(page([entry(2, { category: "message", fields: { record_kind: "message.received" } })]));
+  expect(get(".terminal-lines").textContent).toContain("正文未采集");
+  await click("原始日志：关"); expect(latest().query.include_content).toBe(true);
+  expect(get(".terminal-lines").textContent).toContain("正文未采集");
 });

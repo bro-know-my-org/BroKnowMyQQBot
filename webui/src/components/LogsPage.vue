@@ -110,7 +110,7 @@ onBeforeUnmount(() => { alive = false; stop(); });
     <p v-if="error" class="notice error" role="alert">{{ error }}</p>
     <p v-if="notice" class="notice" role="status">{{ notice }}</p>
     <div class="logs-view-switch" role="group" aria-label="日志显示方式"><button type="button" :aria-pressed="view === 'terminal'" @click="view = 'terminal'">实时输出</button><button type="button" :aria-pressed="view === 'structured'" @click="view = 'structured'">结构化记录</button></div>
-    <TerminalOutput v-if="view === 'terminal'" :entries="entries" :session-id="session" :include-content="includeContent" :empty-message="busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动重试。' : '当前筛选暂无日志，等待新的输出。'" />
+    <TerminalOutput v-if="view === 'terminal'" :entries="entries" :plugins="plugins" :session-id="session" :include-content="includeContent" :empty-message="busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动重试。' : '当前筛选暂无日志，等待新的输出。'" />
     <p v-if="view === 'structured'" class="hint logs-count">已显示 {{ entries.length }} / 1000 条 · 按时间先后排列</p>
     <ol v-if="view === 'structured' && entries.length" class="log-list" tabindex="0" aria-label="日志条目">
       <li v-for="entry in entries" :key="`${session}-${entry.id}`" class="log-entry">

@@ -42,7 +42,8 @@
 .terminal-line { white-space: pre; overflow-wrap: normal; }
 .terminal-viewport.is-wrapping .terminal-line { white-space: pre-wrap; overflow-wrap: anywhere; }
 .terminal-line time, .terminal-field { color: var(--terminal-muted); }
-.terminal-level { font-weight: 700; }
+.terminal-level, .terminal-status { font-weight: 700; }
+.terminal-detail { color: var(--terminal-muted); }
 .terminal-source { color: #c7cbbb; }
 .terminal-empty { padding: 8px 0; color: var(--terminal-muted); }
 .terminal-footer { min-height: 36px; padding-top: 8px; padding-bottom: 8px; border-top: 1px solid #495554; color: var(--terminal-muted); font-size: 11px; }
