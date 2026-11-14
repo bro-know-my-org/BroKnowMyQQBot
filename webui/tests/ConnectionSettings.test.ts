@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { createApp, nextTick } from 'vue';
+import { createApp, h, nextTick, ref } from 'vue';
 import ConnectionSettings from '../src/components/ConnectionSettings.vue';
 import AdaptersPage from '../src/components/AdaptersPage.vue';
 import { ApiError } from '../src/api';
@@ -9,7 +9,7 @@ import { runtimeFixture } from './runtimeFixture';
 
 let app: ReturnType<typeof createApp> | undefined;
 let server = systemSettingsFixture();
-const request = vi.fn(), dirty = vi.fn(), busy = vi.fn();
+const request = vi.fn(), dirty = vi.fn(), busy = vi.fn(), saved = vi.fn();
 const flush = async () => { await new Promise<void>(resolve => setImmediate(resolve)); await nextTick(); };
 const element = <T extends HTMLElement = HTMLElement>(selector: string) => document.querySelector<T>(selector)!;
 const click = async (selector: string) => { element<HTMLButtonElement>(selector).click(); await flush(); };
@@ -22,10 +22,10 @@ const input = async (selector: string, value: string | boolean) => {
 const submit = async () => { element('#connections-form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flush(); };
 function mount(runtime = false) {
   const root = document.createElement('div'); document.body.append(root);
-  app = createApp(runtime ? AdaptersPage : ConnectionSettings, { request, onDirty: dirty, onBusy: busy }); app.mount(root);
+  app = createApp(runtime ? AdaptersPage : ConnectionSettings, { request, onDirty: dirty, onBusy: busy, onSaved: saved, bootId: '11111111-1111-4111-8111-111111111111' }); app.mount(root);
 }
 beforeEach(() => {
-  server = systemSettingsFixture(); request.mockReset(); dirty.mockReset(); busy.mockReset();
+  server = systemSettingsFixture(); request.mockReset(); dirty.mockReset(); busy.mockReset(); saved.mockReset();
   request.mockImplementation(async (path: string, body?: { settings: typeof server.connections }) => {
     if (path === '/api/runtime') return runtimeFixture();
     if (body) { server.connections = JSON.parse(JSON.stringify(body.settings)); server.revision = 'b'.repeat(64); }
@@ -46,6 +46,7 @@ it('按需读取，未知选择保留，连接保存不改当前运行面板或�
   await input('#connections-onebot11-enabled', true); await input('#connections-webhook-listen', '127.0.0.1:8181');
   expect(dirty).toHaveBeenLastCalledWith(true); await submit();
   const post = request.mock.calls.find(([, body]) => body)?.[1];
+  expect(saved).toHaveBeenCalledExactlyOnceWith('11111111-1111-4111-8111-111111111111');
   expect(post.scope).toBe('connections'); expect(post.expected_revision).toBe('a'.repeat(64));
   expect(post.settings.qq.environment).toBe('future_environment');
   expect(post.settings.qq.webhook.listen).toBe('127.0.0.1:8181');
@@ -57,6 +58,7 @@ it('按需读取，未知选择保留，连接保存不改当前运行面板或�
 it('409 保留可复制草稿并阻止重复保存，刷新必须确认放弃', async () => {
   mount(); await click('#edit-connections'); await input('#connections-webhook-path', '/new-callback');
   request.mockRejectedValueOnce(new ApiError('版本冲突', 409)); await submit();
+  expect(saved).not.toHaveBeenCalled();
   expect(element<HTMLInputElement>('#connections-webhook-path').value).toBe('/new-callback');
   expect(element<HTMLTextAreaElement>('#copy-connections').value).toContain('/new-callback');
   expect(element<HTMLButtonElement>('#save-connections').disabled).toBe(true);
@@ -86,12 +88,13 @@ it('结果未知时重新读取，确认已保存后解除草稿，不重复写�
   await submit();
   expect(request.mock.calls.filter(([, body]) => body)).toHaveLength(1);
   expect(request.mock.calls.filter(([, body]) => !body)).toHaveLength(2);
-  expect(dirty).toHaveBeenLastCalledWith(false); expect(document.body.textContent).toContain('重新读取已确认保存');
+  expect(dirty).toHaveBeenLastCalledWith(false); expect(saved).toHaveBeenCalledExactlyOnceWith('11111111-1111-4111-8111-111111111111'); expect(document.body.textContent).toContain('重新读取已确认保存');
 });
 
 it('重新读取仍不确认时保留草稿和写入阻断；卸载取消请求', async () => {
   mount(); await click('#edit-connections'); await input('#connections-webhook-path', '/uncertain');
   request.mockRejectedValueOnce(new ApiError('offline')); await submit();
+  expect(saved).not.toHaveBeenCalled();
   expect(element<HTMLTextAreaElement>('#copy-connections').value).toContain('/uncertain');
   expect(element<HTMLButtonElement>('#save-connections').disabled).toBe(true);
   expect(request.mock.calls.filter(([, body]) => body)).toHaveLength(1);
@@ -118,4 +121,14 @@ it('原生保存保留未启用适配器的零值；启用后再施加数值约�
   await input('#connections-onebot11-enabled', true);
   expect(element<HTMLFormElement>('#connections-form').checkValidity()).toBe(false);
   await click('#save-connections'); expect(request.mock.calls.filter(([, body]) => body)).toHaveLength(1);
+});
+
+it('保存期间外部 boot 变化不把旧请求当作当前进程的待重启提示', async () => {
+  const bootId = ref('11111111-1111-4111-8111-111111111111');
+  app = createApp({ setup: () => () => h(ConnectionSettings, { request, bootId: bootId.value, onSaved: saved }) });
+  app.mount(document.body.appendChild(document.createElement('div'))); await click('#edit-connections'); await input('#connections-webhook-path', '/old-boot');
+  let finish!: (value: unknown) => void; request.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })); await submit();
+  bootId.value = '22222222-2222-4222-8222-222222222222'; await nextTick();
+  server.connections.qq.webhook.path = '/old-boot'; finish(structuredClone(server)); await flush();
+  expect(saved).not.toHaveBeenCalled();
 });

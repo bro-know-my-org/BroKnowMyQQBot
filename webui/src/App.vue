@@ -18,6 +18,7 @@ import type { ProcessSession } from './lifecycle';
 import { createNotifications, notificationKey } from './notifications';
 import { ApiError, createApi } from './api';
 import { createManagementStatus, managementStatusKey } from './status';
+import { createFaultNotices } from './faultNoticeEngine';
 import { mergeStatus, mergePluginRead } from './pluginSync';
 import type { Mutation, PluginView, Session } from './types';
 const route = useRoute(), router = useRouter();
@@ -37,6 +38,7 @@ const conflict = computed(() => !!plugin.value && (conflicts.value.has(plugin.va
 const detailTab = computed(() => route.name === 'plugin-config' ? 'config' : route.name === 'plugin-logs' ? 'logs' : 'overview');
 const api = createApi(() => { if (!restartLocked.value) logout('登录已失效，请重新输入管理 Token。'); });
 const status = createManagementStatus(api.request, () => logout('登录已失效，请重新输入管理 Token。')); provide(managementStatusKey, status);
+const faultNotices = createFaultNotices(status, notifications, () => authenticated.value && !restartLocked.value, () => bootId.value);
 const removedPlugins = ref(new Set<string>()), autoError = ref('');
 let epoch = 0, refreshAfterBusy = false, readGeneration = 0, reconciliationQueued = false, pendingStatus = false, resetStatusRevision = false;
 let retryNotBefore = 0, reconcileDelay = 1000;
@@ -231,7 +233,7 @@ function beforeUnload(event: BeforeUnloadEvent) { if (restartLocked.value || plu
 const pageHide = () => { notifications.suspendSession(); logout('', true); };
 const pageShow = (event: PageTransitionEvent) => { if (event.persisted) restoreSession(); };
 onMounted(() => { document.addEventListener('visibilitychange', visibilitySync); window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
-onBeforeUnmount(() => { status.dispose(); invalidateRead(); document.removeEventListener('visibilitychange', visibilitySync); notifications.dispose(); removeGuard(); api.clear(); epoch++; window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('pagehide', pageHide); window.removeEventListener('pageshow', pageShow); });
+onBeforeUnmount(() => { faultNotices.dispose(); status.dispose(); invalidateRead(); document.removeEventListener('visibilitychange', visibilitySync); notifications.dispose(); removeGuard(); api.clear(); epoch++; window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('pagehide', pageHide); window.removeEventListener('pageshow', pageShow); });
 </script>
 <template>
   <div v-if="!authenticated" class="login-shell">
@@ -253,7 +255,7 @@ onBeforeUnmount(() => { status.dispose(); invalidateRead(); document.removeEvent
     <button v-if="pluginsFailed" id="retry-plugins" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">重试加载插件</button>
     <section v-if="!refreshedAt && route.meta.section === 'plugins'" class="panel empty-state" aria-live="polite"><h1 tabindex="-1">{{ pluginsFailed ? '插件状态暂不可用' : '正在读取插件状态' }}</h1><p>{{ pluginsFailed ? '尚未读取到插件列表，请重试加载。' : '正在连接管理服务，请稍候。' }}</p></section>
     <OverviewPage v-else-if="route.name === 'overview'" :plugins="plugins" :refreshed-at="refreshedAt" :busy="busy" :request="api.request" @refresh="refresh" />
-    <AdaptersPage v-else-if="route.name === 'adapters'" :request="api.request" :locked="busy" @dirty="systemDirty = $event" @busy="systemBusy = $event" />
+    <AdaptersPage v-else-if="route.name === 'adapters'" :boot-id="bootId" @saved="faultNotices.settingsSaved($event, 'connections')" :request="api.request" :locked="busy" @dirty="systemDirty = $event" @busy="systemBusy = $event" />
     <template v-else-if="route.name === 'logs'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">运行 / LOGS</span><h1 tabindex="-1">日志</h1><p class="muted">查看最近运行记录，按级别和插件实例筛选。</p></div></div><LogsPage :request="api.request" :subscribe-logs="api.subscribeLogs" :plugins="plugins" /></template>
     <template v-else-if="route.name === 'plugins'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">插件 / INSTALLED</span><h1 tabindex="-1">已安装插件</h1><p class="muted">查看实例状态，进入插件管理配置。</p></div><div class="actions"><button id="refresh" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">刷新状态</button><RouterLink :to="{ name: 'marketplace' }" class="button-link">浏览插件市场 ↗</RouterLink></div></div><LocalPackageInstall :request="api.request" :upload="api.upload" :plugins="plugins" :locked="busy || permissionsReadBusy" @dirty="localDirty = $event" @busy="localBusy = $event" @installed="reconcilePermissions" @uncertain="reconcilePermissions" /><PluginList :plugins="plugins" :busy="busy || pluginToolsBusy" /></template>
     <template v-else-if="route.meta.section === 'plugins'">
@@ -262,7 +264,7 @@ onBeforeUnmount(() => { status.dispose(); invalidateRead(); document.removeEvent
       <PluginDetail v-if="plugin" :key="`${plugin.instance_id}:${pluginEditorEpoch}`" :plugin="plugin" :request="api.request" :subscribe-logs="api.subscribeLogs" :tab="detailTab" :busy="busy || pluginToolsBusy" :conflict="conflict" @mutate="mutate" @dirty="pluginDirty = $event" @error="report" @busy="pluginChildBusy = $event" @updated="updatePlugin" @uncertain="reconcilePermissions" />
       <section v-else class="panel empty-state"><h1 tabindex="-1">未找到插件实例</h1><p>该实例不在当前管理列表中，可能已移除或未加载。</p><RouterLink :to="{ name: 'plugins' }" class="button-link">返回已安装插件</RouterLink></section>
     </template>
-    <template v-else-if="route.name === 'settings'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">系统 / SETTINGS</span><h1 tabindex="-1">设置</h1><p class="muted">管理 Bot 的全局行为。</p></div></div><CommandSettings :request="api.request" :locked="systemBusy" @dirty="settingsDirty = $event" @busy="settingsBusy = $event" /><SystemSettings :request="api.request" :locked="settingsBusy" @dirty="systemDirty = $event" @busy="systemBusy = $event" /></template>
+    <template v-else-if="route.name === 'settings'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">系统 / SETTINGS</span><h1 tabindex="-1">设置</h1><p class="muted">管理 Bot 的全局行为。</p></div></div><CommandSettings :request="api.request" :locked="systemBusy" @dirty="settingsDirty = $event" @busy="settingsBusy = $event" /><SystemSettings :boot-id="bootId" @saved="faultNotices.settingsSaved($event, 'global')" :request="api.request" :locked="settingsBusy" @dirty="systemDirty = $event" @busy="systemBusy = $event" /></template>
     <MarketplacePage v-else-if="route.name === 'marketplace'" :request="api.request" :reconcile="marketReconcile" @busy="marketBusy = $event" @uncertain="marketReconcile = true" @installed="marketplaceInstalled" />
     <UnavailablePage v-else :kind="String(route.name)" />
     </template>

@@ -3,8 +3,8 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { ApiError, type Request } from '../api';
 import { useNoticeSource } from '../notifications';
 import { readSettings, settingsPayload, type Group, type SettingsScope, type SettingsSnapshot } from '../systemSettings';
-const props = defineProps<{ request: Request; scope: SettingsScope; title: string; groups: Group[]; locked?: boolean }>();
-const emit = defineEmits<{ dirty: [value: boolean]; busy: [value: boolean] }>();
+const props = defineProps<{ request: Request; scope: SettingsScope; title: string; groups: Group[]; locked?: boolean; bootId?: string }>();
+const emit = defineEmits<{ dirty: [value: boolean]; busy: [value: boolean]; saved: [bootId: string] }>();
 const opened = ref(false), busy = ref(false), blocked = ref(false), failed = ref(false), message = ref('');
 const draft = ref<SettingsSnapshot | null>(null), saved = ref('');
 const encoded = computed(() => draft.value ? JSON.stringify(settingsPayload(draft.value, props.scope)) : '');
@@ -29,10 +29,11 @@ async function refresh() {
 async function save() {
   if (busy.value || props.locked || blocked.value || !dirty.value || !draft.value) return;
   busy.value = true; failed.value = false; message.value = '正在保存，当前运行连接与日志不变…';
-  const submitted = encoded.value;
+  const submitted = encoded.value, submittedBoot = props.bootId ?? '';
+  const confirmed = () => { if (props.bootId === submittedBoot) emit('saved', submittedBoot); };
   try {
     const response = readSettings(await props.request('/api/settings/system', { scope: props.scope, expected_revision: draft.value.revision, settings: settingsPayload(draft.value, props.scope) }, controller.signal), props.scope, props.groups);
-    if (!disposed) { accept(response); message.value = '已保存；请通过现有运行方式重启 Bot 后生效。'; }
+    if (!disposed) { accept(response); confirmed(); message.value = '已保存；请通过现有运行方式重启 Bot 后生效。'; }
   } catch (error) {
     if (disposed) return;
     failed.value = true; message.value = (error as Error).message;
@@ -43,7 +44,7 @@ async function save() {
       try {
         const current = await read();
         if (!disposed && JSON.stringify(settingsPayload(current, props.scope)) === submitted) {
-          accept(current); failed.value = false; message.value = '重新读取已确认保存；请重启 Bot 后生效。';
+          accept(current); confirmed(); failed.value = false; message.value = '重新读取已确认保存；请重启 Bot 后生效。';
         }
       } catch { /* Retain edits and block repeat writes until an explicit refresh. */ }
       if (!disposed && blocked.value) message.value = '保存结果未确认，已尝试重新读取，未自动重试写入。请复制编辑后重新读取。';

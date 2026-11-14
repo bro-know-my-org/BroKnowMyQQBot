@@ -1,3 +1,4 @@
+import type { DeepReadonly } from 'vue';
 import type { ManagementSnapshot, PluginStatus } from './status';
 import { failureNames } from './runtime';
 import type { AdapterStatus } from './runtime';
@@ -19,7 +20,7 @@ export function createFaultDiff() {
   let entities = new Map<string, Observed>();
   const delivery = new Map<string, { at: number; tone: FaultNotice['tone'] }>();
   function reset() { boot = ''; revision = -1n; ready = false; settings = null; entities.clear(); delivery.clear(); }
-  function consume(next: ManagementSnapshot, now: number): FaultNotice[] {
+  function consume(next: DeepReadonly<ManagementSnapshot>, now: number): FaultNotice[] {
     if (boot !== next.boot_id) { reset(); boot = next.boot_id; }
     if (BigInt(next.revision) <= revision) return [];
     revision = BigInt(next.revision);

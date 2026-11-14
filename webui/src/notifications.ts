@@ -45,7 +45,7 @@ export function createNotifications() {
     if (!message) { if (!options.silent) clearSource(source); return; }
     const action = readNoticeAction(options.action), key = readNoticeKey(options.key);
     const previous = key ? state.history.find(entry => entry.key === key) : undefined;
-    if (previous && options.baseline) return previous.id;
+    if (previous && options.baseline && previous.tone === tone) return previous.id;
     if (previous && options.coalesce) {
       Object.assign(previous, { message, tone, action, createdAt: Date.now(), unread: true });
       stop(previous.id); clocks.delete(previous.id);

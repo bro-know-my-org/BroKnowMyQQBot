@@ -30,7 +30,7 @@ it('invalid action metadata is dropped at creation/load without rejecting compat
 it('coalesces bursts into the same row and refresh restores no toast or duplicate baseline', () => {
   center = createNotifications(); center.authenticate(scope, false);
   const id = center.notify('状态 · 连接', '离线', 'warning', { action: { page: 'adapters' }, key: 'boot:adapter:one' })!;
-  for (let i = 0; i < 200; i++) center.notify('状态 · 连接', `变化${i}`, 'success', { silent: true, coalesce: true, key: 'boot:adapter:one', action: { page: 'adapters' } });
+  for (let i = 0; i < 200; i++) center.notify('状态 · 连接', `变化${i}`, 'warning', { silent: true, coalesce: true, key: 'boot:adapter:one', action: { page: 'adapters' } });
   expect(center.state.history).toHaveLength(1); expect(center.state.active).toHaveLength(1); expect(center.state.active[0]?.message).toBe('变化199');
   center.suspendSession(); center.dispose(); center = createNotifications(); center.authenticate(scope, true);
   expect(center.state.history).toHaveLength(1); expect(center.state.active).toEqual([]);

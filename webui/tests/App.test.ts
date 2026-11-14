@@ -5,6 +5,7 @@ import App from '../src/App.vue';
 import { createManagementRouter, pluginRoute } from '../src/navigation';
 import type { Commands, Config, PluginView } from '../src/types';
 import { runtimeFixture } from './runtimeFixture';
+import { systemSettingsFixture } from './systemSettingsFixture';
 
 const fixture = (overrides: Partial<PluginView> = {}): PluginView => ({
   instance_id: 'sample', plugin_id: 'dev.bkm.sample', name: '<img src=x onerror=alert(1)>', description: '测试插件', version: '1.0', saved_version: '1.0', loaded_version: '1.0', restart_required: false, source: 'local', trust_level: 'local-wasm', signature_status: 'unsigned',
@@ -16,13 +17,15 @@ let app: ReturnType<typeof createApp>, plugins: PluginView[], commands: Commands
 let router: ReturnType<typeof createManagementRouter>;
 let sessionAuthenticated: boolean, sessionMode: 'token' | 'none', unsafePluginResponse: boolean;
 const OLD_BOOT = '11111111-1111-4111-8111-111111111111', NEW_BOOT = '22222222-2222-4222-8222-222222222222';
-let currentBoot: string;
+let currentBoot: string, initialOnline = false;
+let fileSettings = systemSettingsFixture();
 class StatusSource extends EventTarget {
   static CLOSED = 2; static all: StatusSource[] = [];
   readyState = 1; onerror: (() => void) | null = null; onopen: (() => void) | null = null;
   close = vi.fn(() => { this.readyState = 2; });
   constructor(public url: string) { super(); StatusSource.all.push(this); if (url === '/api/status/stream') queueMicrotask(() => this.status()); }
   status(revision = '1', summaries = plugins, runtime = runtimeFixture()) {
+    if (initialOnline && revision === '1') runtime.snapshot.adapters['qq-fixture']!.online = true;
     this.dispatchEvent(new MessageEvent('status', { data: JSON.stringify({ boot_id: currentBoot, revision,
       runtime: { ...runtime, boot_id: currentBoot }, plugins: summaries, plugins_truncated: false, settings_restart_required: null }) }));
   }
@@ -41,6 +44,14 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
   if (!sessionAuthenticated && sessionMode !== 'none') return new Response('{}', { status: 401 });
   if (path === '/api/runtime') return new Response(JSON.stringify({ ...runtimeFixture(), boot_id: currentBoot }));
   if (path === '/api/plugins' && unsafePluginResponse) { unsafePluginResponse = false; return new Response(JSON.stringify({ plugins }).replace('"count":1', '"count":9007199254740993')); }
+  if (path === '/api/settings/system') {
+    if (body) {
+      if (body.scope === 'global') fileSettings.global = body.settings as typeof fileSettings.global;
+      else fileSettings.connections = body.settings as typeof fileSettings.connections;
+      fileSettings.revision = 'b'.repeat(64);
+    }
+    return new Response(JSON.stringify(fileSettings));
+  }
   if (path === '/api/settings/commands') {
     if (body) { expect(body.expected_revision).toBe(commands.revision); commands = { prefix: String(body.prefix), revision: String(Number(commands.revision) + 1) }; }
     return new Response(JSON.stringify(commands));
@@ -90,7 +101,7 @@ async function login(target: RouteLocationRaw = pluginRoute(plugins[0]?.instance
 beforeEach(() => {
   plugins = [fixture()]; commands = { prefix: '/', revision: '1' }; fail = null; requests.length = 0;
   sessionAuthenticated = false; sessionMode = 'token'; unsafePluginResponse = false;
-  currentBoot = OLD_BOOT; StatusSource.all = []; vi.stubGlobal('EventSource', StatusSource);
+  initialOnline = false; fileSettings = systemSettingsFixture(); currentBoot = OLD_BOOT; StatusSource.all = []; vi.stubGlobal('EventSource', StatusSource);
   vi.stubGlobal('fetch', fetcher); vi.spyOn(window, 'confirm').mockReturnValue(true);
   vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('credentials must stay in memory'); });
 });
@@ -802,4 +813,36 @@ it('同一保存版本故障恢复后按需读取详情并清除旧错误计数'
     expect(Array.from(document.querySelectorAll('.stat-value'))[3]!.textContent).toBe('0'); expect(text()).not.toContain('旧故障');
     expect(requests.filter(r => r.path === '/api/plugins')).toHaveLength(2);
   } finally { vi.useRealTimers(); }
+});
+
+describe('共享状态故障通知与定位', () => {
+  it('首帧无通知风暴，单一订阅的离线通知动作沿用草稿守卫并保留历史', async () => {
+    initialOnline = true; await login(); expect(document.querySelector('.notification-action')).toBeNull();
+    await input('#field-0', '99'); vi.mocked(window.confirm).mockReturnValue(false);
+    statusSource().status('2'); await flush(); expect(document.body.textContent).toContain('qq-fixture 连接已离线');
+    const action = get<HTMLButtonElement>('.notification-toasts .notification-action'); action.click(); await flush();
+    expect(router.currentRoute.value.name).toBe('plugin-config'); expect(value('#field-0')).toBe('99');
+    await click('[aria-controls="notification-history"]'); const rows = document.querySelectorAll('.notification-history-list li').length;
+    statusSource().status('2'); statusSource().status('3'); await flush(); expect(document.querySelectorAll('.notification-history-list li')).toHaveLength(rows);
+    await click('.notification-history .notification-action'); expect(router.currentRoute.value.name).toBe('plugin-config'); expect(document.querySelector('#notification-history')).not.toBeNull();
+    vi.mocked(window.confirm).mockReturnValue(true); await click('.notification-history .notification-action');
+    expect(router.currentRoute.value.name).toBe('adapters'); expect(document.querySelector('#notification-history')).toBeNull();
+    expect(StatusSource.all.filter(s => s.url === '/api/status/stream')).toHaveLength(1); expect(requests.some(r => r.path === '/api/runtime')).toBe(false); expect(posts()).toHaveLength(0);
+  });
+  it('外部新进程清除旧故障浮层，不把停机/重连或草稿视为故障', async () => {
+    initialOnline = true; await login(); await input('#field-0', '55'); statusSource().status('2'); await flush();
+    expect(document.querySelector('.notification-action')).not.toBeNull();
+    currentBoot = NEW_BOOT; statusSource().status('1'); await flush(); await flush();
+    expect(value('#field-0')).toBe('55'); expect(document.querySelector('.notification-toasts .notification-action')).toBeNull();
+    expect(posts()).toHaveLength(0); expect(StatusSource.all.filter(s => s.url === '/api/status/stream')).toHaveLength(2);
+  });
+  it('普通全局和连接保存生成重启提示，热前缀保存不生成该提示', async () => {
+    initialOnline = true; await login({ name: 'settings' });
+    await input('#command-prefix', '!'); await click('#save-prefix'); expect(document.querySelector('.notification-action')).toBeNull();
+    await click('#edit-global'); await input('#global-runtime-event_concurrency', '7'); await click('#save-global');
+    expect(document.body.textContent).toContain('已确认保存运行与日志设置；普通设置重启后读取');
+    await go({ name: 'adapters' }); await click('#edit-connections'); await input('#connections-webhook-path', '/changed'); await click('#save-connections');
+    expect(document.body.textContent).toContain('已确认保存连接配置；普通设置重启后读取');
+    expect(StatusSource.all.filter(s => s.url === '/api/status/stream')).toHaveLength(1);
+  });
 });
