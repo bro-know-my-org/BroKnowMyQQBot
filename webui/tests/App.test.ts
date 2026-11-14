@@ -17,6 +17,17 @@ let router: ReturnType<typeof createManagementRouter>;
 let sessionAuthenticated: boolean, sessionMode: 'token' | 'none', unsafePluginResponse: boolean;
 const OLD_BOOT = '11111111-1111-4111-8111-111111111111', NEW_BOOT = '22222222-2222-4222-8222-222222222222';
 let currentBoot: string;
+class StatusSource extends EventTarget {
+  static CLOSED = 2; static all: StatusSource[] = [];
+  readyState = 1; onerror: (() => void) | null = null; onopen: (() => void) | null = null;
+  close = vi.fn(() => { this.readyState = 2; });
+  constructor(public url: string) { super(); StatusSource.all.push(this); if (url === '/api/status/stream') queueMicrotask(() => this.status()); }
+  status(revision = '1', summaries = plugins, runtime = runtimeFixture()) {
+    this.dispatchEvent(new MessageEvent('status', { data: JSON.stringify({ boot_id: currentBoot, revision,
+      runtime: { ...runtime, boot_id: currentBoot }, plugins: summaries, plugins_truncated: false, settings_restart_required: null }) }));
+  }
+}
+const statusSource = () => StatusSource.all.filter(s => s.url === '/api/status/stream').at(-1)!;
 const requests: Array<{ path: string; method: string; body: Record<string, unknown> | undefined; init: RequestInit }> = [];
 const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
   const path = String(input), method = init.method ?? 'GET', body = init.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
@@ -50,7 +61,7 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
   p.pending = !path.endsWith('/apply'); p.updated_at_ms++; if (!p.pending) p.runtime_state = p.enabled ? 'ready' : 'stopped';
   return new Response(JSON.stringify({ plugin: p }));
 });
-// Mount the real application and dispatch native DOM events; only HTTP is mocked.
+// Mount the real application and dispatch native DOM events; only HTTP and EventSource are mocked.
 function get<T extends HTMLElement = HTMLElement>(selector: string): T {
   const element = document.querySelector<T>(selector); if (!element) throw new Error(`Missing element: ${selector}`); return element;
 }
@@ -79,7 +90,7 @@ async function login(target: RouteLocationRaw = pluginRoute(plugins[0]?.instance
 beforeEach(() => {
   plugins = [fixture()]; commands = { prefix: '/', revision: '1' }; fail = null; requests.length = 0;
   sessionAuthenticated = false; sessionMode = 'token'; unsafePluginResponse = false;
-  currentBoot = OLD_BOOT;
+  currentBoot = OLD_BOOT; StatusSource.all = []; vi.stubGlobal('EventSource', StatusSource);
   vi.stubGlobal('fetch', fetcher); vi.spyOn(window, 'confirm').mockReturnValue(true);
   vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('credentials must stay in memory'); });
 });
@@ -103,7 +114,7 @@ describe('浏览器管理会话', () => {
   it('免认证模式自动进入并显示当前模式', async () => {
     sessionMode = 'none'; await mount({ name: 'overview' });
     expect(text()).toContain('本地免认证'); expect(document.querySelector('#token')).toBeNull(); expect(document.querySelector('#logout')).toBeNull();
-    expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins', '/api/runtime']);
+    expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins']);
   });
   it('浏览器往返缓存恢复时重新核对会话，失效时不会显示旧管理数据', async () => {
     await login(); window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })); await flush();
@@ -271,38 +282,28 @@ it('连接页独立读取运行状态，插件读取失败不遮住真实连接'
   await go({ name: 'overview' }); expect(document.querySelector('.runtime-panel')).not.toBeNull();
 });
 
-it('切换路由与退出取消读取，迟到的 401 不撤销新页面或新登录', async () => {
+it('切换路由复用订阅，退出取消探测并隔离迟到的 401', async () => {
   let resolve!: (value: Response) => void, signal!: AbortSignal;
-  vi.stubGlobal('fetch', (input: RequestInfo | URL, init: RequestInit = {}) => {
-    if (String(input) === '/api/runtime') {
-      signal = init.signal!;
-      return new Promise<Response>(done => { resolve = done; });
-    }
-    return fetcher(input, init);
-  });
-  await login({ name: 'adapters' }); const routeSignal = signal, routeResponse = resolve;
-  await go({ name: 'plugins' }); expect(routeSignal.aborted).toBe(true);
-  routeResponse(new Response('{}', { status: 401 })); await flush(); expect(document.querySelector('#token')).toBeNull();
-  await go({ name: 'overview' }); const sessionSignal = signal, oldSessionResponse = resolve;
-  await click('#logout'); expect(sessionSignal.aborted).toBe(true);
+  await login({ name: 'adapters' }); const source = statusSource();
+  await go({ name: 'plugins' }); expect(source.close).not.toHaveBeenCalled();
+  expect(StatusSource.all).toHaveLength(1);
+  fetcher.mockImplementationOnce((_input, init = {}) => { signal = init.signal!; return new Promise(done => { resolve = done; }); });
+  source.onerror!(); await click('#logout'); expect(signal.aborted).toBe(true); expect(source.close).toHaveBeenCalledOnce();
   await input('#token', 'new-token'); await submit('#login-form');
-  resolve(new Response(JSON.stringify(runtimeFixture()))); await flush();
-  oldSessionResponse(new Response('{}', { status: 401 })); await flush();
-  expect(document.querySelector('#token')).toBeNull(); expect(text()).toContain('运行降级');
+  resolve(new Response('{}', { status: 401 })); await flush(); source.status('99', []);
+  expect(document.querySelector('#token')).toBeNull(); await go({ name: 'overview' }); expect(text()).toContain('运行降级');
 });
 
-it('前台周期刷新只读取运行状态，不重复成功通知；有效 401 返回登录页', async () => {
+it('共享状态更新不轮询运行接口、不重复成功通知；有效 401 返回登录页', async () => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   try {
-    await login({ name: 'overview' });
-    await click('[aria-controls="notification-history"]');
+    await login({ name: 'overview' }); await click('[aria-controls="notification-history"]');
     const history = get('#notification-history').textContent;
-    await vi.advanceTimersByTimeAsync(10000); await flush();
-    expect(requests.filter(r => r.path === '/api/runtime')).toHaveLength(3);
+    statusSource().status('2'); await vi.advanceTimersByTimeAsync(10000); await flush();
+    expect(requests.filter(r => r.path === '/api/runtime')).toHaveLength(0);
     expect(requests.filter(r => r.path === '/api/plugins')).toHaveLength(1);
     expect(get('#notification-history').textContent).toBe(history);
-    fail = { path: '/api/runtime', method: 'GET', status: 401 };
-    await vi.advanceTimersByTimeAsync(5000); await flush();
+    fail = { path: '/api/session', method: 'GET', status: 401 }; statusSource().onerror!(); await flush();
     expect(document.querySelector('#login-form')).not.toBeNull(); expect(document.querySelector('.runtime-panel')).toBeNull();
     const count = requests.length; await vi.advanceTimersByTimeAsync(15000); expect(requests).toHaveLength(count);
   } finally { app?.unmount(); vi.useRealTimers(); }
@@ -557,7 +558,7 @@ describe('Bot 进程控制', () => {
       await go({ name: 'overview' });
       let finishRuntime!: (value: Response) => void, oldSignal!: AbortSignal;
       fetcher.mockImplementationOnce((_input, init = {}) => new Promise<Response>(resolve => { finishRuntime = resolve; oldSignal = init.signal as AbortSignal; }));
-      await vi.advanceTimersByTimeAsync(5000); await flush();
+      statusSource().onerror!(); await flush();
       vi.stubGlobal('fetch', async (input: RequestInfo | URL, init: RequestInit = {}) => {
         if (String(input) === '/api/restart') {
           requests.push({ path: '/api/restart', method: 'POST', body: JSON.parse(String(init.body)), init });
@@ -565,7 +566,7 @@ describe('Bot 进程控制', () => {
         }
         return fetcher(input, init);
       });
-      await click('#restart-bot'); expect(oldSignal.aborted).toBe(true);
+      const oldSource = statusSource(); await click('#restart-bot'); expect(oldSignal.aborted).toBe(true); expect(oldSource.close).toHaveBeenCalledOnce();
       expect(get('.app-shell').hasAttribute('inert')).toBe(true); expect(document.querySelector('.runtime-panel')).toBeNull();
       expect(get('[role="dialog"]').textContent).toContain('正在重启');
       expect(document.activeElement).toBe(get('[role="dialog"]'));
@@ -695,4 +696,110 @@ it('本地上传、安装草稿和不确定结果读取接入重启停止、导�
   await click('#commit-local-package'); expect(disabled('#logout')).toBe(true); expect(disabled('#restart-bot')).toBe(true); expect(disabled('#stop-bot')).toBe(true);
   finish(new Response(JSON.stringify({ plugins }))); await flush();
   expect(disabled('#logout')).toBe(false); expect(disabled('#commit-local-package')).toBe(true); expect(text()).toContain('不会自动重复安装');
+});
+
+
+describe('共享状态与编辑草稿', () => {
+  it('运行故障保持编辑器身份和脏标记；外部保存、Schema 变化及删除保留草稿直到显式刷新', async () => {
+    await login(); await input('#field-0', '8'); const field = get('#field-0'); field.focus();
+    statusSource().status('2', [fixture({ runtime_state: 'disabled' })]); await flush();
+    expect(get('#field-0')).toBe(field); expect(document.activeElement).toBe(field);
+    expect(value('#field-0')).toBe('8'); expect(disabled('#save')).toBe(false); expect(text()).toContain('已禁用');
+    plugins = [fixture({ version: '2', updated_at_ms: 2, config: { changed: 'new' }, schema: { type: 'object', properties: { changed: { type: 'string' } } } })];
+    statusSource().status('3'); await flush();
+    expect(get('#field-0')).toBe(field); expect(value('#field-0')).toBe('8'); expect(disabled('#save')).toBe(true); expect(text()).toContain('当前编辑仍保留');
+    plugins = []; statusSource().status('4'); await flush();
+    expect(get('#field-0')).toBe(field); expect(value('#field-0')).toBe('8'); expect(text()).toContain('实例已从最新完整状态移除');
+    vi.mocked(window.confirm).mockReturnValue(false); await click('#refresh'); expect(value('#field-0')).toBe('8');
+    vi.mocked(window.confirm).mockReturnValue(true); await click('#refresh'); expect(text()).toContain('未找到插件实例');
+  });
+  it('完整读取只在安全时合并新增和删除，自动同步失败保留内容且显示错误', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      await login({ name: 'overview' }); plugins = [fixture({ instance_id: 'new', name: '新增实例' })];
+      statusSource().status('2'); await vi.advanceTimersByTimeAsync(250); await flush();
+      expect(text()).toContain('新增实例'); expect(Array.from(document.querySelectorAll('.stat-value'))[0]!.textContent).toBe('1');
+      plugins.push(fixture({ instance_id: 'another' })); fail = { path: '/api/plugins', method: 'GET', status: 500 };
+      statusSource().status('3'); await vi.advanceTimersByTimeAsync(250); await flush();
+      expect(text()).toContain('插件自动同步失败'); expect(text()).toContain('新增实例');
+      expect(requests.filter(r => r.path === '/api/plugins')).toHaveLength(3); expect(posts()).toHaveLength(0);
+    } finally { vi.useRealTimers(); }
+  });
+  it('开始编辑或写入时取消旧读取，迟到的读取和旧状态不能回滚已确认保存', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      await login(); const old = structuredClone(plugins); plugins.push(fixture({ instance_id: 'other' }));
+      let finish!: (response: Response) => void, signal!: AbortSignal;
+      fetcher.mockImplementationOnce((_input, init = {}) => { signal = init.signal!; return new Promise(done => { finish = done; }); });
+      statusSource().status('2'); await vi.advanceTimersByTimeAsync(250); await flush();
+      await input('#field-0', '9'); expect(signal.aborted).toBe(true); await click('#save');
+      finish(new Response(JSON.stringify({ plugins: old }))); await flush(); statusSource().status('3', old); await flush();
+      expect(value('#field-0')).toBe('9'); expect(disabled('#save')).toBe(true); expect(disabled('#apply')).toBe(false);
+      expect(posts()).toHaveLength(1); expect(plugins[0]!.config.count).toBe(9);
+    } finally { vi.useRealTimers(); }
+  });
+  it('后台和卸载关闭根订阅，旧事件不会更新页面或发起隐藏请求', async () => {
+    let hidden = false; vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden);
+    await login({ name: 'overview' }); const old = statusSource(), count = requests.length;
+    hidden = true; document.dispatchEvent(new Event('visibilitychange')); old.status('2', []); await flush();
+    expect(old.close).toHaveBeenCalledOnce(); expect(requests).toHaveLength(count);
+    hidden = false; document.dispatchEvent(new Event('visibilitychange')); await flush();
+    expect(StatusSource.all).toHaveLength(2); const current = statusSource(); app.unmount();
+    current.status('3', []); expect(current.close).toHaveBeenCalledOnce();
+  });
+});
+
+it('干净编辑器读取新 Schema 时更新字段；脏草稿只在显式刷新后采用新 Schema', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    await login(); plugins = [fixture({ version: '2', updated_at_ms: 2, schema: { type: 'object', properties: { greeting: { type: 'string', title: '新字段' } } } })];
+    statusSource().status('2'); await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(get('#field-0').tagName).toBe('TEXTAREA'); expect(value('#field-0')).toBe('hello'); expect(text()).toContain('新字段');
+    await input('#field-0', 'draft'); const field = get('#field-0');
+    plugins = [fixture({ version: '3', updated_at_ms: 3, config: { count: 2 } })]; statusSource().status('3'); await flush();
+    expect(get('#field-0')).toBe(field); expect(value('#field-0')).toBe('draft'); expect(disabled('#save')).toBe(true);
+    await click('#refresh'); expect(get('#field-0').tagName).toBe('INPUT'); expect(value('#field-0')).toBe('2'); expect(disabled('#save')).toBe(true);
+  } finally { vi.useRealTimers(); }
+});
+
+it('摘要版本先到而完整输入未到时锁写；开始编辑不会把旧输入作为新版本覆盖保存', async () => {
+  await login(); plugins = [fixture({ updated_at_ms: 2, config: { count: 99 } })]; statusSource().status('2'); await flush();
+  expect(disabled('#toggle')).toBe(true); await input('#field-0', '7'); await click('#save');
+  expect(posts()).toHaveLength(0); expect(value('#field-0')).toBe('7'); expect(disabled('#save')).toBe(true);
+  await click('#refresh'); expect(value('#field-0')).toBe('99');
+});
+it('后台读取失败退避重试，保持锁写直到同版本的完整输入到达', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  try {
+    await login(); plugins = [fixture({ updated_at_ms: 2, config: { count: 99 } })];
+    fail = { path: '/api/plugins', method: 'GET', status: 500 }; statusSource().status('2');
+    await vi.advanceTimersByTimeAsync(250); await flush(); expect(text()).toContain('插件自动同步失败'); expect(disabled('#toggle')).toBe(true);
+    await vi.advanceTimersByTimeAsync(999); expect(value('#field-0')).toBe('1');
+    await vi.advanceTimersByTimeAsync(1); await flush(); expect(value('#field-0')).toBe('99'); expect(disabled('#toggle')).toBe(false);
+    expect(text()).not.toContain('插件自动同步失败'); expect(requests.filter(r => r.path === '/api/plugins')).toHaveLength(3);
+  } finally { vi.useRealTimers(); }
+});
+it('隐藏期间初次前台读取的成功响应不会被无声丢弃', async () => {
+  let finish!: (response: Response) => void;
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init: RequestInit = {}) => String(input) === '/api/plugins' ? new Promise<Response>(done => { finish = done; }) : fetcher(input, init));
+  await login(); let hidden = true; vi.spyOn(document, 'hidden', 'get').mockImplementation(() => hidden);
+  document.dispatchEvent(new Event('visibilitychange')); finish(new Response(JSON.stringify({ plugins }))); await flush();
+  hidden = false; document.dispatchEvent(new Event('visibilitychange')); await flush(); expect(value('#field-0')).toBe('1');
+});
+it('写入失败后仍编辑时回放待处理的外部删除摘要并禁止再次保存', async () => {
+  await login(); await input('#field-0', '7'); let finish!: (response: Response) => void;
+  fetcher.mockImplementationOnce(() => new Promise<Response>(done => { finish = done; })); get<HTMLButtonElement>('#save').click(); await flush();
+  plugins = []; statusSource().status('2'); finish(new Response(JSON.stringify({ error: 'temporary failure' }), { status: 500 })); await flush();
+  expect(value('#field-0')).toBe('7'); expect(disabled('#save')).toBe(true); expect(text()).toContain('实例已从最新完整状态移除');
+});
+
+it('同一保存版本故障恢复后按需读取详情并清除旧错误计数', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    plugins = [fixture({ runtime_state: 'disabled', error: '旧故障' })]; await login({ name: 'overview' });
+    expect(Array.from(document.querySelectorAll('.stat-value'))[3]!.textContent).toBe('1');
+    plugins = [fixture()]; statusSource().status('2'); await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(Array.from(document.querySelectorAll('.stat-value'))[3]!.textContent).toBe('0'); expect(text()).not.toContain('旧故障');
+    expect(requests.filter(r => r.path === '/api/plugins')).toHaveLength(2);
+  } finally { vi.useRealTimers(); }
 });

@@ -17,6 +17,8 @@ import RestartControl from './components/RestartControl.vue';
 import type { ProcessSession } from './lifecycle';
 import { createNotifications, notificationKey } from './notifications';
 import { ApiError, createApi } from './api';
+import { createManagementStatus, managementStatusKey } from './status';
+import { mergeStatus, mergePluginRead } from './pluginSync';
 import type { Mutation, PluginView, Session } from './types';
 const route = useRoute(), router = useRouter();
 const authenticated = ref(false), tokenInput = ref(''), plugins = shallowRef<PluginView[]>([]), refreshedAt = ref('');
@@ -29,17 +31,84 @@ const pluginToolsBusy = computed(() => pluginChildBusy.value || permissionsReadB
 const systemDirty = ref(false), systemBusy = ref(false);
 const bootId = ref(''), restartLocked = ref(false);
 const notifications = createNotifications(); provide(notificationKey, notifications);
+const unreconciledIds = ref(new Set<string>());
 const plugin = computed(() => plugins.value.find(p => p.instance_id === route.params.instanceId));
-const conflict = computed(() => !!plugin.value && conflicts.value.has(plugin.value.instance_id));
+const conflict = computed(() => !!plugin.value && (conflicts.value.has(plugin.value.instance_id) || unreconciledIds.value.has(plugin.value.instance_id)));
 const detailTab = computed(() => route.name === 'plugin-config' ? 'config' : route.name === 'plugin-logs' ? 'logs' : 'overview');
 const api = createApi(() => { if (!restartLocked.value) logout('登录已失效，请重新输入管理 Token。'); });
-let epoch = 0, refreshAfterBusy = false;
+const status = createManagementStatus(api.request, () => logout('登录已失效，请重新输入管理 Token。')); provide(managementStatusKey, status);
+const removedPlugins = ref(new Set<string>()), autoError = ref('');
+let epoch = 0, refreshAfterBusy = false, readGeneration = 0, reconciliationQueued = false, pendingStatus = false, resetStatusRevision = false;
+let retryNotBefore = 0, reconcileDelay = 1000;
+let reconcileTimer: ReturnType<typeof setTimeout> | undefined, reconcileRead: AbortController | undefined;
+const synchronizationBusy = computed(() => busy.value || pluginToolsBusy.value || settingsBusy.value || systemBusy.value || marketBusy.value);
+const editing = computed(() => pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value);
+function protectedIds() { const ids = new Set(conflicts.value); if (pluginDirty.value && plugin.value) ids.add(plugin.value.instance_id); return ids; }
+function invalidateRead() { readGeneration++; clearTimeout(reconcileTimer); reconcileTimer = undefined; reconcileRead?.abort(); reconcileRead = undefined; }
+function reconciledInputs(incoming: PluginView[]) {
+  const protectedSet = protectedIds();
+  for (const id of unreconciledIds.value) {
+    if (protectedSet.has(id)) continue;
+    const current = plugins.value.find(p => p.instance_id === id), loaded = incoming.find(p => p.instance_id === id);
+    if (!current || (loaded && current.updated_at_ms === loaded.updated_at_ms && current.version === loaded.version)) unreconciledIds.value.delete(id);
+    else reconciliationQueued = true;
+  }
+  retryNotBefore = 0; reconcileDelay = 1000;
+}
+function queueReconciliation() { reconciliationQueued = true; pumpReconciliation(); }
+function pumpReconciliation() {
+  if (!reconciliationQueued || reconcileTimer || reconcileRead || !authenticated.value || restartLocked.value || synchronizationBusy.value || editing.value || document.hidden) return;
+  reconcileTimer = setTimeout(() => { reconcileTimer = undefined; void reconcileBackground(); }, Math.max(250, retryNotBefore - Date.now()));
+}
+async function reconcileBackground() {
+  if (!authenticated.value || restartLocked.value || synchronizationBusy.value || editing.value || document.hidden) return;
+  reconciliationQueued = false;
+  const current = epoch, ticket = ++readGeneration, controller = new AbortController(); reconcileRead = controller;
+  try {
+    const data = await api.request<{ plugins: PluginView[] }>('/api/plugins', undefined, controller.signal);
+    if (current !== epoch || ticket !== readGeneration || controller.signal.aborted) return;
+    if (!Array.isArray(data.plugins)) throw new Error('插件列表格式异常，请重试。');
+    plugins.value = mergePluginRead(plugins.value, data.plugins, protectedIds(), resetStatusRevision);
+    resetStatusRevision = false; reconciledInputs(data.plugins);
+    refreshedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false }); pluginsFailed.value = false; autoError.value = '';
+  } catch (error) {
+    if (current === epoch && ticket === readGeneration && !controller.signal.aborted) { pluginsFailed.value = true; autoError.value = (error as Error).message; reconciliationQueued = true; retryNotBefore = Date.now() + reconcileDelay; reconcileDelay = Math.min(30000, reconcileDelay * 2); }
+  } finally { if (reconcileRead === controller) { reconcileRead = undefined; pumpReconciliation(); } }
+}
+function applyStatus() {
+  const next = status.snapshot.value;
+  if (!next || !authenticated.value || restartLocked.value) return;
+  if (bootId.value && bootId.value !== next.boot_id) {
+    api.clear(); invalidateRead(); resetStatusRevision = true; for (const p of plugins.value) unreconciledIds.value.add(p.instance_id); for (const id of protectedIds()) conflicts.value.add(id); queueReconciliation();
+  }
+  bootId.value = next.boot_id;
+  if (synchronizationBusy.value) { pendingStatus = true; return; }
+  pendingStatus = false;
+  const merged = mergeStatus(plugins.value, next, protectedIds(), resetStatusRevision);
+  for (const id of merged.savedChangedIds) unreconciledIds.value.add(id);
+  plugins.value = merged.plugins;
+  for (const id of merged.conflicts) conflicts.value.add(id);
+  for (const p of next.plugins) removedPlugins.value.delete(p.instance_id);
+  for (const id of merged.removed) removedPlugins.value.add(id);
+  if (merged.reconcile) queueReconciliation();
+}
+watch(() => status.snapshot.value, applyStatus, { flush: 'sync' });
+watch(() => status.state.value, state => { if (state === 'open' && pluginsFailed.value) queueReconciliation(); });
+watch([authenticated, restartLocked, bootId], () => { if (authenticated.value && !restartLocked.value) status.start(bootId.value); else status.stop(); }, { flush: 'sync' });
+watch([synchronizationBusy, editing], () => {
+  if (synchronizationBusy.value || editing.value) { if (reconcileRead || reconcileTimer) reconciliationQueued = true; invalidateRead(); }
+  if (!synchronizationBusy.value) { if (pendingStatus) applyStatus(); pumpReconciliation(); }
+}, { flush: 'sync' });
+watch(pluginDirty, dirty => { if (dirty && plugin.value && unreconciledIds.value.has(plugin.value.instance_id)) conflicts.value.add(plugin.value.instance_id); }, { flush: 'sync' });
+function visibilitySync() { if (document.hidden) { if (reconcileRead || reconcileTimer) { reconciliationQueued = true; invalidateRead(); } } else pumpReconciliation(); }
+
 let historyScope: string | undefined;
 function report(text: string, failed = true, progress = false) { notifications.notify('控制台', text, progress ? 'progress' : failed ? 'error' : 'success'); }
 function logout(text = '', unloading = false) {
   if (!unloading) notifications.reset();
+  status.stop(); invalidateRead(); unreconciledIds.value.clear(); retryNotBefore = 0; reconcileDelay = 1000; reconciliationQueued = false; pendingStatus = false; removedPlugins.value.clear(); autoError.value = '';
   api.clear(); epoch++; refreshAfterBusy = false; authenticated.value = false; tokenInput.value = ''; plugins.value = []; refreshedAt.value = '';
-  bootId.value = ''; restartLocked.value = false; notifications.setSuspended(false);
+  bootId.value = ''; resetStatusRevision = false; restartLocked.value = false; notifications.setSuspended(false);
   historyScope = undefined;
   busy.value = false; checkingSession.value = false; sessionFailed.value = false; pluginsFailed.value = false; authMode.value = 'token';
   pluginDirty.value = false; localDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; systemDirty.value = false; systemBusy.value = false; pluginChildBusy.value = false; permissionsReadBusy.value = false; localBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
@@ -59,14 +128,16 @@ async function perform(task: () => Promise<void>, loading: string) {
   try { await task(); } catch (e) { if (current === epoch) report((e as Error).message); }
   finally { if (current === epoch) { notifications.clearSource('控制台', true); busy.value = false; if (refreshAfterBusy) { refreshAfterBusy = false; marketplaceInstalled(); } } }
 }
-async function refreshPlugins() {
-  const current = epoch;
+async function refreshPlugins(resolve = true, announce = true) {
+  const current = epoch, ticket = ++readGeneration;
   try {
     const data = await api.request<{ plugins: PluginView[] }>('/api/plugins');
     if (!Array.isArray(data.plugins)) throw new Error('插件列表格式异常，请重试。');
-    plugins.value = data.plugins; pluginEditorEpoch.value++; refreshedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-    pluginDirty.value = false; conflicts.value.clear(); pluginsFailed.value = false;
-    report(plugins.value.length ? '插件状态已更新。' : '暂无插件，可先通过现有安装方式添加插件。', false);
+    if (current !== epoch || ticket !== readGeneration) return;
+    plugins.value = resolve ? data.plugins : mergePluginRead(plugins.value, data.plugins, protectedIds(), resetStatusRevision); if (resolve) pluginEditorEpoch.value++; refreshedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    resetStatusRevision = false; reconciliationQueued = false; reconciledInputs(data.plugins);
+    if (resolve) { pluginDirty.value = false; conflicts.value.clear(); removedPlugins.value.clear(); unreconciledIds.value.clear(); } pluginsFailed.value = false; autoError.value = '';
+    if (announce) report(plugins.value.length ? '插件状态已更新。' : '暂无插件，可先通过现有安装方式添加插件。', false);
   } catch (e) { if (current === epoch && authenticated.value) pluginsFailed.value = true; throw e; }
 }
 function login() {
@@ -81,13 +152,13 @@ function readSession(session: Session, restore = false, preserveHistory = false)
   if (!preserveHistory || !scope || scope !== historyScope) notifications.authenticate(scope, restore && session.authenticated);
   historyScope = scope;
   authMode.value = session.mode;
-  authenticated.value = session.authenticated;
   bootId.value = typeof session.boot_id === 'string' ? session.boot_id : '';
+  authenticated.value = session.authenticated;
 }
 function processLock(locked: boolean) {
   if (restartLocked.value === locked) return;
   restartLocked.value = locked; notifications.setSuspended(locked);
-  if (locked) { api.clear(); epoch++; refreshAfterBusy = false; }
+  if (locked) { invalidateRead(); reconciliationQueued = false; pendingStatus = false; api.clear(); epoch++; refreshAfterBusy = false; }
 }
 function processReady(session: ProcessSession) {
   readSession(session, true, true); plugins.value = []; refreshedAt.value = ''; pluginsFailed.value = false;
@@ -111,7 +182,7 @@ function signOut() {
 // reads for this session, including after route remounts; never replay the write.
 function marketplaceInstalled() {
   if (busy.value) { refreshAfterBusy = true; return; }
-  void perform(refreshPlugins, '正在读取安装后的插件状态…');
+  void perform(() => refreshPlugins(false, false), '正在读取安装后的插件状态…');
 }
 function refresh() { if (!restartLocked.value && !pluginToolsBusy.value && mayDiscard(pluginDirty.value)) void perform(refreshPlugins, '正在刷新插件状态…'); }
 async function mutate(change: Mutation) {
@@ -131,7 +202,7 @@ async function mutate(change: Mutation) {
       if (!data.plugin || data.plugin.instance_id !== p.instance_id) throw new Error('更新响应格式异常，请刷新确认状态。');
       if (action === 'recover' && (data.restart_required !== true || !data.plugin.restart_required || data.plugin.runtime_state === 'ready'
         || !Number.isSafeInteger(data.recovered) || Number(data.recovered) < 0)) throw new Error('恢复响应格式异常，正在重新读取状态。');
-      const updated = data.plugin;
+      const updated = data.plugin; unreconciledIds.value.delete(updated.instance_id);
       plugins.value = plugins.value.map(item => item.instance_id === p.instance_id ? updated : item); pluginDirty.value = false;
       report(action === 'recover' ? `已准备恢复 ${data.recovered} 条失败投递。需要重启 Bot；本次没有重放投递。` : updated.error ? `操作已完成，但插件报告错误：${updated.error}` : action === 'apply' ? (updated.pending ? '仍有待应用设置，请检查运行状态。' : '已应用，请查看最新运行状态。') : '已保存；点击“立即应用”后更新运行时。', !!updated.error);
     } catch (e) {
@@ -148,19 +219,19 @@ async function mutate(change: Mutation) {
   }, operation ? '正在完成插件运维操作…' : change.action === 'apply' ? '正在应用已保存设置…' : '正在保存设置…');
   if (removed && current === epoch && authenticated.value && route.params.instanceId === p.instance_id) await router.replace({ name: 'plugins' });
 }
-function updatePlugin(updated: PluginView) { plugins.value = plugins.value.map(p => p.instance_id === updated.instance_id ? updated : p); }
+function updatePlugin(updated: PluginView) { invalidateRead(); unreconciledIds.value.delete(updated.instance_id); plugins.value = plugins.value.map(p => p.instance_id === updated.instance_id ? updated : p); }
 async function reconcilePermissions() {
   if (!authenticated.value) return;
-  const current = epoch; permissionsReadBusy.value = true;
-  try { const data = await api.request<{ plugins: PluginView[] }>('/api/plugins'); if (current === epoch && authenticated.value && Array.isArray(data.plugins)) plugins.value = data.plugins; }
+  permissionsReadBusy.value = true; const current = epoch, ticket = ++readGeneration;
+  try { const data = await api.request<{ plugins: PluginView[] }>('/api/plugins'); if (current === epoch && ticket === readGeneration && authenticated.value && Array.isArray(data.plugins)) { plugins.value = mergePluginRead(plugins.value, data.plugins, protectedIds(), resetStatusRevision); reconciledInputs(data.plugins); } }
   catch { /* Keep the editor's choices and stale block until explicit reread. */ }
   finally { if (current === epoch) permissionsReadBusy.value = false; }
 }
 function beforeUnload(event: BeforeUnloadEvent) { if (restartLocked.value || pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value) { event.preventDefault(); event.returnValue = ''; } }
 const pageHide = () => { notifications.suspendSession(); logout('', true); };
 const pageShow = (event: PageTransitionEvent) => { if (event.persisted) restoreSession(); };
-onMounted(() => { window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
-onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epoch++; window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('pagehide', pageHide); window.removeEventListener('pageshow', pageShow); });
+onMounted(() => { document.addEventListener('visibilitychange', visibilitySync); window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
+onBeforeUnmount(() => { status.dispose(); invalidateRead(); document.removeEventListener('visibilitychange', visibilitySync); notifications.dispose(); removeGuard(); api.clear(); epoch++; window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('pagehide', pageHide); window.removeEventListener('pageshow', pageShow); });
 </script>
 <template>
   <div v-if="!authenticated" class="login-shell">
@@ -176,6 +247,9 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
   <AppShell v-else :inert="restartLocked || undefined" :busy="restartLocked || busy || settingsBusy || systemBusy || marketBusy || pluginToolsBusy" :auth-mode="authMode" @logout="signOut">
     <template #process-controls><RestartControl :boot-id="bootId" :busy="busy || settingsBusy || systemBusy || marketBusy || pluginToolsBusy" :dirty="pluginDirty || localDirty || settingsDirty || systemDirty" @lock="processLock" @ready="processReady" @auth-needed="logout('管理服务需要重新登录；配置或 Token 可能已更改，请重新输入管理 Token。')" /></template>
     <template v-if="!restartLocked">
+    <p v-if="status.state.value !== 'open'" role="status" class="hint">{{ status.error.value || '正在同步运行状态…' }}<span v-if="status.snapshot.value"> 保留上次状态。</span> <button type="button" @click="status.refresh">重连状态同步</button></p>
+    <p v-if="autoError" role="status" class="notice error">插件自动同步失败：{{ autoError }}；保留上次列表。</p>
+    <p v-if="status.snapshot.value?.plugins_truncated" role="status" class="hint">状态摘要仅包含前 256 个实例；列表保留已读取内容，未据此推断其他实例已移除。</p>
     <button v-if="pluginsFailed" id="retry-plugins" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">重试加载插件</button>
     <section v-if="!refreshedAt && route.meta.section === 'plugins'" class="panel empty-state" aria-live="polite"><h1 tabindex="-1">{{ pluginsFailed ? '插件状态暂不可用' : '正在读取插件状态' }}</h1><p>{{ pluginsFailed ? '尚未读取到插件列表，请重试加载。' : '正在连接管理服务，请稍候。' }}</p></section>
     <OverviewPage v-else-if="route.name === 'overview'" :plugins="plugins" :refreshed-at="refreshedAt" :busy="busy" :request="api.request" @refresh="refresh" />
@@ -184,6 +258,7 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
     <template v-else-if="route.name === 'plugins'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">插件 / INSTALLED</span><h1 tabindex="-1">已安装插件</h1><p class="muted">查看实例状态，进入插件管理配置。</p></div><div class="actions"><button id="refresh" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">刷新状态</button><RouterLink :to="{ name: 'marketplace' }" class="button-link">浏览插件市场 ↗</RouterLink></div></div><LocalPackageInstall :request="api.request" :upload="api.upload" :plugins="plugins" :locked="busy || permissionsReadBusy" @dirty="localDirty = $event" @busy="localBusy = $event" @installed="reconcilePermissions" @uncertain="reconcilePermissions" /><PluginList :plugins="plugins" :busy="busy || pluginToolsBusy" /></template>
     <template v-else-if="route.meta.section === 'plugins'">
       <div class="detail-toolbar"><button id="refresh" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">刷新状态</button></div>
+      <p v-if="plugin && removedPlugins.has(plugin.instance_id)" role="status" class="notice">实例已从最新完整状态移除；以下保留原快照和编辑草稿。请先复制需要保留的编辑，再显式刷新。</p>
       <PluginDetail v-if="plugin" :key="`${plugin.instance_id}:${pluginEditorEpoch}`" :plugin="plugin" :request="api.request" :subscribe-logs="api.subscribeLogs" :tab="detailTab" :busy="busy || pluginToolsBusy" :conflict="conflict" @mutate="mutate" @dirty="pluginDirty = $event" @error="report" @busy="pluginChildBusy = $event" @updated="updatePlugin" @uncertain="reconcilePermissions" />
       <section v-else class="panel empty-state"><h1 tabindex="-1">未找到插件实例</h1><p>该实例不在当前管理列表中，可能已移除或未加载。</p><RouterLink :to="{ name: 'plugins' }" class="button-link">返回已安装插件</RouterLink></section>
     </template>

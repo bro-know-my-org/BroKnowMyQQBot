@@ -15,7 +15,7 @@ const emit = defineEmits<{ mutate: [change: Mutation]; dirty: [value: boolean]; 
 const editor = ref<InstanceType<typeof SchemaEditor>>(), configDirty = ref(false), permissionsDirty = ref(false);
 const dirty = computed(() => configDirty.value || permissionsDirty.value);
 watch(dirty, value => emit("dirty", value), { flush: "sync" });
-watch(() => props.plugin, () => { configDirty.value = false; emit("dirty", dirty.value); });
+watch(() => props.plugin.config, () => { configDirty.value = false; emit("dirty", dirty.value); });
 watch(() => props.tab, () => { configDirty.value = false; });
 function save() { if (props.busy || !props.plugin.editable || props.conflict || !dirty.value) return; try { const config = editor.value!.read(); emit("mutate", { action: "config", config }); } catch (e) { emit("error", (e as Error).message); } }
 function discard() { if (window.confirm("有未保存更改，是否放弃这些更改？")) editor.value?.reset(); }

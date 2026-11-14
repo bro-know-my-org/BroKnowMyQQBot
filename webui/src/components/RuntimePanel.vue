@@ -1,10 +1,18 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, inject } from 'vue';
 import type { Request } from '../api';
 import { failureNames, phaseNames, useRuntime } from '../runtime';
+import { managementStatusKey } from '../status';
 import type { AdapterStatus } from '../runtime';
 const props = defineProps<{ request: Request; connections?: boolean }>();
-const { data, loading, stale, error, updatedAt, refresh } = useRuntime(props.request);
+const shared = inject(managementStatusKey, undefined);
+const fallback = shared ? undefined : useRuntime(props.request);
+const data = shared ? computed(() => shared.snapshot.value?.runtime ?? null) : fallback!.data;
+const loading = shared ? computed(() => shared.state.value === 'connecting') : fallback!.loading;
+const stale = shared ? computed(() => shared.state.value !== 'open') : fallback!.stale;
+const error = shared ? shared.error : fallback!.error;
+const updatedAt = shared ? shared.updatedAt : fallback!.updatedAt;
+const refresh = shared ? shared.refresh : fallback!.refresh;
 const state = computed(() => {
   if (!data.value) return error.value ? '状态不可用' : '正在读取状态';
   const { health, snapshot } = data.value;
@@ -38,7 +46,7 @@ function adapterState(adapter: AdapterStatus) {
         </article>
         <p v-if="!Object.keys(data.snapshot.adapters).length" class="muted">运行时尚未报告适配器，当前没有可确认的在线连接。</p>
       </div>
-      <p class="hint">运行快照 · {{ updatedAt }} · 前台约每 5 秒更新。计数来自当前进程；队列深度为采样值。</p>
+      <p class="hint">运行快照 · {{ updatedAt }} · {{ shared ? '前台自动同步。' : '前台约每 5 秒更新。' }}计数来自当前进程；队列深度为采样值。</p>
     </template>
   </section>
 </template>
