@@ -302,7 +302,7 @@ fn known_log_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-fn is_month_directory(name: &str) -> bool {
+pub(crate) fn is_month_directory(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() == 7
         && bytes[4] == b'-'
@@ -310,7 +310,7 @@ fn is_month_directory(name: &str) -> bool {
         && bytes[5..].iter().all(u8::is_ascii_digit)
 }
 
-fn is_managed_log_filename(name: &str) -> bool {
+pub(crate) fn is_managed_log_filename(name: &str) -> bool {
     let Some(stem) = name
         .strip_suffix(".jsonl.zst")
         .or_else(|| name.strip_suffix(".jsonl"))

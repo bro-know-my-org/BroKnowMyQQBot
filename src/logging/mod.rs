@@ -3,6 +3,7 @@
 mod console;
 pub(crate) mod live;
 mod writer;
+pub(crate) use writer::{is_managed_log_filename, is_month_directory};
 
 use std::io::{self, IsTerminal as _};
 
@@ -56,6 +57,9 @@ pub(crate) fn init(
     config: &LoggingConfig,
     live: Option<live::LogBuffer>,
 ) -> Result<LoggingGuards, LoggingError> {
+    if let Some(buffer) = &live {
+        buffer.configure_archives(config.files.enabled.then(|| config.files.directory.clone()));
+    }
     let language = ConsoleLanguage::parse(&config.console.language);
     let ansi = config.console.ansi && std::io::stderr().is_terminal();
     let console_filter =

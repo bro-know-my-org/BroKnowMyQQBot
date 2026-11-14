@@ -51,7 +51,7 @@ plugin-api = { path = "crates/plugin-api" }
 plugin-host = { path = "crates/plugin-host", features = ["wasm"] }
 qqbot-protocol = { path = "crates/qqbot-protocol" }
 reqwest = { workspace = true, features = ["stream"] }
-rustix.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 secrecy.workspace = true
 semver.workspace = true
 serde.workspace = true

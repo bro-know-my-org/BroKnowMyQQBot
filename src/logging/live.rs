@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fmt::{self, Write as _},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -44,6 +44,7 @@ pub(crate) struct LogBuffer {
     session_id: Arc<str>,
     entries: Arc<Mutex<(u64, VecDeque<LogEntry>)>>,
     redactions: Arc<Vec<String>>,
+    archive_directory: Arc<OnceLock<Option<std::path::PathBuf>>>,
     updates: watch::Sender<u64>,
     content_users: Arc<AtomicUsize>,
     content_epoch: Arc<AtomicU64>,
@@ -140,10 +141,19 @@ impl LogBuffer {
             session_id: uuid::Uuid::new_v4().to_string().into(),
             entries: Arc::new(Mutex::new((0, VecDeque::with_capacity(CAPACITY)))),
             redactions: Arc::new(redactions),
+            archive_directory: Arc::default(),
             updates: watch::channel(0).0,
             content_users: Arc::new(AtomicUsize::new(0)),
             content_epoch: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn configure_archives(&self, directory: Option<std::path::PathBuf>) {
+        let _ = self.archive_directory.set(directory);
+    }
+
+    pub(crate) fn archive_directory(&self) -> Option<std::path::PathBuf> {
+        self.archive_directory.get().cloned().flatten()
     }
 
     pub(crate) fn layer(&self) -> LiveLayer {

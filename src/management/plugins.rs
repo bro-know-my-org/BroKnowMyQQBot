@@ -72,6 +72,7 @@ pub(super) fn router_with_runtime(
     observer: bot_core::RuntimeObserver,
 ) -> Router {
     let streams = super::logs_stream::router(logs.clone(), auth.clone(), shutdown);
+    let archives = super::log_archives::router(logs.clone(), auth.clone());
     Router::new()
         .route("/api/runtime", get(super::runtime::get))
         .route(
@@ -102,6 +103,7 @@ pub(super) fn router_with_runtime(
         ))
         .merge(auth::router(auth))
         .merge(streams)
+        .merge(archives)
         .layer(
             tower::ServiceBuilder::new()
                 .layer(axum::error_handling::HandleErrorLayer::new(

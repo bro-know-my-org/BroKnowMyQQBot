@@ -1,6 +1,7 @@
 //! Loopback-only runtime diagnostics and authenticated plugin management.
 
 mod auth;
+mod log_archives;
 mod logs;
 mod logs_stream;
 mod marketplace;
