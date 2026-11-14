@@ -1,9 +1,17 @@
 .market-search { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 .market-search input { flex: 1; min-width: 160px; }
 .market-source, .market-details, .market-list { overflow-wrap: anywhere; min-width: 0; }
+.market-source { margin-top: 12px; font-size: 13px; color: var(--e-ink-muted); }
+.market-source summary, .market-package summary { display: list-item; min-height: 44px; padding-block: 12px; cursor: pointer; }
+.market-package { margin-top: 20px; border-block: 1px solid var(--e-ink-rule); }
+.market-results { margin-bottom: 16px; }
+.market-plugin-id { color: var(--e-ink-muted); font-size: 13px; }
+.market-versions, .market-commands { display: flex; flex-wrap: wrap; gap: 8px 20px; }
+.market-commands { font-size: 13px; }
+.market-install-state { margin-top: 20px; padding-block: 16px; border-block: 1px solid var(--e-ink-rule); font-size: 14px; }
 .market-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); list-style: none; padding: 0; gap: 16px; }
 .market-list h2 { font-size: 1.15rem; }
-.market-list li { min-width: 0; }
+.market-list li { display: flex; flex-direction: column; align-items: flex-start; min-width: 0; }
 .market-details { margin-block: 20px; }
 .market-metadata { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 12px; }
 .market-metadata dt { color: var(--e-ink-muted); }
@@ -19,6 +27,7 @@
   .market-metadata dd { margin-bottom: 12px; }
 }
 .market-list li p { margin-top: 12px; }
-.market-list li button { margin-top: 16px; }
+.market-list li button { margin-top: auto; padding-top: 12px; padding-bottom: 12px; }
+.market-list li > p:last-of-type { margin-bottom: 20px; }
 .market-details > p { margin-top: 12px; }
 .market-details .section-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }

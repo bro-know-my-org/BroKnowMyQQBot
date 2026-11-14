@@ -3,6 +3,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue';
 import { RouterLink } from 'vue-router';
 import type { Request } from '../api';
 import type { Catalogue, CatalogueItem, InstallResult } from '../types';
+import { runtimeNames } from '../types';
 import { pluginRoute } from '../navigation';
 import '../marketplace.css';
 import { useNoticeSource } from '../notifications';
@@ -10,10 +11,10 @@ const props = defineProps<{ request: Request; reconcile?: boolean }>();
 const emit = defineEmits<{ busy: [value: boolean]; installed: []; uncertain: [] }>();
 const query = ref(''), submittedQuery = ref(''), offset = ref(0), catalogue = shallowRef<Catalogue>(), selected = shallowRef<CatalogueItem>();
 const detailTitle = ref<HTMLElement>();
-const loading = ref(false), installing = ref(false), message = ref(''), error = ref('');
+const loading = ref(false), loadingItem = ref(''), installing = ref(false), message = ref(''), error = ref('');
 const grants = ref<string[]>([]), confirmed = ref(false), stale = ref(false);
 const notifications = useNoticeSource('插件市场', () => error.value || message.value, () => error.value ? 'error' : 'warning');
-let alive = true, detailsTrigger: HTMLElement | undefined;
+let alive = true, detailsTrigger: HTMLElement | undefined, listScroll = 0;
 onBeforeUnmount(() => { alive = false; emit('busy', false); });
 const report = (e: unknown) => { if (alive) error.value = (e as Error).message; };
 async function load(nextOffset = 0, newSearch = false) {
@@ -26,8 +27,8 @@ async function load(nextOffset = 0, newSearch = false) {
   } catch (e) { report(e); } finally { if (alive) loading.value = false; }
 }
 async function details(item: CatalogueItem, event: Event) {
-  detailsTrigger = event.currentTarget as HTMLElement;
   if (loading.value || installing.value) return;
+  detailsTrigger = event.currentTarget as HTMLElement; listScroll = window.scrollY; loadingItem.value = item.plugin_id;
   loading.value = true; error.value = ''; message.value = ''; selected.value = undefined;
   try {
     const result = await props.request<Catalogue>(`/api/marketplace/details?selector=${encodeURIComponent(item.slug)}`);
@@ -37,9 +38,13 @@ async function details(item: CatalogueItem, event: Event) {
       if (props.reconcile) emit('installed');
       await nextTick(); if (alive) detailTitle.value?.focus();
     }
-  } catch (e) { report(e); } finally { if (alive) loading.value = false; }
+  } catch (e) { report(e); } finally { if (alive) { loading.value = false; loadingItem.value = ''; } }
 }
-async function closeDetails() { selected.value = undefined; await nextTick(); detailsTrigger?.focus(); }
+async function closeDetails() {
+  if (installing.value) return;
+  selected.value = undefined; await nextTick();
+  if (alive) { detailsTrigger?.focus({ preventScroll: true }); window.scrollTo({ top: listScroll, behavior: 'instant' }); }
+}
 async function install() {
   const item = selected.value;
   if (!item || !confirmed.value || stale.value || installing.value || !item.manageable) return;
@@ -66,16 +71,19 @@ onMounted(() => { void load(); });
 </script>
 <template>
   <div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">插件 / MARKETPLACE</span><h1 tabindex="-1">插件市场</h1><p class="muted">从配置的 GitHub 市场查找插件。安装与更新保存后，需要重启 Bot 才会加载。</p></div></div>
-  <p class="notice">市场包信任等级：local-wasm / unsigned（未签名）。固定哈希用于核对包内容，不代表签名或发布者身份验证。</p>
-  <form class="market-search panel" @submit.prevent="load(0, true)"><label for="market-search">搜索插件</label><input id="market-search" v-model="query" maxlength="128" type="search" placeholder="名称、插件 ID、命令" :disabled="loading || installing"><button :disabled="loading || installing">搜索</button><button type="button" :disabled="loading || installing" @click="load(offset)">刷新市场</button></form>
-  <p v-if="catalogue" class="hint market-source">索引来源：{{ catalogue.source }} · {{ catalogue.total }} 个匹配条目 · 当前结果：{{ submittedQuery || '全部' }}。当前管理默认实例 /default。</p>
-  <p v-if="loading" role="status">正在读取市场…</p>
+  <form v-show="!selected" class="market-search panel" @submit.prevent="load(0, true)"><label for="market-search">搜索插件</label><input id="market-search" v-model="query" maxlength="128" type="search" placeholder="名称、插件 ID、命令" :disabled="loading || installing"><button :disabled="loading || installing">搜索</button><button type="button" :disabled="loading || installing" @click="load(offset)">刷新市场</button></form>
+  <details v-if="catalogue" v-show="!selected" class="market-source"><summary>市场来源与说明</summary><p class="hint">索引来源：{{ catalogue.source }}。当前管理默认实例 /default，保存后需重启 Bot 加载。</p></details>
+  <p v-if="catalogue" v-show="!selected" class="hint market-results" role="status">{{ catalogue.total }} 个匹配条目 · 当前结果：{{ submittedQuery || '全部' }}</p>
+  <p v-if="loading" role="status">{{ loadingItem ? '正在读取插件详情…' : '正在读取市场…' }}</p>
   <div v-if="error" :class="!notifications ? 'notice error' : undefined" :role="!notifications ? 'alert' : undefined"><template v-if="!notifications">{{ error }} </template><button type="button" :disabled="loading || installing" @click="load(offset)">重试加载市场</button></div>
   <p v-if="message && !notifications" class="notice" role="status">{{ message }}</p>
   <section v-if="selected" class="panel market-details" aria-labelledby="market-detail-title">
-    <div class="section-heading"><h2 id="market-detail-title" ref="detailTitle" tabindex="-1">{{ selected.name }} · {{ selected.latest.version }}</h2><button type="button" :disabled="installing" @click="closeDetails">关闭详情</button></div>
+    <div class="section-heading"><h2 id="market-detail-title" ref="detailTitle" tabindex="-1">{{ selected.name }} · {{ selected.latest.version }}</h2><button type="button" :disabled="installing" @click="closeDetails">← 返回插件列表</button></div>
     <p>{{ selected.summary }}</p><p class="mono">{{ selected.plugin_id }}</p>
-    <dl class="market-metadata"><dt>源码</dt><dd><a :href="selected.repository" target="_blank" rel="noopener noreferrer">{{ selected.repository }}</a></dd><dt>版本与协议</dt><dd>{{ selected.latest.version }} · BPP {{ selected.latest.protocol }}</dd><dt>包来源</dt><dd>{{ selected.latest.download }}</dd><dt>SHA-256</dt><dd class="mono">{{ selected.latest.sha256 }}</dd><dt>实例</dt><dd>{{ selected.instance_id }}</dd><dt>已安装</dt><dd>{{ selected.installed ? `${selected.installed.version} · ${selected.installed.enabled ? '已启用' : '已禁用'} · ${selected.installed.runtime_state}` : '尚未安装默认实例' }}</dd></dl>
+    <p v-if="selected.commands.length" class="market-commands"><span class="muted">命令名</span><code v-for="command in selected.commands" :key="command">{{ command }}</code></p>
+    <div class="market-install-state"><template v-if="selected.installed"><p>已保存版本：<span class="mono">{{ selected.installed.version }}</span> · {{ selected.installed.enabled ? '已保存为启用' : '已保存为禁用' }}</p><p class="hint">实例运行状态：{{ runtimeNames[selected.installed.runtime_state] }}。保存新版本后需重启加载。</p></template><p v-else>尚未安装默认实例。</p></div>
+    <details class="market-package"><summary>包信息与兼容性</summary><dl class="market-metadata"><dt>源码</dt><dd><a :href="selected.repository" target="_blank" rel="noopener noreferrer">{{ selected.repository }}</a></dd><dt>协议</dt><dd>BPP {{ selected.latest.protocol }}</dd><dt>包来源</dt><dd>{{ selected.latest.download }}</dd><dt>SHA-256</dt><dd class="mono">{{ selected.latest.sha256 }}</dd><dt>实例</dt><dd>{{ selected.instance_id }}</dd></dl></details>
+    <p class="notice">此版本为未签名包（local-wasm / unsigned）。固定哈希用于核对包内容，不代表签名或发布者身份验证。</p>
     <p v-if="!selected.manageable" class="notice">此实例由声明式文件或随包配置管理，请在其来源中修改。</p>
     <fieldset :disabled="installing || stale || !selected.manageable"><legend>请求权限 · 逐项选择本次新增授权</legend>
       <p class="hint">未勾选的新增权限不会授予。已有授权在更新时保留；缺少必要权限或配置的安装将保持禁用。</p>
@@ -87,9 +95,9 @@ onMounted(() => { void load(); });
     <p v-if="stale" class="hint">本次选择已结束。再次操作前，请重新打开详情核对最新状态。</p>
     <RouterLink v-if="selected.installed || message" :to="pluginRoute(selected.instance_id)" class="button-link" :aria-disabled="installing" @click="installing && $event.preventDefault()">管理已安装实例</RouterLink>
   </section>
-  <section v-if="catalogue" aria-label="市场插件列表">
+  <section v-if="catalogue" v-show="!selected" aria-label="市场插件列表">
     <p v-if="!catalogue.plugins.length" class="panel empty-state">{{ catalogue.total ? '当前页没有条目，请返回上一页。' : '没有匹配的插件。请更换搜索词或刷新市场。' }}</p>
-    <ul v-else class="market-list"><li v-for="item in catalogue.plugins" :key="item.plugin_id" class="panel"><h2>{{ item.name }}</h2><p>{{ item.summary }}</p><p class="mono">{{ item.plugin_id }}</p><p>{{ item.latest.version }} · {{ item.installed ? `已安装 ${item.installed.version}${item.installed.enabled ? ' / 已启用' : ' / 已禁用'}` : '尚未安装默认实例' }}</p><button type="button" :disabled="loading || installing" @click="details(item, $event)">查看详情与权限</button></li></ul>
-    <nav v-if="catalogue.total" class="actions" aria-label="市场分页"><button type="button" :disabled="offset === 0 || loading || installing" @click="load(Math.max(0, offset - 20))">上一页</button><span>{{ offset + 1 }}–{{ offset + catalogue.plugins.length }} / {{ catalogue.total }}</span><button type="button" :disabled="offset + catalogue.plugins.length >= catalogue.total || loading || installing" @click="load(offset + 20)">下一页</button></nav>
+    <ul v-else class="market-list"><li v-for="item in catalogue.plugins" :key="item.plugin_id" class="panel"><h2>{{ item.name }}</h2><p>{{ item.summary }}</p><p class="mono market-plugin-id">{{ item.plugin_id }}</p><p class="market-versions"><span>市场版本 <strong class="mono">{{ item.latest.version }}</strong></span><span>{{ item.installed ? `已保存 ${item.installed.version}` : '尚未安装默认实例' }}</span></p><p v-if="item.commands.length" class="hint">命令名：{{ item.commands.slice(0, 3).join('、') }}{{ item.commands.length > 3 ? ` 等 ${item.commands.length} 项` : '' }}</p><button type="button" :aria-label="`查看 ${item.name} 的详情与权限`" :disabled="loading || installing" @click="details(item, $event)">{{ loadingItem === item.plugin_id ? '正在读取详情…' : '查看详情与权限' }}</button></li></ul>
+    <nav v-if="catalogue.total > catalogue.plugins.length || offset > 0" class="actions" aria-label="市场分页"><button type="button" :disabled="offset === 0 || loading || installing" @click="load(Math.max(0, offset - 20))">上一页</button><span>{{ offset + 1 }}–{{ offset + catalogue.plugins.length }} / {{ catalogue.total }}</span><button type="button" :disabled="offset + catalogue.plugins.length >= catalogue.total || loading || installing" @click="load(offset + 20)">下一页</button></nav>
   </section>
 </template>

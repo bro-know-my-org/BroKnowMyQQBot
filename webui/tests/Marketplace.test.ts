@@ -28,15 +28,20 @@ async function mount() {
   const root = document.createElement('div'); document.body.append(root);
   app = createApp(MarketplacePage, { request: request as Request, onBusy: busy, onInstalled: installed }).use(router); app.mount(root); await flush();
 }
-beforeEach(() => { selected = item(); page = { source: 'https://example.com/index.json', total: 1, offset: 0, plugins: [selected] }; fail = false; pending = undefined; posts.length = 0; vi.clearAllMocks(); });
-afterEach(() => { app?.unmount(); document.body.replaceChildren(); });
+beforeEach(() => { selected = item(); page = { source: 'https://example.com/index.json', total: 1, offset: 0, plugins: [selected] }; fail = false; pending = undefined; posts.length = 0; vi.clearAllMocks(); vi.spyOn(window, 'scrollTo').mockImplementation(() => {}); });
+afterEach(() => { app?.unmount(); document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 it('真实目录、详情、固定哈希与权限可读；默认不授权且需单独确认', async () => {
   await mount();
   expect(document.body.textContent).toContain('https://example.com/index.json');
   expect(document.querySelector('img')).toBeNull();
   expect(posts).toHaveLength(0);
+  expect(document.querySelector('[aria-label="市场分页"]')).toBeNull();
   await click('.market-list button');
+  expect(get('[aria-label="市场插件列表"]').style.display).toBe('none');
+  expect(get('form').style.display).toBe('none');
+  expect(get<HTMLDetailsElement>('.market-package').open).toBe(false);
+  expect(get('.market-commands').textContent).toContain('ping');
   expect(document.body.textContent).toContain('a'.repeat(64));
   expect(document.activeElement).toBe(get('#market-detail-title'));
   expect(get<HTMLButtonElement>('.market-details .primary').disabled).toBe(true);
@@ -83,6 +88,7 @@ it('安装中报告全局忙碌状态并阻止重复提交', async () => {
   await mount(); await click('.market-list button'); await check('.market-confirm input');
   pending = () => {}; await click('.market-details .primary');
   expect(busy).toHaveBeenLastCalledWith(true); expect(get<HTMLFieldSetElement>('fieldset').disabled).toBe(true);
+  await click('.market-details .section-heading button'); expect(document.querySelector('.market-details')).not.toBeNull();
   await click('.market-details .primary'); expect(posts).toHaveLength(1);
   pending!(); await flush(); expect(busy).toHaveBeenLastCalledWith(false);
 });
@@ -104,4 +110,31 @@ it('翻页沿用已提交搜索，编辑框的新查询仅在提交时从第一�
   expect(request.mock.calls.at(-1)?.[0]).toBe('/api/marketplace?q=&offset=20&limit=20');
   get('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flush();
   expect(request.mock.calls.at(-1)?.[0]).toBe('/api/marketplace?q=draft&offset=0&limit=20');
+});
+it('详情返回保留搜索草稿、已提交查询、分页、原按钮和滚动位置，不重复请求目录', async () => {
+  page = { ...page, total: 25, plugins: Array.from({ length: 20 }, (_, i) => ({ ...item(), plugin_id: `dev.bkm.ping${i}` })) };
+  await mount();
+  const input = get<HTMLInputElement>('#market-search'); input.value = 'draft'; input.dispatchEvent(new Event('input', { bubbles: true }));
+  page = { ...page, plugins: [selected] }; await click('nav[aria-label="市场分页"] button:last-child');
+  vi.stubGlobal('scrollY', 480); const trigger = get<HTMLButtonElement>('.market-list button'); trigger.focus();
+  await click('.market-list button'); const reads = request.mock.calls.length;
+  await click('.market-details .section-heading button');
+  expect(document.querySelector('.market-details')).toBeNull(); expect(get('[aria-label="市场插件列表"]').style.display).toBe('');
+  expect(get<HTMLInputElement>('#market-search').value).toBe('draft'); expect(get('[aria-label="市场分页"]').textContent).toContain('21–21 / 25');
+  expect(get('.market-results').textContent).toContain('当前结果：全部'); expect(request.mock.calls).toHaveLength(reads);
+  expect(document.activeElement).toBe(trigger); expect(window.scrollTo).toHaveBeenLastCalledWith({ top: 480, behavior: 'instant' });
+});
+it('详情请求失败后保持原列表可操作，不展开空详情', async () => {
+  await mount(); fail = true; await click('.market-list button');
+  expect(document.querySelector('.market-details')).toBeNull(); expect(get('[aria-label="市场插件列表"]').style.display).toBe('');
+  expect(get<HTMLButtonElement>('.market-list button').disabled).toBe(false); expect(get('[role="alert"]').textContent).toContain('市场暂不可用');
+});
+it('已保存版本与实例运行状态分别说明，版本相同仍允许核对新增授权', async () => {
+  selected.installed = { version: '1.0.0', enabled: false, updated_at_ms: 7, granted_permissions: [], runtime_state: 'ready' };
+  await mount(); await click('.market-list button');
+  expect(get('.market-install-state').textContent).toContain('已保存版本：1.0.0');
+  expect(get('.market-install-state').textContent).toContain('已保存为禁用'); expect(get('.market-install-state').textContent).toContain('实例运行状态：运行中');
+  expect(get('.market-install-state').textContent).toContain('需重启加载');
+  await check('.market-permission input[value="message.reply"]'); await check('.market-confirm input'); await click('.market-details .primary');
+  expect(posts[0]).toMatchObject({ path: '/api/marketplace/update', body: { expected_updated_at_ms: 7, grants: ['message.reply'] } });
 });
