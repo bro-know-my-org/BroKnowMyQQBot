@@ -109,7 +109,11 @@ async fn start(management_auth: Option<ManagementAuth>) -> Result<(), Box<dyn st
         loaded_packages.packages,
         loaded_packages.file_instances,
     )
-    .with_marketplace(config.plugins.marketplace_url.clone())?;
+    .with_marketplace(
+        config.plugins.database.clone(),
+        config.plugins.installations.clone(),
+        config.plugins.marketplace_url.clone(),
+    )?;
     let plugins = Arc::new(manager.clone());
     let observer = RuntimeObserver::new();
     let shutdown_timeout = Duration::from_secs(config.runtime.shutdown_timeout_seconds);

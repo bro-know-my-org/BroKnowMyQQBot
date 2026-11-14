@@ -232,7 +232,19 @@ pub(crate) fn lock_managed_package_lifecycle(database: &Path) -> Result<File, io
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    file.lock_exclusive()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     Ok(file)
 }
 

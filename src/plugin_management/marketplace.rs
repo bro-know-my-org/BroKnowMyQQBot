@@ -1,5 +1,5 @@
 //! Configured catalogue only: no browser supplied URL or filesystem path.
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use plugin_host::PluginInstallation;
 use serde::Serialize;
@@ -10,6 +10,8 @@ use crate::plugin_marketplace::{MarketplaceClient, MarketplacePlugin};
 
 #[derive(Clone)]
 pub(crate) struct MarketplaceContext {
+    pub(crate) database: PathBuf,
+    pub(crate) declarations: Option<PathBuf>,
     pub(crate) source: String,
     pub(crate) client: Arc<MarketplaceClient>,
 }
@@ -49,9 +51,13 @@ pub(crate) fn selection(plugin: &MarketplacePlugin) -> Result<String, Management
 impl PluginManager {
     pub(crate) fn with_marketplace(
         mut self,
+        database: PathBuf,
+        declarations: Option<PathBuf>,
         source: String,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         self.marketplace = Some(MarketplaceContext {
+            database,
+            declarations,
             client: Arc::new(MarketplaceClient::new(&source)?),
             source,
         });

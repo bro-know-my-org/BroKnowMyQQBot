@@ -53,3 +53,20 @@ pub(super) async fn details(
 #[cfg(test)]
 #[path = "marketplace_tests.rs"]
 mod tests;
+
+pub(super) async fn install(
+    State(state): State<ApiState>,
+    Json(request): Json<crate::plugin_management::marketplace_install::InstallRequest>,
+) -> Result<Json<crate::plugin_management::marketplace_install::InstallResult>, ApiError> {
+    Ok(Json(
+        state.manager.install_marketplace(request, false).await?,
+    ))
+}
+pub(super) async fn update(
+    State(state): State<ApiState>,
+    Json(request): Json<crate::plugin_management::marketplace_install::InstallRequest>,
+) -> Result<Json<crate::plugin_management::marketplace_install::InstallResult>, ApiError> {
+    Ok(Json(
+        state.manager.install_marketplace(request, true).await?,
+    ))
+}

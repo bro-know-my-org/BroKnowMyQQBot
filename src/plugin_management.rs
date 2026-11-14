@@ -1,6 +1,7 @@
 //! Shared management operations for the CLI and authenticated Web interface.
 
 pub(crate) mod marketplace;
+pub(crate) mod marketplace_install;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -29,6 +30,8 @@ use tokio::{
 pub(crate) enum ManagementError {
     #[error("市场暂不可用，请稍后重试或检查配置的索引")]
     MarketplaceUnavailable,
+    #[error("市场条目已改变，请刷新详情并重新确认")]
+    StaleMarketplace,
     #[error("市场请求无效，请重新选择插件")]
     InvalidMarketRequest,
     #[error("插件不存在，或由声明式文件管理")]
@@ -126,6 +129,7 @@ struct Operations {
 struct RuntimeState {
     host: StaticPluginHost,
     packages: BTreeMap<String, String>,
+    restart_required: BTreeSet<String>,
 }
 
 impl PluginManager {
@@ -149,7 +153,11 @@ impl PluginManager {
         Self {
             marketplace: None,
             store,
-            runtime: Arc::new(RwLock::new(RuntimeState { host, packages })),
+            runtime: Arc::new(RwLock::new(RuntimeState {
+                host,
+                packages,
+                restart_required: BTreeSet::new(),
+            })),
             writes: Arc::new(Mutex::new(())),
             operations: Arc::new(StdMutex::new(Operations::default())),
             operation_slots: Arc::new(Semaphore::new(4)),
@@ -309,14 +317,22 @@ impl PluginManager {
         instance_id: &str,
         expected: i64,
     ) -> Result<(), ManagementError> {
+        let manager = self.clone();
+        let instance_id = instance_id.to_owned();
+        self.operation(async move { manager.apply_inner(&instance_id, expected).await })
+            .await
+    }
+
+    async fn operation<T: Send + 'static>(
+        &self,
+        task: impl std::future::Future<Output = Result<T, ManagementError>> + Send + 'static,
+    ) -> Result<T, ManagementError> {
         let permit = self
             .operation_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| ManagementError::Busy)?;
         let (send, receive) = oneshot::channel();
-        let manager = self.clone();
-        let instance_id = instance_id.to_owned();
         {
             let mut operations = self.operations.lock().map_err(|_| ManagementError::Store)?;
             if operations.closing {
@@ -329,7 +345,7 @@ impl PluginManager {
             }
             operations.tasks.spawn(async move {
                 let _permit = permit;
-                let result = manager.apply_inner(&instance_id, expected).await;
+                let result = task.await;
                 let _ = send.send(result);
             });
         }
@@ -368,6 +384,9 @@ impl PluginManager {
             }
         } else if !installation.enabled {
             return Ok(());
+        }
+        if runtime.restart_required.contains(instance_id) {
+            return Err(ManagementError::RestartRequired);
         }
         require_grants(&installation)?;
         let plugin = checked_plugin(&installation).await?;
