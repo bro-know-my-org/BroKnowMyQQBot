@@ -2,6 +2,7 @@
 
 mod auth;
 mod listener;
+mod local_packages;
 mod log_archives;
 mod logs;
 mod logs_stream;

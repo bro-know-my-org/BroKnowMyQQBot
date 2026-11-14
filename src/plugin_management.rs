@@ -1,5 +1,6 @@
 //! Shared management operations for the CLI and authenticated Web interface.
 
+pub(crate) mod local_packages;
 pub(crate) mod marketplace;
 pub(crate) mod marketplace_install;
 mod operations;
@@ -64,6 +65,8 @@ pub(crate) enum ManagementError {
     SettingsUnavailable,
     #[error("插件管理操作繁忙或正在关闭，请稍后重试")]
     Busy,
+    #[error("插件包不得超过 32 MiB")]
+    UploadTooLarge,
 }
 
 impl From<StoreError> for ManagementError {
@@ -127,6 +130,7 @@ pub(crate) struct PluginManager {
     shutdown_worker: Arc<Mutex<Option<ShutdownTask>>>,
     file_instances: Arc<BTreeSet<String>>,
     marketplace: Option<marketplace::MarketplaceContext>,
+    local_packages: Arc<local_packages::Staging>,
 }
 
 #[derive(Default)]
@@ -163,6 +167,7 @@ impl PluginManager {
     ) -> Self {
         Self {
             marketplace: None,
+            local_packages: Arc::default(),
             store,
             runtime: Arc::new(RwLock::new(RuntimeState {
                 host,

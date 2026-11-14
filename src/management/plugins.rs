@@ -73,6 +73,7 @@ pub(super) fn router_with_runtime(
 ) -> Router {
     let streams = super::logs_stream::router(logs.clone(), auth.clone(), shutdown);
     let archives = super::log_archives::router(logs.clone(), auth.clone());
+    let uploads = super::local_packages::router(manager.clone(), auth.clone());
     Router::new()
         .route("/api/runtime", get(super::runtime::get))
         .route(
@@ -83,6 +84,10 @@ pub(super) fn router_with_runtime(
         .route("/api/marketplace", get(super::marketplace::list))
         .route("/api/marketplace/details", get(super::marketplace::details))
         .route("/api/plugins", get(list))
+        .route(
+            "/api/plugins/local/discard",
+            post(super::local_packages::discard),
+        )
         .route(
             "/api/plugins/permissions",
             get(super::permissions::get).post(super::permissions::save),
@@ -124,6 +129,7 @@ pub(super) fn router_with_runtime(
         .merge(auth::router(auth))
         .merge(streams)
         .merge(archives)
+        .merge(uploads)
         .layer(
             tower::ServiceBuilder::new()
                 .layer(axum::error_handling::HandleErrorLayer::new(
@@ -253,6 +259,7 @@ impl IntoResponse for ApiError {
             }
             ManagementError::Conflict | ManagementError::StaleMarketplace => StatusCode::CONFLICT,
             ManagementError::Busy => StatusCode::TOO_MANY_REQUESTS,
+            ManagementError::UploadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ManagementError::Store => StatusCode::INTERNAL_SERVER_ERROR,
             ManagementError::Lifecycle | ManagementError::MarketplaceUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
