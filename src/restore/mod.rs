@@ -1,4 +1,5 @@
-//! One expiring read-only inspection per management listener.
+#[allow(dead_code)] // Used by the following offline application stage.
+mod files;
 pub(crate) mod plan;
 use crate::{backup::Repository, plugin_management::PluginManager};
 use std::{

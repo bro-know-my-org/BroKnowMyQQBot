@@ -43,7 +43,7 @@ impl Repository {
             config,
         }
     }
-    fn directory(&self) -> Result<()> {
+    pub(crate) fn directory(&self) -> Result<()> {
         use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
         match fs::DirBuilder::new().mode(0o700).create(&self.root) {
             Ok(()) => (),
@@ -58,6 +58,15 @@ impl Repository {
         {
             return Err(ManagementError::Backup);
         }
+        File::open(
+            self.root
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .map_err(invalid)?
+        .sync_all()
+        .map_err(invalid)?;
         Ok(())
     }
     pub(crate) fn path(&self, id: &str) -> Result<PathBuf> {
