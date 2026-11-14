@@ -3,6 +3,8 @@
 mod auth;
 mod logs;
 mod logs_stream;
+#[cfg(test)]
+mod message_flow_tests;
 mod plugins;
 mod settings;
 
