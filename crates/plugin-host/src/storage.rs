@@ -238,6 +238,10 @@ impl PluginStore {
         connection.execute_batch(
             "
             PRAGMA foreign_keys = ON;
+            CREATE TABLE IF NOT EXISTS logical_restore_commit (
+                slot INTEGER PRIMARY KEY CHECK (slot = 1),
+                operation_id TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS plugin_state (
                 instance_id TEXT NOT NULL,
                 key TEXT NOT NULL,
@@ -607,7 +611,7 @@ impl PluginStore {
         if existing.as_ref().is_some_and(|(status, _, _)| {
             matches!(
                 status.as_str(),
-                "running" | "committed" | "succeeded" | "dead_letter"
+                "running" | "committed" | "succeeded" | "dead_letter" | "retired"
             )
         }) {
             return Ok(None);
@@ -1102,45 +1106,7 @@ impl PluginStore {
 
     pub fn upsert_installation(&self, installation: &PluginInstallation) -> Result<(), StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
-        connection.execute(
-            "INSERT INTO plugin_installations
-                (instance_id, plugin_id, metadata, version, package_path, package_sha256, source,
-                 trust_level, signature_status, requested_permissions, granted_permissions,
-                 config, enabled, installed_at_ms, updated_at_ms)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(instance_id) DO UPDATE SET
-                plugin_id = excluded.plugin_id,
-                metadata = excluded.metadata,
-                version = excluded.version,
-                package_path = excluded.package_path,
-                package_sha256 = excluded.package_sha256,
-                source = excluded.source,
-                trust_level = excluded.trust_level,
-                signature_status = excluded.signature_status,
-                requested_permissions = excluded.requested_permissions,
-                granted_permissions = excluded.granted_permissions,
-                config = excluded.config,
-                enabled = excluded.enabled,
-                updated_at_ms = excluded.updated_at_ms",
-            params![
-                installation.instance_id,
-                installation.plugin_id,
-                serde_json::to_vec(&installation.metadata)?,
-                installation.version,
-                installation.package_path,
-                installation.package_sha256,
-                installation.source,
-                installation.trust_level,
-                installation.signature_status,
-                serde_json::to_vec(&installation.requested_permissions)?,
-                serde_json::to_vec(&installation.granted_permissions)?,
-                serde_json::to_vec(&installation.config)?,
-                installation.enabled,
-                installation.installed_at_ms,
-                installation.updated_at_ms,
-            ],
-        )?;
-        Ok(())
+        upsert_installation(&connection, installation)
     }
 
     pub fn write_installation(
@@ -1635,6 +1601,51 @@ fn dead_letter_row(row: &rusqlite::Row<'_>) -> Result<DeadLetter, rusqlite::Erro
         last_error: row.get(3)?,
         updated_at_ms: row.get(4)?,
     })
+}
+
+fn upsert_installation(
+    connection: &Connection,
+    installation: &PluginInstallation,
+) -> Result<(), StoreError> {
+    connection.execute(
+        "INSERT INTO plugin_installations
+                (instance_id, plugin_id, metadata, version, package_path, package_sha256, source,
+                 trust_level, signature_status, requested_permissions, granted_permissions,
+                 config, enabled, installed_at_ms, updated_at_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(instance_id) DO UPDATE SET
+                plugin_id = excluded.plugin_id,
+                metadata = excluded.metadata,
+                version = excluded.version,
+                package_path = excluded.package_path,
+                package_sha256 = excluded.package_sha256,
+                source = excluded.source,
+                trust_level = excluded.trust_level,
+                signature_status = excluded.signature_status,
+                requested_permissions = excluded.requested_permissions,
+                granted_permissions = excluded.granted_permissions,
+                config = excluded.config,
+                enabled = excluded.enabled,
+                updated_at_ms = excluded.updated_at_ms",
+        params![
+            installation.instance_id,
+            installation.plugin_id,
+            serde_json::to_vec(&installation.metadata)?,
+            installation.version,
+            installation.package_path,
+            installation.package_sha256,
+            installation.source,
+            installation.trust_level,
+            installation.signature_status,
+            serde_json::to_vec(&installation.requested_permissions)?,
+            serde_json::to_vec(&installation.granted_permissions)?,
+            serde_json::to_vec(&installation.config)?,
+            installation.enabled,
+            installation.installed_at_ms,
+            installation.updated_at_ms,
+        ],
+    )?;
+    Ok(())
 }
 
 fn installation_row(row: &rusqlite::Row<'_>) -> Result<PluginInstallation, rusqlite::Error> {

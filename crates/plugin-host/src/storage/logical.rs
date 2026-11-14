@@ -26,6 +26,7 @@ const MAX_RECORD_BYTES: usize = 512 * 1024;
 const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 mod archive;
+mod restore;
 pub use archive::{
     LogicalArchive, LogicalArchiveError, LogicalArchiveManifest, MAX_LOGICAL_ARCHIVE_BYTES,
 };
@@ -108,81 +109,89 @@ impl PluginStore {
     ) -> Result<LogicalSnapshot, StoreError> {
         let mut connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         let transaction = connection.transaction()?;
-        let mut output = LogicalSnapshot {
-            installations: Vec::new(),
-            state: Vec::new(),
-        };
-        let mut bytes = 0;
-        {
-            let mut statement = transaction.prepare(
-                "SELECT plugin_id, metadata, instance_id, version, package_path, package_sha256,
-                 source, trust_level, signature_status, requested_permissions, granted_permissions,
-                 config, enabled, installed_at_ms, updated_at_ms
-                 FROM plugin_installations ORDER BY instance_id LIMIT 257",
-            )?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
-                if output.installations.len() == MAX_INSTALLATIONS {
-                    return Err(StoreError::InvalidLogicalSnapshot);
-                }
-                // Inspect SQLite's borrowed bytes before any string/BLOB allocation or JSON parse.
-                let mut record_bytes = 0;
-                for column in 0..12 {
-                    let raw = row.get_ref(column)?;
-                    record_bytes += match raw {
-                        rusqlite::types::ValueRef::Text(value)
-                        | rusqlite::types::ValueRef::Blob(value) => value.len(),
-                        _ => return Err(StoreError::InvalidLogicalSnapshot),
-                    };
-                }
-                bytes += record_bytes;
-                if record_bytes > MAX_RECORD_BYTES || bytes > MAX_TOTAL_BYTES {
-                    return Err(StoreError::InvalidLogicalSnapshot);
-                }
-                output.installations.push(installation_row(row)?);
-            }
-        }
-        after_installations();
-        {
-            let mut statement = transaction.prepare(
-                "SELECT instance_id, key, value, revision FROM plugin_state
-                 ORDER BY instance_id, key LIMIT 16385",
-            )?;
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
-                let instance = row
-                    .get_ref(0)?
-                    .as_str()
-                    .map_err(|_| StoreError::InvalidLogicalSnapshot)?;
-                let key = row
-                    .get_ref(1)?
-                    .as_str()
-                    .map_err(|_| StoreError::InvalidLogicalSnapshot)?;
-                let value = row
-                    .get_ref(2)?
-                    .as_blob()
-                    .map_err(|_| StoreError::InvalidLogicalSnapshot)?;
-                bytes += instance.len() + key.len() + value.len() + 8;
-                if output.state.len() == MAX_ROWS
-                    || !valid_instance(instance)
-                    || key.len() > 1024
-                    || value.len() > MAX_VALUE_BYTES
-                    || bytes > MAX_TOTAL_BYTES
-                {
-                    return Err(StoreError::InvalidLogicalSnapshot);
-                }
-                output.state.push(LogicalStateEntry {
-                    instance_id: instance.to_owned(),
-                    key: key.to_owned(),
-                    value: value.to_vec(),
-                    revision: row.get(3)?,
-                });
-            }
-        }
-        output.validate()?;
+        let output = read_snapshot(&transaction, after_installations)?;
         transaction.commit()?;
         Ok(output)
     }
+}
+
+fn read_snapshot(
+    transaction: &rusqlite::Transaction<'_>,
+    after_installations: impl FnOnce(),
+) -> Result<LogicalSnapshot, StoreError> {
+    let mut output = LogicalSnapshot {
+        installations: Vec::new(),
+        state: Vec::new(),
+    };
+    let mut bytes = 0;
+    {
+        let mut statement = transaction.prepare(
+            "SELECT plugin_id, metadata, instance_id, version, package_path, package_sha256,
+                 source, trust_level, signature_status, requested_permissions, granted_permissions,
+                 config, enabled, installed_at_ms, updated_at_ms
+                 FROM plugin_installations ORDER BY instance_id LIMIT 257",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if output.installations.len() == MAX_INSTALLATIONS {
+                return Err(StoreError::InvalidLogicalSnapshot);
+            }
+            // Inspect SQLite's borrowed bytes before any string/BLOB allocation or JSON parse.
+            let mut record_bytes = 0;
+            for column in 0..12 {
+                let raw = row.get_ref(column)?;
+                record_bytes += match raw {
+                    rusqlite::types::ValueRef::Text(value)
+                    | rusqlite::types::ValueRef::Blob(value) => value.len(),
+                    _ => return Err(StoreError::InvalidLogicalSnapshot),
+                };
+            }
+            bytes += record_bytes;
+            if record_bytes > MAX_RECORD_BYTES || bytes > MAX_TOTAL_BYTES {
+                return Err(StoreError::InvalidLogicalSnapshot);
+            }
+            output.installations.push(installation_row(row)?);
+        }
+    }
+    after_installations();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT instance_id, key, value, revision FROM plugin_state
+                 ORDER BY instance_id, key LIMIT 16385",
+        )?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let instance = row
+                .get_ref(0)?
+                .as_str()
+                .map_err(|_| StoreError::InvalidLogicalSnapshot)?;
+            let key = row
+                .get_ref(1)?
+                .as_str()
+                .map_err(|_| StoreError::InvalidLogicalSnapshot)?;
+            let value = row
+                .get_ref(2)?
+                .as_blob()
+                .map_err(|_| StoreError::InvalidLogicalSnapshot)?;
+            bytes += instance.len() + key.len() + value.len() + 8;
+            if output.state.len() == MAX_ROWS
+                || !valid_instance(instance)
+                || key.len() > 1024
+                || value.len() > MAX_VALUE_BYTES
+                || bytes > MAX_TOTAL_BYTES
+            {
+                return Err(StoreError::InvalidLogicalSnapshot);
+            }
+            output.state.push(LogicalStateEntry {
+                instance_id: instance.to_owned(),
+                key: key.to_owned(),
+                value: value.to_vec(),
+                revision: row.get(3)?,
+            });
+        }
+    }
+    output.validate()?;
+    Ok(output)
 }
 
 #[cfg(test)]
