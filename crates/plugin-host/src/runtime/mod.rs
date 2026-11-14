@@ -12,7 +12,7 @@ mod upgrade_tests;
 mod validation;
 
 use management::LifecycleTransition;
-pub use management::PluginInstanceSnapshot;
+pub use management::{PluginInstanceSnapshot, PluginInstanceStatus};
 
 use command::{action_status_name, execute_context_command, failed_completion};
 use validation::{

@@ -807,3 +807,102 @@ async fn cancelled_management_rearms_workers_retiring_before_or_after_rollback()
         }
     }
 }
+
+#[tokio::test]
+async fn status_projection_tracks_saved_config_grants_and_real_lifecycle_faults() {
+    let (host, probe) = fixture().await;
+    let installation = crate::PluginInstallation {
+        plugin_id: probe.manifest.id.to_string(),
+        metadata: probe.manifest.metadata.clone(),
+        instance_id: "fixture".to_owned(),
+        version: "0.1.0".to_owned(),
+        package_path: "not-read.bkm-plugin".to_owned(),
+        package_sha256: "0".repeat(64),
+        source: "private-source-not-returned".to_owned(),
+        trust_level: "local-wasm".to_owned(),
+        signature_status: "unsigned".to_owned(),
+        requested_permissions: vec![],
+        granted_permissions: host.plugins[0]
+            .granted_capabilities
+            .iter()
+            .cloned()
+            .collect(),
+        config: BTreeMap::new(),
+        enabled: true,
+        installed_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    host.store.upsert_installation(&installation).unwrap();
+    let read = || host.instance_statuses(1).unwrap();
+    let runtime = read();
+    assert_eq!(runtime.len(), 1);
+    assert_eq!(runtime[0].state, PluginInstanceState::Ready);
+    let rows = host.store.installation_statuses(&runtime, 1).unwrap();
+    assert_eq!(rows[0].config_matches, Some(true));
+    assert_eq!(rows[0].grants_match, Some(true));
+    assert_eq!(rows[0].name, runtime[0].name);
+    let mut changed = installation.clone();
+    changed
+        .config
+        .insert("draft".to_owned(), Value::String("private".to_owned()));
+    changed.granted_permissions.clear();
+    changed.updated_at_ms = 2;
+    host.store.upsert_installation(&changed).unwrap();
+    let rows = host.store.installation_statuses(&read(), 1).unwrap();
+    assert_eq!(rows[0].config_matches, Some(false));
+    assert_eq!(rows[0].grants_match, Some(false));
+    assert_eq!(rows[0].updated_at_ms, 2);
+    assert!(
+        host.store
+            .installation_statuses(&read(), 0)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(host.instance_statuses(0).unwrap().is_empty());
+    host.set_instance_enabled("fixture", false).await.unwrap();
+    assert_eq!(read()[0].state, PluginInstanceState::Stopped);
+    probe.health.store(2, Ordering::SeqCst);
+    assert!(host.set_instance_enabled("fixture", true).await.is_err());
+    assert_eq!(read()[0].state, PluginInstanceState::Disabled);
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn status_rejects_oversized_static_instance_and_config() {
+    let store = PluginStore::in_memory().unwrap();
+    let mut host = StaticPluginHost::new(store);
+    let id = "x".repeat(513);
+    host.register_trusted(probe(), &id, BTreeMap::new())
+        .await
+        .unwrap();
+    assert!(host.instance_statuses(1).is_err());
+    host.shutdown().await.unwrap();
+    let (host, _) = fixture().await;
+    host.plugins[0]
+        .replace_config(BTreeMap::from([(
+            "large".to_owned(),
+            Value::String("x".repeat(1024 * 1024)),
+        )]))
+        .unwrap();
+    assert!(host.instance_statuses(1).is_err());
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn status_prefix_uses_stable_instance_order_and_marks_unsampled_comparisons_unknown() {
+    let mut host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+    let plugin = probe();
+    host.register_trusted(plugin.clone(), "b", BTreeMap::new())
+        .await
+        .unwrap();
+    let mut other = probe();
+    Arc::get_mut(&mut other).unwrap().manifest.id =
+        plugin_api::PluginId::new("dev.bkm.other").unwrap();
+    Arc::get_mut(&mut other).unwrap().manifest.commands.clear();
+    host.register_trusted(other, "a", BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(host.instance_statuses(1).unwrap()[0].instance_id, "a");
+    assert_eq!(host.instance_statuses(2).unwrap()[1].instance_id, "b");
+    host.shutdown().await.unwrap();
+}

@@ -76,7 +76,76 @@ pub struct PluginInstanceSnapshot {
     pub granted_capabilities: BTreeSet<String>,
 }
 
+/// Lightweight management sample: never calls guest hooks or loads a schema.
+pub struct PluginInstanceStatus {
+    pub instance_id: String,
+    pub plugin_id: String,
+    pub name: String,
+    pub version: String,
+    pub state: PluginInstanceState,
+    pub(crate) config_json: Vec<u8>,
+    pub(crate) grants: BTreeSet<String>,
+}
+
+impl std::fmt::Debug for PluginInstanceStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginInstanceStatus")
+            .field("instance_id", &self.instance_id)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
 impl StaticPluginHost {
+    pub fn instance_statuses(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PluginInstanceStatus>, PluginHostError> {
+        let limit = limit.min(257);
+        let mut selected = BTreeMap::new();
+        for plugin in &self.plugins {
+            selected.insert(plugin.instance_id.as_str(), plugin);
+            if selected.len() > limit {
+                selected.pop_last();
+            }
+        }
+        selected
+            .into_values()
+            .map(|plugin| {
+                let metadata = plugin
+                    .manifest
+                    .metadata
+                    .resolve("zh-CN")
+                    .map_err(|_| crate::StoreError::InvalidStatus)?;
+                if plugin.instance_id.len() > 512
+                    || plugin.manifest.id.as_str().len() > 128
+                    || metadata.name.len() > 512
+                    || plugin.manifest.version.len() > 128
+                    || plugin.granted_capabilities.len() > 128
+                    || plugin
+                        .granted_capabilities
+                        .iter()
+                        .any(|grant| grant.len() > 128)
+                {
+                    return Err(crate::StoreError::InvalidStatus.into());
+                }
+                let config = plugin
+                    .config
+                    .lock()
+                    .map_err(|_| crate::StoreError::Poisoned)?;
+                Ok(PluginInstanceStatus {
+                    instance_id: plugin.instance_id.clone(),
+                    plugin_id: plugin.manifest.id.to_string(),
+                    name: metadata.name.clone(),
+                    version: plugin.manifest.version.clone(),
+                    state: plugin.state()?,
+                    config_json: bounded_config(&config)?,
+                    grants: plugin.granted_capabilities.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Detach only after draining all in-flight work. Old Host snapshots share
     /// the terminal state, so queued dispatches cannot re-enter the guest.
     pub async fn unregister_instance(&mut self, instance_id: &str) -> Result<(), PluginHostError> {
@@ -265,4 +334,24 @@ impl StaticPluginHost {
         plugin.set_state(PluginInstanceState::Ready)?;
         self.resume_pending_schedules(plugin)
     }
+}
+
+// Bound temporary serialization even for unusually large static configurations.
+fn bounded_config(config: &BTreeMap<String, Value>) -> Result<Vec<u8>, crate::StoreError> {
+    struct Buffer(Vec<u8>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.len().saturating_add(bytes.len()) > 1024 * 1024 {
+                return Err(std::io::Error::other("status configuration limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Buffer(Vec::new());
+    serde_json::to_writer(&mut buffer, config)?;
+    Ok(buffer.0)
 }

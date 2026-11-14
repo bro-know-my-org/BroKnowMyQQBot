@@ -1,5 +1,8 @@
 //! SQLite-backed BPP private state, command ledger, and outbox.
 
+mod status;
+pub use status::PluginInstallationStatus;
+
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -17,6 +20,8 @@ const MAX_SCHEDULED_TASKS: u64 = 1_024;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("plugin status metadata exceeds the management bounds")]
+    InvalidStatus,
     #[error("plugin store SQLite operation failed")]
     Sqlite(#[from] rusqlite::Error),
     #[error("plugin store lock was poisoned")]

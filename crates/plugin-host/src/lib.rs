@@ -18,13 +18,13 @@ pub use browser::{
 pub use http::{HttpExecutionError, HttpExecutor, SecureHttpExecutor};
 pub use package::{MAX_PLUGIN_PACKAGE_BYTES, PluginPackageError, ValidatedPluginPackage};
 pub use runtime::{
-    PluginHostError, PluginInstanceSnapshot, PluginInstanceState, StaticPluginHost,
-    TrustedAuthorityProvider, TrustedPlatformQuery, TrustedPluginCapabilities,
+    PluginHostError, PluginInstanceSnapshot, PluginInstanceState, PluginInstanceStatus,
+    StaticPluginHost, TrustedAuthorityProvider, TrustedPlatformQuery, TrustedPluginCapabilities,
     validate_plugin_config,
 };
 pub use storage::{
     CommitOptions, DeadLetter, FailedDelivery, FailedDeliveryPage, OutboxOrigin,
-    PluginInstallation, PluginStore, StoreError,
+    PluginInstallation, PluginInstallationStatus, PluginStore, StoreError,
 };
 #[cfg(feature = "wasm")]
 pub use wasm::{WasmPlugin, WasmPluginError};
