@@ -77,6 +77,37 @@ pub struct PluginInstanceSnapshot {
 }
 
 impl StaticPluginHost {
+    /// Detach only after draining all in-flight work. Old Host snapshots share
+    /// the terminal state, so queued dispatches cannot re-enter the guest.
+    pub async fn unregister_instance(&mut self, instance_id: &str) -> Result<(), PluginHostError> {
+        self.retire_instance(instance_id).await?;
+        self.plugins
+            .retain(|plugin| plugin.instance_id != instance_id);
+        self.instances.remove(instance_id);
+        self.rebuild_command_names();
+        Ok(())
+    }
+
+    /// Stop all work and irreversibly retire this guest, retaining its snapshot.
+    /// Recovery must instantiate a fresh guest after a process restart.
+    pub async fn retire_instance(&self, instance_id: &str) -> Result<(), PluginHostError> {
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|plugin| plugin.instance_id == instance_id)
+            .cloned()
+            .ok_or_else(|| PluginHostError::Invocation {
+                plugin_id: instance_id.to_owned(),
+                message: "plugin instance is not registered".to_owned(),
+            })?;
+        let _lifecycle = plugin.lifecycle.lock().await;
+        self.set_registered_enabled(&plugin, false).await?;
+        // Irreversible while holding the same lifecycle lock: an older Host
+        // clone, including a queued enable, can never revive this guest.
+        plugin.set_state(PluginInstanceState::Disabled)?;
+        Ok(())
+    }
+
     pub async fn configure_stopped_instance(
         &self,
         instance_id: &str,
@@ -147,6 +178,15 @@ impl StaticPluginHost {
                 message: "plugin instance is not registered".to_owned(),
             })?;
         let _lifecycle = plugin.lifecycle.lock().await;
+        self.set_registered_enabled(plugin, enabled).await
+    }
+
+    async fn set_registered_enabled(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        enabled: bool,
+    ) -> Result<(), PluginHostError> {
+        let instance_id = plugin.instance_id.as_str();
         let previous = plugin.state()?;
         if (enabled && previous == PluginInstanceState::Ready)
             || (!enabled && previous == PluginInstanceState::Stopped)
@@ -165,6 +205,7 @@ impl StaticPluginHost {
         }
         if previous == PluginInstanceState::Disabled {
             self.pause_plugin_schedules(instance_id)?;
+            let _execution = plugin.execution.acquire_exclusive().await?;
             self.assets.remove_instance(instance_id);
             return Ok(());
         }

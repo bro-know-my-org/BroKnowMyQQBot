@@ -118,8 +118,28 @@ async fn fixture() -> (StaticPluginHost, Arc<Probe>) {
 }
 
 #[tokio::test]
+async fn unregister_healthy_or_stopped_guest_is_irreversible_in_old_host_clones() {
+    for stopped in [false, true] {
+        let (mut host, probe) = fixture().await;
+        let old = host.clone();
+        if stopped {
+            host.set_instance_enabled("fixture", false).await.unwrap();
+        }
+        host.unregister_instance("fixture").await.unwrap();
+        assert!(host.instance_snapshots().unwrap().is_empty());
+        assert!(old.set_instance_enabled("fixture", true).await.is_err());
+        assert_eq!(
+            old.instance_snapshots().unwrap()[0].state,
+            PluginInstanceState::Disabled
+        );
+        assert_eq!(probe.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.stops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
 async fn poisoning_while_stop_apply_upgrade_or_shutdown_waits_never_revives_the_guest() {
-    for operation in 0..4 {
+    for operation in 0..5 {
         let (host, probe) = fixture().await;
         let mut upgrading_host = host.clone();
         let plugin = &host.plugins[0];
@@ -158,11 +178,12 @@ async fn poisoning_while_stop_apply_upgrade_or_shutdown_waits_never_revives_the_
                     .await
                 }
                 2 => host.shutdown().await,
-                _ => {
+                3 => {
                     upgrading_host
                         .upgrade_trusted("fixture", probe.clone(), BTreeMap::new())
                         .await
                 }
+                _ => upgrading_host.unregister_instance("fixture").await,
             }
         };
         tokio::pin!(management);
