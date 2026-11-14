@@ -5,6 +5,7 @@
 pub mod adapter;
 pub mod context;
 pub mod dedup;
+mod message_trace;
 pub mod metrics;
 pub mod model;
 pub mod router;
@@ -16,6 +17,7 @@ pub use adapter::{
 };
 pub use context::{Context, ContextError};
 pub use dedup::{DedupClaim, DedupError, DedupErrorKind, DedupKey, DedupStore, MemoryDedupStore};
+pub use message_trace::execute_traced_action;
 pub use metrics::{
     AdapterFailureKind, HealthStatus, RuntimeHealth, RuntimeMetricsSnapshot, RuntimeObserver,
     RuntimePhase,

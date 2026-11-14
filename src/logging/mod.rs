@@ -66,7 +66,7 @@ pub(crate) fn init(
             .event_format(ConsoleFormat::new(language, ansi))
             .with_filter(console_filter)
             .with_filter(filter_fn(move |metadata| {
-                show_console_messages || metadata.target() != MESSAGE_LOG_TARGET
+                console_target_allowed(metadata.target(), show_console_messages)
             }))
     });
 
@@ -110,7 +110,7 @@ pub(crate) fn init(
                 .with_writer(writer)
                 .with_filter(file_filter.clone().expect("file filter was validated"))
                 .with_filter(filter_fn(|metadata| {
-                    metadata.target() != MESSAGE_LOG_TARGET
+                    console_target_allowed(metadata.target(), false)
                 })),
         )
     } else {
@@ -152,6 +152,10 @@ pub(crate) fn init(
         .try_init()
         .map_err(|error| LoggingError::Subscriber(error.to_string()))?;
     Ok(guards)
+}
+
+fn console_target_allowed(target: &str, message_content: bool) -> bool {
+    target != live::MESSAGE_TRACE_TARGET && (message_content || target != MESSAGE_LOG_TARGET)
 }
 
 fn live_filter(config: &LoggingConfig) -> Result<EnvFilter, LoggingError> {
@@ -227,7 +231,7 @@ mod tests {
             .flatten_event(true)
             .with_writer(runtime)
             .with_filter(filter_fn(|metadata| {
-                metadata.target() != MESSAGE_LOG_TARGET
+                console_target_allowed(metadata.target(), false)
             }));
         let message_layer = fmt::layer()
             .json()
@@ -249,6 +253,7 @@ mod tests {
                 content = "hello",
                 "message-event"
             );
+            tracing::info!(target: live::MESSAGE_TRACE_TARGET, content = "web-only-body", "web-only-message");
         });
         drop(runtime_guard);
         drop(messages_guard);
@@ -257,9 +262,12 @@ mod tests {
         let messages = read_log(&directory.join("messages"));
         assert!(runtime.contains("runtime-event"));
         assert!(!runtime.contains("message-event"));
+        assert!(!runtime.contains("web-only"));
         assert!(messages.contains("message-event"));
         assert!(messages.contains("hello"));
         assert!(!messages.contains("runtime-event"));
+        assert!(!messages.contains("web-only"));
+        assert!(!console_target_allowed(live::MESSAGE_TRACE_TARGET, true));
         fs::remove_dir_all(directory).unwrap();
     }
 

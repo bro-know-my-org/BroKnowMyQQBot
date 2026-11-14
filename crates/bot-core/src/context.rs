@@ -96,6 +96,16 @@ impl Context {
     }
 
     pub async fn reply(&self, content: impl Into<String>) -> Result<ActionResult, ContextError> {
+        self.reply_with_event_id(self.event_id.as_str(), content)
+            .await
+    }
+
+    /// Replies to the original message while attributing a derived event's action.
+    pub async fn reply_with_event_id(
+        &self,
+        event_id: &str,
+        content: impl Into<String>,
+    ) -> Result<ActionResult, ContextError> {
         let target = self
             .reply_target
             .clone()
@@ -104,17 +114,29 @@ impl Context {
             .source_message_id
             .clone()
             .ok_or(ContextError::MissingReplyTarget)?;
-        self.execute(Action::Reply(ReplyAction {
-            target,
-            source_message_id,
-            content: content.into(),
-        }))
+        self.execute_with_event_id(
+            event_id,
+            Action::Reply(ReplyAction {
+                target,
+                source_message_id,
+                content: content.into(),
+            }),
+        )
         .await
     }
 
     pub async fn execute(&self, action: Action) -> Result<ActionResult, ContextError> {
-        self.adapter
-            .execute(action)
+        self.execute_with_event_id(self.event_id.as_str(), action)
+            .await
+    }
+
+    /// Executes on the original Adapter with the current derived source event ID.
+    pub async fn execute_with_event_id(
+        &self,
+        event_id: &str,
+        action: Action,
+    ) -> Result<ActionResult, ContextError> {
+        crate::execute_traced_action(self.adapter.as_ref(), event_id, action)
             .await
             .map_err(ContextError::from)
     }

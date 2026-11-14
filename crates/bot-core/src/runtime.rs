@@ -1202,6 +1202,7 @@ async fn process_claimed_event(
     observer: RuntimeObserver,
     claim: DedupClaim,
 ) -> Option<PendingEventRetry> {
+    crate::message_trace::received(&event);
     let context = Context::new(&event, Arc::clone(&adapter));
     let mut handled_successfully = true;
     for registered in handlers.iter() {

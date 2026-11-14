@@ -17,6 +17,7 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 const CAPACITY: usize = 1000;
 const FIELD_COUNT: usize = 16;
+pub(crate) const MESSAGE_TRACE_TARGET: &str = "bkm::message_trace";
 
 #[derive(Clone)]
 pub(crate) struct LogBuffer {
