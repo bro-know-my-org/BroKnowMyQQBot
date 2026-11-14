@@ -303,6 +303,7 @@ dependencies = [
  "plugin-host",
  "qqbot-protocol",
  "reqwest",
+ "rusqlite",
  "rustix",
  "secrecy",
  "semver",

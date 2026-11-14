@@ -81,3 +81,7 @@ pub(super) async fn failures(
             .await?,
     ))
 }
+
+#[cfg(test)]
+#[path = "plugin_operations_tests.rs"]
+mod tests;
