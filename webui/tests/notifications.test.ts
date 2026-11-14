@@ -63,13 +63,30 @@ describe('通知计时与会话历史', () => {
     expect(center.state.history).toHaveLength(100); expect(center.state.history[99]?.message).toBe('通知4');
     expect(center.unread.value).toBe(100); expect(vi.getTimerCount()).toBe(3);
   });
-  it('只在前台打开历史时标为已读，打开期间的新通知不累加未读数', () => {
-    center.notify('测试', '一'); expect(center.unread.value).toBe(1);
-    window.dispatchEvent(new Event('blur')); center.setOpen(true); expect(center.unread.value).toBe(1);
-    center.notify('测试', '二'); expect(center.unread.value).toBe(2);
-    window.dispatchEvent(new Event('focus')); expect(center.unread.value).toBe(0);
-    center.notify('测试', '三'); expect(center.unread.value).toBe(0);
-    center.setOpen(false); center.notify('测试', '四'); expect(center.unread.value).toBe(1);
+  it('实际展示的前台浮层立即已读，后台和遮挡不算展示', () => {
+    const id = center.notify('测试', '一')!; expect(center.unread.value).toBe(1);
+    window.dispatchEvent(new Event('blur')); center.setVisible(id, 'toast', true); expect(center.unread.value).toBe(1);
+    hide(true); window.dispatchEvent(new Event('focus')); expect(center.unread.value).toBe(1);
+    center.setSuspended(true); hide(false); expect(center.unread.value).toBe(1);
+    center.setSuspended(false); expect(center.unread.value).toBe(0);
+    const next = center.notify('测试', '二')!; center.setOpen(true); center.setVisible(next, 'toast', true);
+    expect(center.unread.value).toBe(1); center.setOpen(false); expect(center.unread.value).toBe(0);
+  });
+  it('静默通知只记历史且不替换同来源浮层，打开历史只读实际可见的条目', () => {
+    const toast = center.notify('测试', '普通通知')!; center.setVisible(toast, 'toast', true);
+    const first = center.notify('测试', '静默一', 'info', { silent: true })!;
+    const second = center.notify('测试', '静默二', 'warning', { silent: true })!;
+    expect(active()).toEqual(['普通通知']); expect(center.unread.value).toBe(2); expect(vi.getTimerCount()).toBe(1);
+    center.setOpen(true); expect(center.unread.value).toBe(2);
+    center.setVisible(first, 'history', true); expect(center.unread.value).toBe(1);
+    center.setVisible(second, 'history', false); expect(center.state.history[0]?.unread).toBe(true);
+    center.markAllRead(); expect(center.unread.value).toBe(0);
+  });
+  it('静默通知遵循历史容量，清理会话后旧可见回调不影响新通知', () => {
+    for (let i = 0; i < 104; i++) center.notify('静默', `通知${i}`, 'info', { silent: true });
+    expect(active()).toEqual([]); expect(center.state.history).toHaveLength(100); expect(center.unread.value).toBe(100); expect(vi.getTimerCount()).toBe(0);
+    const old = center.state.history[0]!.id; center.reset(); center.setVisible(old, 'history', true);
+    center.notify('静默', '新通知', 'info', { silent: true }); expect(center.unread.value).toBe(1);
   });
   it('清空历史同时移除对应浮层，重置清除整个会话并取消定时器', () => {
     center.notify('日志', '完成'); center.notify('任务', '进行中', 'progress'); center.setOpen(true);

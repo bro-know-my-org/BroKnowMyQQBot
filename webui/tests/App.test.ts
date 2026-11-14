@@ -264,6 +264,7 @@ it('通知按钮可回看跨页历史，退出登录后清空上一会话的通�
   await go({ name: 'overview' }); expect(get('.notification-toast').textContent).toContain('已保存；点击“立即应用”后更新运行时。');
   await click('[aria-controls="notification-history"]');
   expect(get('#notification-history').textContent).toContain('已保存；点击“立即应用”后更新运行时。');
+  await click('.notification-history-actions button');
   expect(get('[aria-controls="notification-history"]').getAttribute('aria-label')).toContain('0 条未读');
   await click('#logout'); expect(document.querySelector('#notification-history')).toBeNull();
   await click('[aria-controls="notification-history"]');

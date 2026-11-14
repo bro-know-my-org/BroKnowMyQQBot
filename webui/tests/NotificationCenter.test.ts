@@ -3,18 +3,32 @@ import { createApp, nextTick } from 'vue';
 import NotificationCenter from '../src/components/NotificationCenter.vue';
 import { createNotifications } from '../src/notifications';
 let app: ReturnType<typeof createApp>, center: ReturnType<typeof createNotifications>, trigger: HTMLButtonElement;
+let intersection: IntersectionObserverCallback;
+let observerOptions: IntersectionObserverInit | undefined;
+const targets = new Set<Element>(), disconnect = vi.fn(() => targets.clear());
+const intersect = (target: Element, shown = true, ratio = shown ? 1 : 0) => intersection([{
+  target, isIntersecting: shown, intersectionRatio: ratio, boundingClientRect: target.getBoundingClientRect(),
+  intersectionRect: target.getBoundingClientRect(), rootBounds: null, time: performance.now(),
+}], {} as IntersectionObserver);
 const get = <T extends HTMLElement = HTMLElement>(selector: string) => document.querySelector<T>(selector)!;
 beforeEach(() => {
   vi.spyOn(document, 'hasFocus').mockReturnValue(true);
   vi.spyOn(HTMLElement.prototype, 'getClientRects').mockReturnValue([new DOMRect(0, 0, 44, 44)] as unknown as DOMRectList);
+  targets.clear(); disconnect.mockClear();
+  vi.stubGlobal('IntersectionObserver', class {
+    constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) { intersection = callback; observerOptions = options; }
+    observe(element: Element) { targets.add(element); }
+    unobserve(element: Element) { targets.delete(element); }
+    disconnect = disconnect;
+  });
   center = createNotifications(); trigger = document.createElement('button'); trigger.textContent = '通知历史'; trigger.setAttribute('aria-controls', 'notification-history');
   const root = document.createElement('div'); document.body.append(trigger, root); app = createApp(NotificationCenter, { center }); app.mount(root);
 });
-afterEach(() => { app.unmount(); center.dispose(); document.body.replaceChildren(); vi.restoreAllMocks(); });
+afterEach(() => { app.unmount(); center.dispose(); document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 it('打开历史后聚焦关闭按钮，Escape 关闭并回到触发按钮', async () => {
   trigger.focus(); center.notify('设置', '前缀已保存', 'success'); center.setOpen(true); await nextTick(); await nextTick();
   expect(document.activeElement).toBe(get('[aria-label="关闭通知历史"]'));
-  expect(get('#notification-history').textContent).toContain('前缀已保存'); expect(center.unread.value).toBe(0);
+  expect(get('#notification-history').textContent).toContain('前缀已保存'); intersect(get('.notification-history-list li')); expect(center.unread.value).toBe(0);
   document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })); await nextTick();
   expect(get('#notification-history')).toBeNull(); expect(document.activeElement).toBe(trigger); expect(center.state.history).toHaveLength(1);
 });
@@ -64,4 +78,36 @@ it.each(['replace', 'evict'])('自动移除聚焦通知时恢复键盘位置：%
   else for (let i = 0; i < 3; i++) center.notify(`新来源${i}`, `新通知${i}`);
   await nextTick(); await nextTick(); expect(document.activeElement).toBe(get('[aria-label="关闭通知"]'));
   expect(center.state.history.some(entry => entry.message === '原通知')).toBe(true);
+});
+it('浮层实际进入视口后立即已读，未展示的静默条目仍未读', async () => {
+  center.notify('普通', '普通消息'); center.notify('静默', '静默消息', 'info', { silent: true }); await nextTick();
+  expect(center.unread.value).toBe(2); expect(targets.size).toBe(1);
+  intersect(get('.notification-toast')); expect(center.unread.value).toBe(1);
+  center.setOpen(true); await nextTick(); await nextTick(); expect(center.unread.value).toBe(1);
+  intersect(get('.notification-history-list li')); expect(center.unread.value).toBe(0);
+});
+it('历史未滚动到的条目不自动已读，全部已读按钮仍可显式清除', async () => {
+  for (let i = 0; i < 3; i++) center.notify('静默', `通知${i}`, 'info', { silent: true });
+  center.setOpen(true); await nextTick(); await nextTick();
+  const rows = document.querySelectorAll('.notification-history-list li'); intersect(rows[0]!); intersect(rows[1]!, false);
+  expect(center.unread.value).toBe(2);
+  get<HTMLButtonElement>('.notification-history-actions button').click(); await nextTick(); expect(center.unread.value).toBe(0);
+});
+it('销毁或移除条目后停止观察，晚到的可见性回调不再写入', async () => {
+  center.notify('普通', '旧通知'); await nextTick(); const old = get('.notification-toast');
+  center.notify('普通', '新通知'); await nextTick(); expect(targets.has(old)).toBe(false);
+  intersect(old); expect(center.unread.value).toBe(2);
+  app.unmount(); expect(disconnect).toHaveBeenCalledOnce(); expect(targets.size).toBe(0);
+  intersect(old); expect(center.unread.value).toBe(2);
+});
+it('条目从仅接触边界到出现实际面积时仍能收到可见更新并标为已读', async () => {
+  center.notify('静默', '边缘条目', 'info', { silent: true }); center.setOpen(true); await nextTick(); await nextTick();
+  const target = get('.notification-history-list li');
+  intersect(target, true, 0);
+  expect(center.unread.value).toBe(1);
+  const thresholds = Array.isArray(observerOptions?.threshold) ? observerOptions.threshold : [observerOptions?.threshold ?? 0];
+  // isIntersecting stays true: the browser only reports this scroll if a threshold index changes.
+  const indexAt = (ratio: number) => thresholds.filter(threshold => threshold <= ratio).length;
+  if (indexAt(0) !== indexAt(0.005)) intersect(target, true, 0.005);
+  expect(center.unread.value).toBe(0);
 });
