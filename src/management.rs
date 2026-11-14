@@ -3,6 +3,7 @@
 mod auth;
 mod logs;
 mod logs_stream;
+mod marketplace;
 #[cfg(test)]
 mod message_flow_tests;
 mod plugins;

@@ -55,6 +55,8 @@ pub(super) fn router_with_logs_and_shutdown(
 ) -> Router {
     let streams = super::logs_stream::router(logs.clone(), auth.clone(), shutdown);
     Router::new()
+        .route("/api/marketplace", get(super::marketplace::list))
+        .route("/api/marketplace/details", get(super::marketplace::details))
         .route("/api/plugins", get(list))
         .route("/api/plugins/config", post(save_config))
         .route("/api/plugins/enabled", post(save_enabled))
@@ -196,10 +198,13 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self.0 {
             ManagementError::NotManaged => StatusCode::NOT_FOUND,
+            ManagementError::InvalidMarketRequest => StatusCode::BAD_REQUEST,
             ManagementError::Conflict => StatusCode::CONFLICT,
             ManagementError::Busy => StatusCode::TOO_MANY_REQUESTS,
             ManagementError::Store => StatusCode::INTERNAL_SERVER_ERROR,
-            ManagementError::Lifecycle => StatusCode::SERVICE_UNAVAILABLE,
+            ManagementError::Lifecycle | ManagementError::MarketplaceUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
         (status, Json(json!({"error":self.0.to_string()}))).into_response()

@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, time::Duration};
 use plugin_api::PluginId;
 use plugin_host::ValidatedPluginPackage;
 use reqwest::{Url, redirect::Policy};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 pub(crate) const DEFAULT_MARKETPLACE_URL: &str =
@@ -14,14 +14,14 @@ const MAX_MARKETPLACE_INDEX_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 5;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MarketplaceIndex {
     schema_version: u32,
     plugins: Vec<MarketplacePlugin>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MarketplacePlugin {
     pub(crate) slug: String,
@@ -36,7 +36,7 @@ pub(crate) struct MarketplacePlugin {
     pub(crate) capabilities: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MarketplaceRelease {
     pub(crate) version: String,
@@ -45,11 +45,16 @@ pub(crate) struct MarketplaceRelease {
     pub(crate) sha256: String,
 }
 
+#[cfg(test)]
+pub(crate) type MarketplaceFixture = std::sync::Arc<std::sync::Mutex<(Vec<u8>, Vec<u8>)>>;
+
 #[derive(Debug)]
 pub(crate) struct MarketplaceClient {
     index_url: Url,
     index_client: reqwest::Client,
     download_client: reqwest::Client,
+    #[cfg(test)]
+    fixture: Option<MarketplaceFixture>,
 }
 
 impl MarketplaceClient {
@@ -105,10 +110,16 @@ impl MarketplaceClient {
             index_url,
             index_client,
             download_client,
+            #[cfg(test)]
+            fixture: None,
         })
     }
 
     pub(crate) async fn fetch_index(&self) -> Result<MarketplaceIndex, Box<dyn std::error::Error>> {
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            return self.parse_index(&fixture.lock().expect("fixture lock").0);
+        }
         let response = self
             .index_client
             .get(self.index_url.clone())
@@ -116,7 +127,14 @@ impl MarketplaceClient {
             .await?
             .error_for_status()?;
         let bytes = read_bounded_response(response, MAX_MARKETPLACE_INDEX_BYTES, "index").await?;
-        let mut index: MarketplaceIndex = serde_json::from_slice(&bytes)?;
+        self.parse_index(&bytes)
+    }
+
+    fn parse_index(&self, bytes: &[u8]) -> Result<MarketplaceIndex, Box<dyn std::error::Error>> {
+        if bytes.len() > MAX_MARKETPLACE_INDEX_BYTES {
+            return Err("index too large".into());
+        }
+        let mut index: MarketplaceIndex = serde_json::from_slice(bytes)?;
         index.validate()?;
         if self.index_url.as_str() != DEFAULT_MARKETPLACE_URL {
             index.mark_review_labels_untrusted();
@@ -129,6 +147,11 @@ impl MarketplaceClient {
         plugin: &MarketplacePlugin,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let download = validate_release_url(&plugin.latest.download)?;
+        #[cfg(test)]
+        if let Some(fixture) = &self.fixture {
+            let bytes = fixture.lock().expect("fixture lock").1.clone();
+            return checked_download(bytes, plugin);
+        }
         let response = self
             .download_client
             .get(download)
@@ -137,16 +160,32 @@ impl MarketplaceClient {
             .error_for_status()?;
         let bytes =
             read_bounded_response(response, MAX_PLUGIN_PACKAGE_BYTES, "plugin package").await?;
-        let actual_sha256 = hex::encode(Sha256::digest(&bytes));
-        if actual_sha256 != plugin.latest.sha256 {
-            return Err(format!(
-                "marketplace package checksum mismatch: expected {}, got {actual_sha256}",
-                plugin.latest.sha256
-            )
-            .into());
-        }
-        Ok(bytes)
+        checked_download(bytes, plugin)
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_fixture(mut self, fixture: MarketplaceFixture) -> Self {
+        self.fixture = Some(fixture);
+        self
+    }
+}
+
+fn checked_download(
+    bytes: Vec<u8>,
+    plugin: &MarketplacePlugin,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if bytes.len() > MAX_PLUGIN_PACKAGE_BYTES {
+        return Err("package too large".into());
+    }
+    let actual_sha256 = hex::encode(Sha256::digest(&bytes));
+    if actual_sha256 != plugin.latest.sha256 {
+        return Err(format!(
+            "marketplace package checksum mismatch: expected {}, got {actual_sha256}",
+            plugin.latest.sha256
+        )
+        .into());
+    }
+    Ok(bytes)
 }
 
 impl MarketplaceIndex {

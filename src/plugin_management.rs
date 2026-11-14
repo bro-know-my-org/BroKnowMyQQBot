@@ -1,5 +1,7 @@
 //! Shared management operations for the CLI and authenticated Web interface.
 
+pub(crate) mod marketplace;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex as StdMutex, RwLock},
@@ -25,6 +27,10 @@ use tokio::{
 
 #[derive(Debug, Error)]
 pub(crate) enum ManagementError {
+    #[error("市场暂不可用，请稍后重试或检查配置的索引")]
+    MarketplaceUnavailable,
+    #[error("市场请求无效，请重新选择插件")]
+    InvalidMarketRequest,
     #[error("插件不存在，或由声明式文件管理")]
     NotManaged,
     #[error("插件记录已改变，请刷新后重试")]
@@ -107,6 +113,7 @@ pub(crate) struct PluginManager {
     operation_slots: Arc<Semaphore>,
     shutdown_worker: Arc<Mutex<Option<ShutdownTask>>>,
     file_instances: Arc<BTreeSet<String>>,
+    marketplace: Option<marketplace::MarketplaceContext>,
 }
 
 #[derive(Default)]
@@ -140,6 +147,7 @@ impl PluginManager {
         file_instances: BTreeSet<String>,
     ) -> Self {
         Self {
+            marketplace: None,
             store,
             runtime: Arc::new(RwLock::new(RuntimeState { host, packages })),
             writes: Arc::new(Mutex::new(())),
