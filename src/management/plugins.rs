@@ -266,7 +266,9 @@ impl IntoResponse for ApiError {
             }
             ManagementError::Conflict | ManagementError::StaleMarketplace => StatusCode::CONFLICT,
             ManagementError::Busy => StatusCode::TOO_MANY_REQUESTS,
-            ManagementError::UploadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ManagementError::UploadTooLarge | ManagementError::RestoreTooLarge => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
             ManagementError::ExpiredSelection => StatusCode::GONE,
             ManagementError::Store => StatusCode::INTERNAL_SERVER_ERROR,
             ManagementError::Lifecycle | ManagementError::MarketplaceUnavailable => {

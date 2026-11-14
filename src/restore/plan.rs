@@ -38,7 +38,10 @@ pub(crate) struct Inspection {
     pub plugins: Vec<Impact>,
     pub affected_instances: Vec<String>,
     pub changed_settings: Vec<String>,
+    pub settings_before: Value,
+    pub settings_after: Value,
 }
+#[allow(dead_code)] // The following offline-application stage consumes retained CAS data.
 pub(crate) struct Prepared {
     pub archive: LogicalArchive,
     pub inspection: Inspection,
@@ -47,6 +50,8 @@ pub(crate) struct Prepared {
     pub expected: Vec<PluginInstallation>,
     pub declarations: Vec<PluginInstallation>,
     pub imported: LogicalSnapshot,
+    pub declaration_revision: Option<String>,
+    pub current_bindings: Value,
 }
 
 impl Prepared {
@@ -142,13 +147,16 @@ impl Prepared {
                 plugins,
                 affected_instances: affected.into_iter().collect(),
                 changed_settings,
+                settings_before:backup::selected(&saved),settings_after:settings.clone(),
             },
             archive,
             old_config: source,
             new_config,
+            current_bindings:serde_json::json!(runtime.iter().filter(|b| !expected.iter().chain(&declarations).any(|i| i.instance_id == b.instance_id)).map(|b|serde_json::json!({"instance_id":b.instance_id,"manifest":b.manifest,"config":b.config,"grants":b.granted_capabilities})).collect::<Vec<_>>()),
             expected,
             declarations,
             imported,
+            declaration_revision:None,
         })
     }
 

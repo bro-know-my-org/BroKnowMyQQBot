@@ -216,7 +216,22 @@ impl Drop for Fixture {
 
 #[tokio::test]
 async fn actual_export_is_logical_private_and_excludes_host_configuration_and_execution() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
+    let mut host = StaticPluginHost::new(f.store.clone());
+    host.register_trusted(
+        Arc::new(builtin_plugins::CounterPlugin::default()),
+        "dev.test/default",
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    f.manager = PluginManager::new(host, f.store.clone(), BTreeMap::new(), BTreeSet::new())
+        .with_marketplace(
+            f.root.join("plugins.db"),
+            None,
+            "https://example.com/index.json".into(),
+        )
+        .unwrap();
     f.store
         .commit(
             "dev.test/default",
@@ -253,6 +268,37 @@ async fn actual_export_is_logical_private_and_excludes_host_configuration_and_ex
     assert_eq!(f.repo.list().unwrap().len(), 1);
     assert!(f.repo.open("../bot.toml").is_err());
     assert!(f.repo.open(&uuid::Uuid::new_v4().to_string()).is_err());
+}
+
+#[tokio::test]
+async fn unverified_orphan_state_never_creates_an_unrestorable_archive() {
+    let f = Fixture::new();
+    f.store
+        .commit(
+            "dev.unknown/default",
+            "fixture",
+            &[plugin_api::StateOp::Put {
+                key: "private".into(),
+                value: b"retained".to_vec(),
+                expected_revision: None,
+            }],
+            &[],
+            plugin_host::CommitOptions::new(4096),
+        )
+        .unwrap();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .acquire_owned()
+        .await
+        .unwrap();
+    assert!(matches!(
+        f.manager.create_backup(f.repo.clone(), permit).await,
+        Err(ManagementError::UnboundBackupState)
+    ));
+    assert!(f.repo.list().unwrap().is_empty());
+    assert_eq!(
+        f.store.logical_snapshot().unwrap().state[0].value,
+        b"retained"
+    );
 }
 
 use std::os::unix::fs::symlink;

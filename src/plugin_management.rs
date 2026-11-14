@@ -7,6 +7,7 @@ pub(crate) mod marketplace_install;
 mod operations;
 pub(crate) mod permissions;
 pub(crate) mod status;
+mod restore;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -33,6 +34,12 @@ use tokio::{
 
 #[derive(Debug, Error)]
 pub(crate) enum ManagementError {
+    #[error(
+        "存在无法验证插件身份的孤立私有数据，无法生成可验证恢复包；数据已保留，请核对已卸载实例"
+    )]
+    UnboundBackupState,
+    #[error("逻辑归档不得超过 128 MiB")]
+    RestoreTooLarge,
     #[error("逻辑备份不可用：文件、包或数据超限/不一致，请检查配置和待重启插件")]
     Backup,
     #[error("市场暂不可用，请稍后重试或检查配置的索引")]
@@ -164,6 +171,10 @@ impl PluginManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_writes_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.writes.clone().lock_owned().await
+    }
     pub(crate) fn command_prefix(&self) -> Result<String, ManagementError> {
         Ok(self.snapshot()?.host.command_prefix())
     }

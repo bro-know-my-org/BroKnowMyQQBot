@@ -15,6 +15,7 @@ mod permissions;
 mod plugin_operations;
 mod plugins;
 mod restart;
+mod restores;
 mod runtime;
 mod settings;
 mod status_stream;
@@ -111,6 +112,10 @@ pub(crate) async fn serve(
     let listener = listener::bind(&config).await?;
     let listen = listener.local_addr()?;
     restart.record_listener(listen);
+    let restores = restores::router(
+        crate::restore::State::new(manager.clone(), Some(shutdown.clone())),
+        auth.clone(),
+    );
     info!(listen = %listen, auth = ?config.auth, "management server listening");
     let (status_router, status_worker, status_stop) = status_stream::router(
         manager.clone(),
@@ -124,6 +129,7 @@ pub(crate) async fn serve(
         Some((manager, auth.clone(), live_logs, shutdown.clone())),
     );
     let app = app
+        .merge(restores)
         .merge(restart::router(restart, auth))
         .merge(status_router)
         .layer(axum::middleware::from_fn(plugins::security_headers));

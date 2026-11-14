@@ -51,6 +51,7 @@ impl PluginManager {
                     snapshot.validate().map_err(invalid)?;
                     if runtime.packages.keys().any(|id| !snapshot.installations.iter().any(|i| &i.instance_id == id)) { return Err(super::ManagementError::Backup); }
                     let bindings = runtime.host.instance_snapshots().map_err(invalid)?;
+                    if snapshot.state.iter().any(|e| !snapshot.installations.iter().any(|i|i.instance_id==e.instance_id) && !bindings.iter().any(|b|b.instance_id==e.instance_id)) {return Err(super::ManagementError::UnboundBackupState);}
                     let mut configuration = BTreeMap::from([("bot".into(), backup::selected(&saved))]);
                     configuration.insert("bindings".into(), json!(bindings.iter().filter(|b| !snapshot.installations.iter().any(|i| i.instance_id == b.instance_id)).map(|b|
                         json!({"instance_id":b.instance_id,"manifest":b.manifest,"config":b.config,"grants":b.granted_capabilities})).collect::<Vec<_>>()));
