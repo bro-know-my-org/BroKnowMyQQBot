@@ -2,7 +2,7 @@ import { shallowRef } from 'vue';
 import { isObject } from './types';
 
 export type ProcessAction = 'restart' | 'stop';
-export interface ProcessSession { boot_id: string; mode: 'token' | 'none'; authenticated: boolean }
+export interface ProcessSession { boot_id: string; mode: 'token' | 'none'; authenticated: boolean; history_scope?: string | null }
 type Phase = 'idle' | 'requesting' | 'waiting' | 'timeout' | 'disconnected' | 'external-start' | 'rejected';
 export interface ProcessState { phase: Phase; action: ProcessAction; message: string }
 interface Options {
@@ -108,12 +108,12 @@ export function createProcessControl(options: Options) {
     try {
       const result = await read(CONTROL_PATHS[action], owner, { expected_boot_id: boot });
       if (!live(owner)) return;
-      if (result.response.status !== 202) {
+      if (result.response.status >= 400 && result.response.status < 500 && result.response.status !== 408) {
         if (result.response.status === 401) { requireAuth(owner); return; }
         set('rejected', isObject(result.value) && typeof result.value.error === 'string' ? result.value.error.slice(0, 512) : '操作未被接受，请刷新状态后确认。');
         options.lock(false); return;
       }
-      accepted = isObject(result.value) && result.value.boot_id === boot && result.value.action === action;
+      accepted = result.response.status === 202 && isObject(result.value) && result.value.boot_id === boot && result.value.action === action;
     } catch { if (!live(owner)) return; }
     if (!live(owner)) return;
     const progress = action === 'restart' ? '正在重启：等待任务结束并确认新进程…' : '正在停止：等待任务结束和服务断开…';

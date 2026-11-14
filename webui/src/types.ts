@@ -16,7 +16,7 @@ export type PluginAction = 'config' | 'enabled' | 'apply' | 'uninstall' | 'recov
 export interface Mutation { action: PluginAction; config?: Config; enabled?: boolean; confirm?: boolean }
 export interface FailedDeliveryPage { entries: { attempts: number; error_class: string; updated_at_ms: number }[]; next_before: number | null }
 export interface Commands { prefix: string; revision: string; saved_prefix?: string; pending?: boolean }
-export interface Session { mode: 'token' | 'none'; authenticated: boolean; history_scope?: string | null }
+export interface Session { mode: 'token' | 'none'; authenticated: boolean; history_scope?: string | null; boot_id?: string }
 export type LogCategory = 'runtime' | 'message';
 export interface LogEntry { id: number; category: LogCategory; content?: string; timestamp: string; level: string; target: string; message: string; instance_id: string | null; fields: Record<string, string> }
 export interface LogPage { session_id: string; entries: LogEntry[]; next_cursor: number; dropped: boolean; has_more: boolean }

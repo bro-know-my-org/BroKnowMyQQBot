@@ -65,6 +65,7 @@ onBeforeUnmount(() => { notifications?.setSuspended(false); document.body.style.
     </aside>
     <div class="app-body" :inert="mobileOpen || undefined">
       <header class="topbar"><div class="breadcrumb"><button ref="menu" class="icon-button mobile-menu-toggle" type="button" aria-label="打开导航菜单" aria-controls="main-sidebar" :aria-expanded="mobileOpen" @click="openMenu"><NavIcon name="menu" /></button><span class="muted">控制台</span><span aria-hidden="true">/</span><span>{{ route.meta.title }}</span></div><div class="topbar-actions"><NotificationButton /><span v-if="authMode === 'none'" class="status-marker"><span class="status-shape is-offline" aria-hidden="true" />本地免认证</span><button v-else id="logout" class="quiet" type="button" :disabled="busy" @click="$emit('logout')">退出登录</button></div></header>
+      <slot name="process-controls" />
       <main id="page-content" ref="content" class="page-content" tabindex="-1"><slot /></main>
     </div>
   </div>

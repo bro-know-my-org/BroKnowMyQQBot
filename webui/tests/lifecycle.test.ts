@@ -110,6 +110,15 @@ it('explicit conflict releases the guard, without probing or retrying the write'
   expect(fetcher).toHaveBeenCalledOnce(); control.dismissRejection(); expect(control.state.value.phase).toBe('idle');
 });
 
+it.each([408, 500, 503])('uncertain HTTP %s reconciles with reads and cannot repeat the write', async status => {
+  const fetcher = vi.fn(async (_: string, init: RequestInit) => response(init.method === 'POST' ? {} : session(), init.method === 'POST' ? status : 200));
+  vi.stubGlobal('fetch', fetcher); void control.start('restart', OLD, false); await tick();
+  expect(control.state.value.phase).toBe('waiting'); expect(control.state.value.message).toContain('结果尚未确认');
+  await control.start('restart', OLD, false); await tick(90_001);
+  expect(control.state.value.phase).toBe('timeout');
+  expect(fetcher.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
+});
+
 it('hanging requests time out and disposal cancels all probes and timers', async () => {
   const signals: AbortSignal[] = [];
   const fetcher = vi.fn((_path: string, init: RequestInit) => { signals.push(init.signal as AbortSignal); return new Promise<Response>(() => {}); });

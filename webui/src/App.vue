@@ -12,6 +12,8 @@ import SystemSettings from './components/SystemSettings.vue';
 import PluginList from './components/PluginList.vue';
 import PluginDetail from './components/PluginDetail.vue';
 import NotificationCenter from './components/NotificationCenter.vue';
+import RestartControl from './components/RestartControl.vue';
+import type { ProcessSession } from './lifecycle';
 import { createNotifications, notificationKey } from './notifications';
 import { ApiError, createApi } from './api';
 import type { Mutation, PluginView, Session } from './types';
@@ -21,29 +23,34 @@ const authMode = ref<Session['mode']>('token'), checkingSession = ref(true), ses
 const pluginsFailed = ref(false), marketBusy = ref(false), marketReconcile = ref(false);
 const busy = ref(false), pluginDirty = ref(false), settingsDirty = ref(false), settingsBusy = ref(false), conflicts = ref(new Set<string>());
 const systemDirty = ref(false), systemBusy = ref(false);
+const bootId = ref(''), restartLocked = ref(false);
 const notifications = createNotifications(); provide(notificationKey, notifications);
 const plugin = computed(() => plugins.value.find(p => p.instance_id === route.params.instanceId));
 const conflict = computed(() => !!plugin.value && conflicts.value.has(plugin.value.instance_id));
 const detailTab = computed(() => route.name === 'plugin-config' ? 'config' : route.name === 'plugin-logs' ? 'logs' : 'overview');
-const api = createApi(() => logout('登录已失效，请重新输入管理 Token。'));
+const api = createApi(() => { if (!restartLocked.value) logout('登录已失效，请重新输入管理 Token。'); });
 let epoch = 0, refreshAfterBusy = false;
+let historyScope: string | undefined;
 function report(text: string, failed = true, progress = false) { notifications.notify('控制台', text, progress ? 'progress' : failed ? 'error' : 'success'); }
 function logout(text = '', unloading = false) {
   if (!unloading) notifications.reset();
   api.clear(); epoch++; refreshAfterBusy = false; authenticated.value = false; tokenInput.value = ''; plugins.value = []; refreshedAt.value = '';
+  bootId.value = ''; restartLocked.value = false; notifications.setSuspended(false);
+  historyScope = undefined;
   busy.value = false; checkingSession.value = false; sessionFailed.value = false; pluginsFailed.value = false; authMode.value = 'token';
   pluginDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; systemDirty.value = false; systemBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
 }
 const mayDiscard = (dirty: boolean) => !dirty || window.confirm('有未保存更改，是否放弃这些更改？');
 const removeGuard = router.beforeEach((to, from) => {
   if (!authenticated.value) return true;
+  if (restartLocked.value) return false;
   if (busy.value || settingsBusy.value || systemBusy.value || marketBusy.value) { report('操作进行中，请等待完成后再切换页面。'); return false; }
   if (to.name === from.name && to.params.instanceId === from.params.instanceId) return true;
   return mayDiscard(pluginDirty.value || settingsDirty.value || systemDirty.value);
 });
 watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; settingsDirty.value = false; systemDirty.value = false; });
 async function perform(task: () => Promise<void>, loading: string) {
-  if (busy.value) return;
+  if (busy.value || restartLocked.value) return;
   const current = epoch; busy.value = true; report(loading, false, true);
   try { await task(); } catch (e) { if (current === epoch) report((e as Error).message); }
   finally { if (current === epoch) { notifications.clearSource('控制台', true); busy.value = false; if (refreshAfterBusy) { refreshAfterBusy = false; marketplaceInstalled(); } } }
@@ -64,11 +71,23 @@ function login() {
   notifications.reset();
   void perform(async () => { const session = await api.request<Session>('/api/session/login', { token: value }); readSession(session); if (!session.authenticated) throw new Error('登录未完成，请重试。'); await refreshPlugins(); }, '正在验证并加载插件…');
 }
-function readSession(session: Session, restore = false) {
+function readSession(session: Session, restore = false, preserveHistory = false) {
   if (!session || !['token', 'none'].includes(session.mode) || typeof session.authenticated !== 'boolean') throw new Error('会话响应格式异常，请重试。');
-  notifications.authenticate(session.authenticated && typeof session.history_scope === 'string' && /^[a-f0-9]{64}$/.test(session.history_scope) ? session.history_scope : undefined, restore && session.authenticated);
+  const scope = session.authenticated && typeof session.history_scope === 'string' && /^[a-f0-9]{64}$/.test(session.history_scope) ? session.history_scope : undefined;
+  if (!preserveHistory || !scope || scope !== historyScope) notifications.authenticate(scope, restore && session.authenticated);
+  historyScope = scope;
   authMode.value = session.mode;
   authenticated.value = session.authenticated;
+  bootId.value = typeof session.boot_id === 'string' ? session.boot_id : '';
+}
+function processLock(locked: boolean) {
+  if (restartLocked.value === locked) return;
+  restartLocked.value = locked; notifications.setSuspended(locked);
+  if (locked) { api.clear(); epoch++; refreshAfterBusy = false; }
+}
+function processReady(session: ProcessSession) {
+  readSession(session, true, true); plugins.value = []; refreshedAt.value = ''; pluginsFailed.value = false;
+  void perform(async () => { await refreshPlugins(); report('已重新连接管理服务。', false); }, '正在重新读取管理状态…');
 }
 function restoreSession() {
   if (busy.value) return;
@@ -81,7 +100,7 @@ function restoreSession() {
   }, '正在恢复登录状态…');
 }
 function signOut() {
-  if (busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || !mayDiscard(pluginDirty.value || settingsDirty.value || systemDirty.value)) return;
+  if (restartLocked.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || !mayDiscard(pluginDirty.value || settingsDirty.value || systemDirty.value)) return;
   void perform(async () => { await api.request<Session>('/api/session/logout', {}); logout(); }, '正在退出登录…');
 }
 // A lost response may finish later on the server. Keep reconciling on market
@@ -90,9 +109,9 @@ function marketplaceInstalled() {
   if (busy.value) { refreshAfterBusy = true; return; }
   void perform(refreshPlugins, '正在读取安装后的插件状态…');
 }
-function refresh() { if (mayDiscard(pluginDirty.value)) void perform(refreshPlugins, '正在刷新插件状态…'); }
+function refresh() { if (!restartLocked.value && mayDiscard(pluginDirty.value)) void perform(refreshPlugins, '正在刷新插件状态…'); }
 async function mutate(change: Mutation) {
-  const p = plugin.value; if (!p?.editable || conflict.value || (pluginDirty.value && change.action !== 'config')) return;
+  const p = plugin.value; if (restartLocked.value || !p?.editable || conflict.value || (pluginDirty.value && change.action !== 'config')) return;
   const operation = change.action === 'uninstall' || change.action === 'recover';
   if (operation && change.confirm !== true) return;
   const current = epoch; let removed = false;
@@ -125,7 +144,7 @@ async function mutate(change: Mutation) {
   }, operation ? '正在完成插件运维操作…' : change.action === 'apply' ? '正在应用已保存设置…' : '正在保存设置…');
   if (removed && current === epoch && authenticated.value && route.params.instanceId === p.instance_id) await router.replace({ name: 'plugins' });
 }
-function beforeUnload(event: BeforeUnloadEvent) { if (pluginDirty.value || settingsDirty.value || systemDirty.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value) { event.preventDefault(); event.returnValue = ''; } }
+function beforeUnload(event: BeforeUnloadEvent) { if (restartLocked.value || pluginDirty.value || settingsDirty.value || systemDirty.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value) { event.preventDefault(); event.returnValue = ''; } }
 const pageHide = () => { notifications.suspendSession(); logout('', true); };
 const pageShow = (event: PageTransitionEvent) => { if (event.persisted) restoreSession(); };
 onMounted(() => { window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
@@ -142,7 +161,9 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
       <p class="hint">登录后刷新页面可恢复会话。退出登录、会话过期或服务重启后需重新登录。</p>
     </main><footer class="login-footer">BKMQB — CONTROL PANEL</footer>
   </div>
-  <AppShell v-else :busy="busy || settingsBusy || systemBusy || marketBusy" :auth-mode="authMode" @logout="signOut">
+  <AppShell v-else :inert="restartLocked || undefined" :busy="restartLocked || busy || settingsBusy || systemBusy || marketBusy" :auth-mode="authMode" @logout="signOut">
+    <template #process-controls><RestartControl :boot-id="bootId" :busy="busy || settingsBusy || systemBusy || marketBusy" :dirty="pluginDirty || settingsDirty || systemDirty" @lock="processLock" @ready="processReady" @auth-needed="logout('管理服务需要重新登录；配置或 Token 可能已更改，请重新输入管理 Token。')" /></template>
+    <template v-if="!restartLocked">
     <button v-if="pluginsFailed" id="retry-plugins" type="button" :disabled="busy" @click="refresh">重试加载插件</button>
     <section v-if="!refreshedAt && route.meta.section === 'plugins'" class="panel empty-state" aria-live="polite"><h1 tabindex="-1">{{ pluginsFailed ? '插件状态暂不可用' : '正在读取插件状态' }}</h1><p>{{ pluginsFailed ? '尚未读取到插件列表，请重试加载。' : '正在连接管理服务，请稍候。' }}</p></section>
     <OverviewPage v-else-if="route.name === 'overview'" :plugins="plugins" :refreshed-at="refreshedAt" :busy="busy" :request="api.request" @refresh="refresh" />
@@ -157,6 +178,7 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
     <template v-else-if="route.name === 'settings'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">系统 / SETTINGS</span><h1 tabindex="-1">设置</h1><p class="muted">管理 Bot 的全局行为。</p></div></div><CommandSettings :request="api.request" :locked="systemBusy" @dirty="settingsDirty = $event" @busy="settingsBusy = $event" /><SystemSettings :request="api.request" :locked="settingsBusy" @dirty="systemDirty = $event" @busy="systemBusy = $event" /></template>
     <MarketplacePage v-else-if="route.name === 'marketplace'" :request="api.request" :reconcile="marketReconcile" @busy="marketBusy = $event" @uncertain="marketReconcile = true" @installed="marketplaceInstalled" />
     <UnavailablePage v-else :kind="String(route.name)" />
+    </template>
   </AppShell>
-  <NotificationCenter v-if="authenticated" :center="notifications" />
+  <NotificationCenter v-if="authenticated && !restartLocked" :center="notifications" />
 </template>

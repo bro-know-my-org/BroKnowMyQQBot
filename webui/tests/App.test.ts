@@ -15,6 +15,8 @@ const fixture = (overrides: Partial<PluginView> = {}): PluginView => ({
 let app: ReturnType<typeof createApp>, plugins: PluginView[], commands: Commands, fail: { path: string; method: string; status: number } | null;
 let router: ReturnType<typeof createManagementRouter>;
 let sessionAuthenticated: boolean, sessionMode: 'token' | 'none', unsafePluginResponse: boolean;
+const OLD_BOOT = '11111111-1111-4111-8111-111111111111', NEW_BOOT = '22222222-2222-4222-8222-222222222222';
+let currentBoot: string;
 const requests: Array<{ path: string; method: string; body: Record<string, unknown> | undefined; init: RequestInit }> = [];
 const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
   const path = String(input), method = init.method ?? 'GET', body = init.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
@@ -23,10 +25,10 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
   if (path.startsWith('/api/session')) {
     if (path.endsWith('/login')) sessionAuthenticated = true;
     if (path.endsWith('/logout')) sessionAuthenticated = false;
-    return new Response(JSON.stringify({ mode: sessionMode, authenticated: sessionMode === 'none' || sessionAuthenticated, history_scope: 'a'.repeat(64) }));
+    return new Response(JSON.stringify({ boot_id: currentBoot, mode: sessionMode, authenticated: sessionMode === 'none' || sessionAuthenticated, history_scope: 'a'.repeat(64) }));
   }
   if (!sessionAuthenticated && sessionMode !== 'none') return new Response('{}', { status: 401 });
-  if (path === '/api/runtime') return new Response(JSON.stringify(runtimeFixture()));
+  if (path === '/api/runtime') return new Response(JSON.stringify({ ...runtimeFixture(), boot_id: currentBoot }));
   if (path === '/api/plugins' && unsafePluginResponse) { unsafePluginResponse = false; return new Response(JSON.stringify({ plugins }).replace('"count":1', '"count":9007199254740993')); }
   if (path === '/api/settings/commands') {
     if (body) { expect(body.expected_revision).toBe(commands.revision); commands = { prefix: String(body.prefix), revision: String(Number(commands.revision) + 1) }; }
@@ -72,6 +74,7 @@ async function login(target: RouteLocationRaw = pluginRoute(plugins[0]?.instance
 beforeEach(() => {
   plugins = [fixture()]; commands = { prefix: '/', revision: '1' }; fail = null; requests.length = 0;
   sessionAuthenticated = false; sessionMode = 'token'; unsafePluginResponse = false;
+  currentBoot = OLD_BOOT;
   vi.stubGlobal('fetch', fetcher); vi.spyOn(window, 'confirm').mockReturnValue(true);
   vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('credentials must stay in memory'); });
 });
@@ -520,4 +523,108 @@ it('none模式刷新同样保留本标签通知历史', async () => {
   app.unmount(); document.body.replaceChildren(); await mount();
   await click('[aria-controls="notification-history"]'); expect(get('#notification-history').textContent).toContain('已保存；点击');
   sessionStorage.clear();
+});
+
+
+describe('Bot 进程控制', () => {
+  const processPosts = () => requests.filter(r => r.path === '/api/restart' || r.path === '/api/stop');
+  it.each(['restart', 'stop'])('取消 %s 确认不写入；编辑草稿保护两个操作', async action => {
+    await login(); vi.mocked(window.confirm).mockReturnValue(false);
+    await click(`#${action}-bot`); expect(processPosts()).toHaveLength(0);
+    expect(window.confirm).toHaveBeenLastCalledWith(expect.stringContaining(action === 'restart' ? '确认重启' : '确认停止'));
+    await input('#field-0', '9'); expect(disabled('#restart-bot')).toBe(true); expect(disabled('#stop-bot')).toBe(true);
+    vi.mocked(window.confirm).mockReturnValue(true); await click(`#${action}-bot`);
+    expect(processPosts()).toHaveLength(0); expect(value('#field-0')).toBe('9');
+  });
+  it('管理写入期间不允许重启或停止', async () => {
+    await login(); await input('#field-0', '8');
+    let complete!: (value: Response) => void;
+    fetcher.mockImplementationOnce(() => new Promise<Response>(resolve => { complete = resolve; }));
+    get<HTMLButtonElement>('#save').click(); await nextTick();
+    expect(disabled('#restart-bot')).toBe(true); expect(disabled('#stop-bot')).toBe(true);
+    await click('#restart-bot'); await click('#stop-bot'); expect(window.confirm).not.toHaveBeenCalled();
+    complete(new Response(JSON.stringify({ plugin: plugins[0] }))); await flush();
+  });
+  it('重启暂停普通请求与导航，只有新启动标识就绪后恢复页面并保留内存通知', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      await login(); await input('#field-0', '2'); await click('#save');
+      await go({ name: 'overview' });
+      let finishRuntime!: (value: Response) => void, oldSignal!: AbortSignal;
+      fetcher.mockImplementationOnce((_input, init = {}) => new Promise<Response>(resolve => { finishRuntime = resolve; oldSignal = init.signal as AbortSignal; }));
+      await vi.advanceTimersByTimeAsync(5000); await flush();
+      vi.stubGlobal('fetch', async (input: RequestInfo | URL, init: RequestInit = {}) => {
+        if (String(input) === '/api/restart') {
+          requests.push({ path: '/api/restart', method: 'POST', body: JSON.parse(String(init.body)), init });
+          return new Response(JSON.stringify({ boot_id: OLD_BOOT, action: 'restart' }), { status: 202 });
+        }
+        return fetcher(input, init);
+      });
+      await click('#restart-bot'); expect(oldSignal.aborted).toBe(true);
+      expect(get('.app-shell').hasAttribute('inert')).toBe(true); expect(document.querySelector('.runtime-panel')).toBeNull();
+      expect(get('[role="dialog"]').textContent).toContain('正在重启');
+      expect(document.activeElement).toBe(get('[role="dialog"]'));
+      get('[role="dialog"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await go({ name: 'plugins' }); expect(router.currentRoute.value.name).toBe('overview');
+      const unload = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(unload); expect(unload.defaultPrevented).toBe(true);
+      finishRuntime(new Response('{}', { status: 401 })); await flush(); expect(document.querySelector('#token')).toBeNull();
+      currentBoot = NEW_BOOT; await vi.advanceTimersByTimeAsync(250); await flush(); await flush();
+      expect(document.querySelector('.process-overlay')).toBeNull(); expect(get('.app-shell').hasAttribute('inert')).toBe(false);
+      expect(text()).toContain('运行降级'); expect(processPosts()).toHaveLength(1);
+      expect(processPosts()[0]!.body).toEqual({ expected_boot_id: OLD_BOOT });
+      await click('[aria-controls="notification-history"]');
+      expect(get('#notification-history').textContent).toContain('已保存；点击');
+      expect(get('#notification-history').textContent).toContain('已重新连接管理服务');
+      expect(requests.filter(r => r.body?.token)).toHaveLength(1);
+    } finally { app?.unmount(); vi.useRealTimers(); }
+  });
+  it('停止后断连保留准确说明、停止自动探测，重新连接只发 GET', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      await login(); let offline = true;
+      const calls: string[] = [];
+      vi.stubGlobal('fetch', async (input: RequestInfo | URL, init: RequestInit = {}) => {
+        const path = String(input); calls.push(`${init.method ?? 'GET'} ${path}`);
+        if (path === '/api/stop') return new Response(JSON.stringify({ boot_id: OLD_BOOT, action: 'stop' }), { status: 202 });
+        if (offline) throw new TypeError('offline');
+        return fetcher(input, init);
+      });
+      await click('#stop-bot');
+      expect(window.confirm).toHaveBeenLastCalledWith(expect.stringContaining('终端或服务管理器'));
+      expect(get('[role="dialog"]').textContent).toContain('停止请求已接受，服务已断开');
+      expect(text()).toContain('无法仅凭断连确认正常退出'); expect(text()).toContain('自动重启策略');
+      expect(get('#reconnect-bot').textContent).toBe('重新连接');
+      const count = calls.length; await vi.advanceTimersByTimeAsync(180_000); expect(calls).toHaveLength(count);
+      offline = false; currentBoot = NEW_BOOT; await click('#reconnect-bot'); await flush();
+      expect(document.querySelector('.process-overlay')).toBeNull();
+      expect(calls.filter(call => call.startsWith('POST'))).toEqual(['POST /api/stop']);
+    } finally { app?.unmount(); vi.useRealTimers(); }
+  });
+  it('Token 更改时诚实返回登录页，不重提旧 Token 或操作；新登录可用新控制器', async () => {
+    await login();
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      if (String(input) === '/api/restart') {
+        sessionAuthenticated = false; currentBoot = NEW_BOOT;
+        return new Response(JSON.stringify({ boot_id: OLD_BOOT, action: 'restart' }), { status: 202 });
+      }
+      return fetcher(input, init);
+    });
+    await click('#restart-bot'); expect(document.querySelector('#login-form')).not.toBeNull();
+    expect(text()).toContain('Token 可能已更改'); expect(document.querySelector('.process-overlay')).toBeNull();
+    expect(requests.filter(r => r.body?.token)).toHaveLength(1);
+    await input('#token', 'rotated-token'); await submit('#login-form');
+    expect(disabled('#restart-bot')).toBe(false); expect(disabled('#stop-bot')).toBe(false);
+    expect(requests.filter(r => r.body?.token).at(-1)!.body).toEqual({ token: 'rotated-token' });
+  });
+  it('明确拒绝保留可访问确认结果，返回后恢复控制台；卸载会取消探测', async () => {
+    await login();
+    vi.stubGlobal('fetch', async () => new Response(JSON.stringify({ error: '另一个关闭操作已被接受' }), { status: 409 }));
+    await click('#restart-bot'); expect(text()).toContain('操作未接受'); expect(get('.app-shell').hasAttribute('inert')).toBe(true);
+    get('[role="dialog"]').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await flush();
+    expect(document.querySelector('.process-overlay')).toBeNull(); expect(disabled('#restart-bot')).toBe(false);
+    let signal!: AbortSignal;
+    const pending = vi.fn((_input: RequestInfo | URL, init: RequestInit = {}) => { signal = init.signal as AbortSignal; return new Promise<Response>(() => {}); });
+    vi.stubGlobal('fetch', pending); await click('#stop-bot'); app.unmount(); await flush();
+    expect(signal.aborted).toBe(true); expect(pending).toHaveBeenCalledOnce();
+  });
 });
