@@ -125,7 +125,7 @@ impl AuthState {
         });
         Json(
             json!({"mode": if self.expected.is_some() { "token" } else { "none" },
-            "authenticated": authenticated, "history_scope": history_scope}),
+            "authenticated": authenticated, "history_scope": history_scope, "boot_id": crate::restart::boot_id()}),
         )
     }
 }

@@ -46,17 +46,29 @@ struct AdapterSet {
     qq_api: Option<OpenApiClient>,
 }
 
-pub(crate) async fn run(management_auth: Option<ManagementAuth>) -> ExitCode {
-    match start(management_auth).await {
-        Ok(()) => ExitCode::SUCCESS,
+pub(crate) enum Outcome {
+    Exit(ExitCode),
+    Restart,
+}
+
+pub(crate) async fn run(
+    management_auth: Option<ManagementAuth>,
+    restart: crate::restart::Controller,
+) -> Outcome {
+    match start(management_auth, restart).await {
+        Ok(true) => Outcome::Restart,
+        Ok(false) => Outcome::Exit(ExitCode::SUCCESS),
         Err(error) => {
             eprintln!("BroKnowMyQQBot failed: {error}");
-            ExitCode::FAILURE
+            Outcome::Exit(ExitCode::FAILURE)
         }
     }
 }
 
-async fn start(management_auth: Option<ManagementAuth>) -> Result<(), Box<dyn std::error::Error>> {
+async fn start(
+    management_auth: Option<ManagementAuth>,
+    restart: crate::restart::Controller,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let mut config = BotConfig::load()?;
     let secrets_file = load_secret_environment()?;
     let qq_credentials = resolve_credentials(&mut config, secrets_file.as_deref())?;
@@ -100,7 +112,7 @@ async fn start(management_auth: Option<ManagementAuth>) -> Result<(), Box<dyn st
             }
         };
     if config.qq.enabled && config.qq.check_only {
-        return preflight(&plugins, qq_api.as_ref()).await;
+        return preflight(&plugins, qq_api.as_ref()).await.map(|()| false);
     }
 
     let manager = PluginManager::new(
@@ -137,6 +149,8 @@ async fn start(management_auth: Option<ManagementAuth>) -> Result<(), Box<dyn st
         onebot11_enabled = config.onebot11.enabled,
         "starting BroKnowMyQQBot adapters"
     );
+    let signal = wait_for_shutdown_signal();
+    tokio::pin!(signal);
     let runtime_result = supervise_runtime(
         runtime,
         config.management,
@@ -144,17 +158,37 @@ async fn start(management_auth: Option<ManagementAuth>) -> Result<(), Box<dyn st
         manager,
         live_logs,
         shutdown_timeout,
+        (restart, signal.as_mut()),
     )
     .await;
-    if let Err(error) = plugins.shutdown().await {
+    finish_plugins(&plugins, runtime_result, signal.as_mut()).await
+}
+
+async fn finish_plugins(
+    plugins: &PluginManager,
+    runtime_result: Result<bool, Box<dyn std::error::Error>>,
+    mut signal: std::pin::Pin<&mut impl std::future::Future<Output = std::io::Result<()>>>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut restarting = *runtime_result.as_ref().unwrap_or(&false);
+    let shutdown = plugins.shutdown();
+    tokio::pin!(shutdown);
+    let (shutdown_result, signal_result) = if restarting {
+        let (result, decision) = crate::restart::drain(signal.as_mut(), shutdown).await;
+        restarting = *decision.as_ref().unwrap_or(&false);
+        (result, decision.map(|_| ()))
+    } else {
+        (shutdown.await, Ok(()))
+    };
+    if let Err(error) = shutdown_result {
         if runtime_result.is_ok() {
             return Err(error.into());
         }
         warn!(%error, "plugin shutdown failed after runtime failure");
     }
     runtime_result?;
+    signal_result?;
     info!("BroKnowMyQQBot stopped");
-    Ok(())
+    Ok(restarting)
 }
 
 fn resolve_credentials(
@@ -234,7 +268,12 @@ async fn supervise_runtime(
     manager: PluginManager,
     live_logs: logging::live::LogBuffer,
     shutdown_timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
+    control: (
+        crate::restart::Controller,
+        std::pin::Pin<&mut impl std::future::Future<Output = std::io::Result<()>>>,
+    ),
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let (restart, mut signal) = control;
     let (shutdown_handle, shutdown_signal) = shutdown_channel();
     let runtime_run = runtime.run(shutdown_signal.clone());
     let management_run = management::serve(
@@ -244,25 +283,33 @@ async fn supervise_runtime(
         live_logs,
         shutdown_signal,
         shutdown_timeout,
+        restart.clone(),
     );
     tokio::pin!(runtime_run);
     tokio::pin!(management_run);
+    let mut restarting = false;
     let (runtime_result, management_result, signal_result) = tokio::select! {
+        biased;
+        result = &mut signal => {
+            shutdown_handle.shutdown();
+            let (runtime_result, management_result) = tokio::join!(&mut runtime_run, &mut management_run);
+            (runtime_result, management_result, result)
+        },
         result = &mut runtime_run => {
             shutdown_handle.shutdown();
-            let management_result = management_run.await;
-            (result, management_result, Ok(()))
+            (result, management_run.await, Ok(()))
         },
         result = &mut management_run => {
             shutdown_handle.shutdown();
-            let runtime_result = runtime_run.await;
-            (runtime_result, result, Ok(()))
+            (runtime_run.await, result, Ok(()))
         },
-        signal = wait_for_shutdown_signal() => {
+        () = restart.cancelled() => {
             shutdown_handle.shutdown();
-            let (runtime_result, management_result) =
-                tokio::join!(&mut runtime_run, &mut management_run);
-            (runtime_result, management_result, signal)
+            let ((runtime_result, management_result), decision) = crate::restart::drain(
+                signal.as_mut(), async { tokio::join!(&mut runtime_run, &mut management_run) },
+            ).await;
+            restarting = *decision.as_ref().unwrap_or(&false);
+            (runtime_result, management_result, decision.map(|_| ()))
         }
     };
     if runtime_result.is_ok() && management_result.is_ok() {
@@ -279,7 +326,7 @@ async fn supervise_runtime(
         }
     }
     runtime_result?;
-    Ok(())
+    Ok(restarting)
 }
 
 async fn build_adapters(

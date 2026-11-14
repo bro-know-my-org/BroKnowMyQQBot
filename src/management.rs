@@ -10,6 +10,7 @@ mod marketplace;
 mod message_flow_tests;
 mod plugin_operations;
 mod plugins;
+mod restart;
 mod runtime;
 mod settings;
 mod system_settings;
@@ -91,6 +92,7 @@ pub(crate) async fn serve(
     live_logs: crate::logging::live::LogBuffer,
     mut shutdown: ShutdownSignal,
     shutdown_timeout: Duration,
+    restart: crate::restart::Controller,
 ) -> Result<(), ManagementError> {
     if !config.enabled {
         shutdown.cancelled().await;
@@ -100,8 +102,13 @@ pub(crate) async fn serve(
     let listener = listener::bind(&config).await?;
     let listen = listener.local_addr()?;
     info!(listen = %listen, auth = ?config.auth, "management server listening");
-    let (app, validation_jobs) =
-        router_parts(observer, Some((manager, auth, live_logs, shutdown.clone())));
+    let (app, validation_jobs) = router_parts(
+        observer,
+        Some((manager, auth.clone(), live_logs, shutdown.clone())),
+    );
+    let app = app
+        .merge(restart::router(restart, auth))
+        .layer(axum::middleware::from_fn(plugins::security_headers));
     let mut validation_supervisor = tokio::spawn(run_validation_workers(validation_jobs));
     let (serve_result, shutdown_deadline) = {
         let mut graceful_shutdown = shutdown.clone();

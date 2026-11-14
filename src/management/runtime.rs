@@ -10,6 +10,7 @@ use super::plugins::ApiState;
 
 #[derive(Serialize)]
 pub(super) struct RuntimeStatus {
+    boot_id: &'static str,
     health: RuntimeHealth,
     snapshot: Snapshot,
 }
@@ -62,6 +63,7 @@ impl RuntimeStatus {
             RuntimePhase::Stopped | RuntimePhase::Failed => HealthStatus::Unhealthy,
         };
         Self {
+            boot_id: crate::restart::boot_id(),
             health: RuntimeHealth {
                 status,
                 phase: metrics.phase,
