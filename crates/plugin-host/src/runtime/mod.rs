@@ -4,6 +4,7 @@ mod command;
 mod management;
 #[cfg(test)]
 mod management_tests;
+mod observation;
 #[cfg(test)]
 mod upgrade_tests;
 mod validation;
@@ -44,7 +45,7 @@ use tokio::{
     task::AbortHandle,
     time::{sleep, timeout},
 };
-use tracing::{error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -849,7 +850,7 @@ impl StaticPluginHost {
                 Err(error) => error!(
                     plugin_id = %plugin.manifest.id,
                     instance_id = plugin.instance_id,
-                    error = %error,
+                    error_class = observation::host_error_class(&error),
                     "isolated plugin host delivery failure"
                 ),
             }
@@ -910,7 +911,7 @@ impl StaticPluginHost {
             error!(
                 plugin_id = %plugin.manifest.id,
                 instance_id = plugin.instance_id,
-                error = %error,
+                error_class = observation::host_error_class(&error),
                 "action-completion delivery will be recovered later"
             );
         }
@@ -937,6 +938,7 @@ impl StaticPluginHost {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)] // Keep the delivery transaction and retry decisions together.
     async fn deliver_single_with_retry(
         &self,
         plugin: &Arc<RegisteredPlugin>,
@@ -976,23 +978,46 @@ impl StaticPluginHost {
             else {
                 return Ok((false, VecDeque::new()));
             };
+            let span = observation::invocation_span(plugin, &envelope);
+            let started = std::time::Instant::now();
             let result = async {
-                let output = self
-                    .invoke_envelope(plugin, &envelope, caller_authority)
-                    .await?;
-                let stop = output.disposition == Disposition::Stop;
-                let completions = self
-                    .commit_and_execute(
-                        plugin,
-                        origin,
-                        &envelope.event_id,
-                        &envelope.delivery_id,
-                        &envelope.invocation_id,
-                        output,
-                    )
-                    .await?;
-                Ok::<_, PluginHostError>((stop, completions))
+                let result = async {
+                    let (output, declared_command) = self
+                        .invoke_envelope(plugin, &envelope, caller_authority)
+                        .await?;
+                    let observation =
+                        observation::OutputObservation::new(&output, declared_command);
+                    let stop = output.disposition == Disposition::Stop;
+                    let completions = self
+                        .commit_and_execute(
+                            plugin,
+                            origin,
+                            &envelope.event_id,
+                            &envelope.delivery_id,
+                            &envelope.invocation_id,
+                            output,
+                        )
+                        .await?;
+                    observation.completed(started.elapsed());
+                    Ok::<_, PluginHostError>((stop, completions))
+                }
+                .await;
+                if let Err(error) = &result {
+                    warn!(
+                        record_kind = "plugin.failed",
+                        plugin_id = %plugin.manifest.id,
+                        instance_id = plugin.instance_id,
+                        event_id = envelope.event_id,
+                        invocation_id = envelope.invocation_id,
+                        status = "failed",
+                        error_class = observation::host_error_class(error),
+                        elapsed_ms = observation::elapsed_ms(started.elapsed()),
+                        "plugin invocation failed"
+                    );
+                }
+                result
             }
+            .instrument(span)
             .await;
             match result {
                 Ok((stop, completions)) => {
@@ -1115,14 +1140,14 @@ impl StaticPluginHost {
         }
         let dead_letter = failure.dead_letter;
         let circuit_open = failure.circuit_open;
-        error!(
+        debug!(
             plugin_id = %plugin.manifest.id,
             instance_id = plugin.instance_id,
             event_id = envelope.event_id,
             attempt,
             dead_letter,
             circuit_open,
-            error = %error,
+            error_class = observation::host_error_class(error),
             "isolated plugin delivery failure"
         );
         if fatal_trap || circuit_open {
@@ -1279,7 +1304,7 @@ impl StaticPluginHost {
         plugin: &RegisteredPlugin,
         envelope: &PluginEventEnvelope,
         caller_authority: &CallerAuthority,
-    ) -> Result<HandlerOutput, PluginHostError> {
+    ) -> Result<(HandlerOutput, bool), PluginHostError> {
         let state = self.store.snapshot(&plugin.instance_id)?;
         let config = plugin.config_snapshot()?;
         let command_prefix = self.command_prefix();
@@ -1292,6 +1317,16 @@ impl StaticPluginHost {
             })
             .flatten()
             .and_then(|text| plugin_api::CommandContext::parse(&command_prefix, text));
+        let declared_command = command_context.as_ref().is_some_and(|context| {
+            plugin.manifest.commands.iter().any(|declaration| {
+                declaration.name == context.name || declaration.aliases.contains(&context.name)
+            })
+        });
+        if declared_command {
+            if let Some(context) = &command_context {
+                tracing::Span::current().record("command_name", context.name.as_str());
+            }
+        }
         let queries = InvocationQueries {
             command_declarations: self.command_declarations()?,
             command_prefix,
@@ -1304,6 +1339,11 @@ impl StaticPluginHost {
         };
         let invocation =
             AssertUnwindSafe(plugin.plugin.on_event(envelope, &queries)).catch_unwind();
+        debug!(
+            record_kind = "plugin.invoked",
+            status = "invoked",
+            "plugin invoked"
+        );
         let output = timeout(plugin.manifest.timeout(), invocation)
             .await
             .map_err(|_| PluginHostError::Timeout {
@@ -1333,7 +1373,7 @@ impl StaticPluginHost {
                 },
             })?;
         validate_output(plugin, &output)?;
-        Ok(output)
+        Ok((output, declared_command))
     }
 
     async fn commit_and_execute(
@@ -1345,16 +1385,6 @@ impl StaticPluginHost {
         invocation_id: &str,
         output: HandlerOutput,
     ) -> Result<VecDeque<ActionCompleted>, PluginHostError> {
-        for diagnostic in &output.diagnostics {
-            warn!(
-                plugin_id = %plugin.manifest.id,
-                instance_id = %plugin.instance_id,
-                code = diagnostic.code,
-                level = diagnostic.level,
-                message = diagnostic.message,
-                "plugin diagnostic"
-            );
-        }
         let outbox_origin = origin.outbox_origin(source_event_id);
         let commands = self.store.commit(
             &plugin.instance_id,
@@ -1383,6 +1413,21 @@ impl StaticPluginHost {
         invocation_id: &str,
         command: PluginCommand,
     ) -> Result<ActionCompleted, PluginHostError> {
+        let span = observation::action_span(plugin, source_event_id, invocation_id, &command);
+        self.execute_command_observed(plugin, origin, source_event_id, invocation_id, command)
+            .instrument(span)
+            .await
+    }
+
+    async fn execute_command_observed(
+        &self,
+        plugin: &Arc<RegisteredPlugin>,
+        origin: ExecutionOrigin<'_>,
+        source_event_id: &str,
+        invocation_id: &str,
+        command: PluginCommand,
+    ) -> Result<ActionCompleted, PluginHostError> {
+        let started = std::time::Instant::now();
         let execution = async {
             match command.kind.as_str() {
                 "schedule.create" | "schedule.cancel" => {
@@ -1391,6 +1436,7 @@ impl StaticPluginHost {
                 _ => {
                     execute_context_command(
                         origin,
+                        source_event_id,
                         &command,
                         self.http_executor.as_ref(),
                         self.browser_executor.as_ref(),
@@ -1435,15 +1481,7 @@ impl StaticPluginHost {
                 error_code: None,
                 error_message: None,
             },
-            Some(Err(error)) => {
-                error!(
-                    plugin_id = %plugin.manifest.id,
-                    command_id = command.command_id,
-                    error = %error,
-                    "plugin command failed"
-                );
-                failed_completion(source_event_id, invocation_id, &command, &error)
-            }
+            Some(Err(error)) => failed_completion(source_event_id, invocation_id, &command, &error),
         };
         let persisted =
             serde_json::to_value(&completion).map_err(|error| PluginHostError::Invocation {
@@ -1457,6 +1495,7 @@ impl StaticPluginHost {
             action_status_name(completion.status),
             &persisted,
         )?;
+        observation::action_completed(plugin, &completion, started.elapsed());
         Ok(completion)
     }
 
@@ -2871,7 +2910,7 @@ mod tests {
                 .unwrap(),
                 extensions: Vec::new(),
             };
-            let output = host
+            let (output, _) = host
                 .invoke_envelope(&host.plugins[0], &envelope, &CallerAuthority::default())
                 .await
                 .unwrap();
@@ -2911,7 +2950,7 @@ mod tests {
         };
         for enabled in [true, false, true] {
             host.set_instance_enabled("ping", enabled).await.unwrap();
-            let output = host
+            let (output, _) = host
                 .invoke_envelope(&host.plugins[0], &envelope, &CallerAuthority::default())
                 .await
                 .unwrap();

@@ -7,13 +7,14 @@ use super::{
     MediaSend, PluginCommand, PluginError, PluginManifest, SendMessageAction, TrustedPlatformQuery,
     Value,
 };
-use bot_core::{MediaAttachment, ReplyMediaAction, SendMediaAction};
+use bot_core::{MediaAttachment, ReplyMediaAction, SendMediaAction, execute_traced_action};
 use plugin_api::{PluginMessageTarget, url_path_matches_prefix};
 use reqwest::header::{HeaderName, HeaderValue};
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) async fn execute_context_command(
     origin: ExecutionOrigin<'_>,
+    source_event_id: &str,
     command: &PluginCommand,
     http_executor: &dyn HttpExecutor,
     browser_executor: &dyn BrowserExecutor,
@@ -68,8 +69,7 @@ pub(super) async fn execute_context_command(
                         query.platform()
                     )));
                 }
-                adapter
-                    .execute(action)
+                execute_traced_action(adapter.as_ref(), source_event_id, action)
                     .await
                     .map_err(|error| adapter_command_error(&error))?
             }
@@ -93,7 +93,7 @@ pub(super) async fn execute_context_command(
                 })?;
             let result = match origin {
                 ExecutionOrigin::Event(context) => context
-                    .reply(message_text)
+                    .reply_with_event_id(source_event_id, message_text)
                     .await
                     .map_err(|error| context_command_error(&error))?,
                 ExecutionOrigin::Recovered(origin) => {
@@ -107,21 +107,23 @@ pub(super) async fn execute_context_command(
                             "recovered event does not provide a source message ID".to_owned(),
                         )
                     })?;
-                    adapters
-                        .get(&origin.adapter_id)
-                        .ok_or_else(|| {
-                            PluginError::Permanent(format!(
-                                "recovered event adapter `{}` is unavailable",
-                                origin.adapter_id
-                            ))
-                        })?
-                        .execute(Action::Reply(bot_core::ReplyAction {
+                    let adapter = adapters.get(&origin.adapter_id).ok_or_else(|| {
+                        PluginError::Permanent(format!(
+                            "recovered event adapter `{}` is unavailable",
+                            origin.adapter_id
+                        ))
+                    })?;
+                    execute_traced_action(
+                        adapter.as_ref(),
+                        source_event_id,
+                        Action::Reply(bot_core::ReplyAction {
                             target,
                             source_message_id,
                             content: message_text.to_owned(),
-                        }))
-                        .await
-                        .map_err(|error| adapter_command_error(&error))?
+                        }),
+                    )
+                    .await
+                    .map_err(|error| adapter_command_error(&error))?
                 }
                 ExecutionOrigin::Scheduled { .. } => {
                     return Err(PluginError::Permanent(
@@ -137,30 +139,38 @@ pub(super) async fn execute_context_command(
                 .map_err(|error| PluginError::Permanent(error.to_string()))?;
             let result = match origin {
                 ExecutionOrigin::Event(context) => context
-                    .execute(Action::SendMessage(action))
+                    .execute_with_event_id(source_event_id, Action::SendMessage(action))
                     .await
                     .map_err(|error| context_command_error(&error))?,
-                ExecutionOrigin::Scheduled { adapter_id } => adapters
-                    .get(adapter_id)
-                    .ok_or_else(|| {
-                        PluginError::Permanent(format!(
-                            "scheduled event adapter `{adapter_id}` is unavailable"
-                        ))
-                    })?
-                    .execute(Action::SendMessage(action))
-                    .await
-                    .map_err(|error| adapter_command_error(&error))?,
-                ExecutionOrigin::Recovered(origin) => adapters
-                    .get(&origin.adapter_id)
-                    .ok_or_else(|| {
-                        PluginError::Permanent(format!(
-                            "recovered event adapter `{}` is unavailable",
-                            origin.adapter_id
-                        ))
-                    })?
-                    .execute(Action::SendMessage(action))
-                    .await
-                    .map_err(|error| adapter_command_error(&error))?,
+                ExecutionOrigin::Scheduled { adapter_id } => execute_traced_action(
+                    adapters
+                        .get(adapter_id)
+                        .ok_or_else(|| {
+                            PluginError::Permanent(format!(
+                                "scheduled event adapter `{adapter_id}` is unavailable"
+                            ))
+                        })?
+                        .as_ref(),
+                    source_event_id,
+                    Action::SendMessage(action),
+                )
+                .await
+                .map_err(|error| adapter_command_error(&error))?,
+                ExecutionOrigin::Recovered(origin) => execute_traced_action(
+                    adapters
+                        .get(&origin.adapter_id)
+                        .ok_or_else(|| {
+                            PluginError::Permanent(format!(
+                                "recovered event adapter `{}` is unavailable",
+                                origin.adapter_id
+                            ))
+                        })?
+                        .as_ref(),
+                    source_event_id,
+                    Action::SendMessage(action),
+                )
+                .await
+                .map_err(|error| adapter_command_error(&error))?,
             };
             serde_json::to_value(result).map_err(|error| PluginError::Permanent(error.to_string()))
         }
@@ -196,28 +206,31 @@ pub(super) async fn execute_context_command(
                 .map_err(|error| PluginError::Permanent(error.to_string()))?;
             let result = match origin {
                 ExecutionOrigin::Event(context) => context
-                    .execute(Action::ReplyMedia(ReplyMediaAction {
-                        target: context.reply_target().cloned().ok_or_else(|| {
-                            PluginError::Permanent(
-                                "event does not provide a reply target".to_owned(),
-                            )
-                        })?,
-                        source_message_id: context
-                            .source_message_id()
-                            .map(str::to_owned)
-                            .ok_or_else(|| {
+                    .execute_with_event_id(
+                        source_event_id,
+                        Action::ReplyMedia(ReplyMediaAction {
+                            target: context.reply_target().cloned().ok_or_else(|| {
                                 PluginError::Permanent(
-                                    "event does not provide a source message ID".to_owned(),
+                                    "event does not provide a reply target".to_owned(),
                                 )
                             })?,
-                        attachment: MediaAttachment::image(
-                            asset.mime_type,
-                            None,
-                            asset.data.to_vec(),
-                        )
-                        .map_err(|error| PluginError::Permanent(error.to_owned()))?,
-                        caption: request.caption,
-                    }))
+                            source_message_id: context
+                                .source_message_id()
+                                .map(str::to_owned)
+                                .ok_or_else(|| {
+                                    PluginError::Permanent(
+                                        "event does not provide a source message ID".to_owned(),
+                                    )
+                                })?,
+                            attachment: MediaAttachment::image(
+                                asset.mime_type,
+                                None,
+                                asset.data.to_vec(),
+                            )
+                            .map_err(|error| PluginError::Permanent(error.to_owned()))?,
+                            caption: request.caption,
+                        }),
+                    )
                     .await
                     .map_err(|error| context_command_error(&error))?,
                 ExecutionOrigin::Recovered(origin) => {
@@ -231,15 +244,16 @@ pub(super) async fn execute_context_command(
                             "recovered event does not provide a source message ID".to_owned(),
                         )
                     })?;
-                    adapters
-                        .get(&origin.adapter_id)
-                        .ok_or_else(|| {
-                            PluginError::Permanent(format!(
-                                "recovered event adapter `{}` is unavailable",
-                                origin.adapter_id
-                            ))
-                        })?
-                        .execute(Action::ReplyMedia(ReplyMediaAction {
+                    let adapter = adapters.get(&origin.adapter_id).ok_or_else(|| {
+                        PluginError::Permanent(format!(
+                            "recovered event adapter `{}` is unavailable",
+                            origin.adapter_id
+                        ))
+                    })?;
+                    execute_traced_action(
+                        adapter.as_ref(),
+                        source_event_id,
+                        Action::ReplyMedia(ReplyMediaAction {
                             target,
                             source_message_id,
                             attachment: MediaAttachment::image(
@@ -249,9 +263,10 @@ pub(super) async fn execute_context_command(
                             )
                             .map_err(|error| PluginError::Permanent(error.to_owned()))?,
                             caption: request.caption,
-                        }))
-                        .await
-                        .map_err(|error| adapter_command_error(&error))?
+                        }),
+                    )
+                    .await
+                    .map_err(|error| adapter_command_error(&error))?
                 }
                 ExecutionOrigin::Scheduled { .. } => {
                     return Err(PluginError::Permanent(
@@ -278,19 +293,21 @@ pub(super) async fn execute_context_command(
                 ExecutionOrigin::Recovered(origin) => origin.adapter_id.clone(),
                 ExecutionOrigin::Scheduled { adapter_id } => adapter_id.to_owned(),
             };
-            let result = adapters
-                .get(&adapter_id)
-                .ok_or_else(|| {
-                    PluginError::Permanent(format!("adapter `{adapter_id}` is unavailable"))
-                })?
-                .execute(Action::SendMedia(SendMediaAction {
+            let adapter = adapters.get(&adapter_id).ok_or_else(|| {
+                PluginError::Permanent(format!("adapter `{adapter_id}` is unavailable"))
+            })?;
+            let result = execute_traced_action(
+                adapter.as_ref(),
+                source_event_id,
+                Action::SendMedia(SendMediaAction {
                     target: message_target(request.target),
                     attachment: MediaAttachment::image(asset.mime_type, None, asset.data.to_vec())
                         .map_err(|error| PluginError::Permanent(error.to_owned()))?,
                     caption: request.caption,
-                }))
-                .await
-                .map_err(|error| adapter_command_error(&error))?;
+                }),
+            )
+            .await
+            .map_err(|error| adapter_command_error(&error))?;
             if request.consume {
                 assets
                     .remove(instance_id, &request.asset_id)
@@ -751,6 +768,7 @@ mod tests {
         };
         let result = execute_context_command(
             ExecutionOrigin::Recovered(&origin),
+            "source",
             &platform_query_command(),
             &SecureHttpExecutor::default(),
             &UnavailableBrowserExecutor,
@@ -831,6 +849,7 @@ mod tests {
             ExecutionOrigin::Scheduled {
                 adapter_id: "query-adapter",
             },
+            "source",
             &platform_query_command(),
             &SecureHttpExecutor::default(),
             &UnavailableBrowserExecutor,
