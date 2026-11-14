@@ -25,6 +25,8 @@ struct Backups {
     slots: Arc<Semaphore>,
     repository: Option<Repository>,
     shutdown: Option<bot_core::ShutdownSignal>,
+    #[cfg(test)]
+    backpressure: Option<Arc<tokio::sync::Notify>>,
 }
 pub(super) fn router(
     manager: PluginManager,
@@ -38,6 +40,8 @@ pub(super) fn router(
             slots: Arc::new(Semaphore::new(1)),
             repository,
             shutdown,
+            #[cfg(test)]
+            backpressure: None,
         },
         auth,
     )
@@ -131,6 +135,8 @@ fn download_body(
 ) -> Result<axum::body::Body, ApiError> {
     let (send, receive) = tokio::sync::mpsc::channel(1);
     let shutdown = state.shutdown.clone();
+    #[cfg(test)]
+    let backpressure = state.backpressure.clone();
     state.manager.supervise_backup(async move {
         let _permit = permit;
         let work = async move {
@@ -141,6 +147,12 @@ fn download_body(
                     Ok(0) => break,
                     Ok(count) => {
                         bytes.truncate(count);
+                        #[cfg(test)]
+                        if send.capacity() == 0 {
+                            if let Some(notification) = &backpressure {
+                                notification.notify_one();
+                            }
+                        }
                         if send.send(Ok(Some(bytes))).await.is_err() {
                             return;
                         }
@@ -175,3 +187,6 @@ fn download_body(
     });
     Ok(axum::body::Body::from_stream(stream))
 }
+
+#[cfg(test)]
+mod tests;

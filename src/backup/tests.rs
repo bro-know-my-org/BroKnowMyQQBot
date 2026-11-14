@@ -254,3 +254,98 @@ async fn actual_export_is_logical_private_and_excludes_host_configuration_and_ex
     assert!(f.repo.open("../bot.toml").is_err());
     assert!(f.repo.open(&uuid::Uuid::new_v4().to_string()).is_err());
 }
+
+use std::os::unix::fs::symlink;
+
+#[test]
+fn fifo_declarations_and_disabled_package_are_rejected_without_waiting_for_a_writer() {
+    const CHILD: &str = "BKMQB_TEST_FIFO_ROOT";
+    if let Some(root) = std::env::var_os(CHILD) {
+        let root = PathBuf::from(root);
+        assert!(crate::plugins::backup_declarations(Some(&root.join("fifo"))).is_err());
+        assert!(crate::plugins::backup_declarations(Some(&root.join("plugins.toml"))).is_err());
+        return;
+    }
+    let f = Fixture::new();
+    let fifo = f.root.join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let declarations = f.root.join("plugins.toml");
+    fs::write(
+        &declarations,
+        "[[wasm]]\npackage='fifo'\ninstance_id='dev.test/default'\nenabled=false\n",
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "backup::tests::fifo_declarations_and_disabled_package_are_rejected_without_waiting_for_a_writer"])
+        .env_clear().env(CHILD, &f.root).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("FIFO reader blocked");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+#[tokio::test]
+async fn retention_is_finite_and_symlinks_never_read_or_replaced() {
+    let f = Fixture::new();
+    for _ in 0..4 {
+        f.export().await;
+    }
+    assert!(f.repo.save(b"fifth").is_err());
+    assert_eq!(f.repo.list().unwrap().len(), 4);
+    let id = f.repo.list().unwrap()[0].id.clone();
+    let path = f.repo.path(&id).unwrap();
+    fs::remove_file(&path).unwrap();
+    symlink(&f.repo.config, &path).unwrap();
+    assert!(f.repo.open(&id).is_err());
+    assert!(f.repo.list().is_err());
+    assert!(
+        fs::read_to_string(&f.repo.config)
+            .unwrap()
+            .contains("# keep comments")
+    );
+}
+
+#[tokio::test]
+async fn configuration_lock_conflict_fails_without_partial_archive_and_can_retry() {
+    let f = Fixture::new();
+    let lock = crate::config::ConfigFileLock::acquire(&f.repo.config).unwrap();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .acquire_owned()
+        .await
+        .unwrap();
+    assert!(
+        f.manager
+            .create_backup(f.repo.clone(), permit)
+            .await
+            .is_err()
+    );
+    assert!(f.repo.list().unwrap().is_empty());
+    drop(lock);
+    f.export().await;
+    assert_eq!(f.repo.list().unwrap().len(), 1);
+}
+
+#[test]
+fn public_or_symlinked_private_root_is_rejected() {
+    let f = Fixture::new();
+    fs::create_dir(&f.repo.root).unwrap();
+    fs::set_permissions(&f.repo.root, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(f.repo.list().is_err());
+    fs::remove_dir(&f.repo.root).unwrap();
+    symlink(&f.root, &f.repo.root).unwrap();
+    assert!(f.repo.list().is_err());
+}
