@@ -160,3 +160,210 @@ fn native_non_utf8_configured_directories_remain_usable() {
     std::fs::create_dir_all(path.join("runtime")).unwrap();
     assert!(archives.inventory_at(&path.join("runtime")).is_ok());
 }
+
+fn record() -> String {
+    json!({"timestamp":"2026-11-14T00:00:00Z","level":"INFO","target":"plugin_host::runtime",
+        "message":"registered plugin","spans":[{"instance_id":"sample","plugin_id":"dev.bkm.sample","token":"span-secret"}],
+        "error":"private-error","payload":{"body":"message-secret"},"content":"message-secret"}).to_string()+"\n"
+}
+#[tokio::test]
+async fn paged_runtime_records_are_safe_and_cursors_cannot_cross_files() {
+    let (temp, logs, _) = fixture();
+    let month = temp.path().join("runtime/2026-11");
+    std::fs::write(month.join(NAME), record().repeat(3)).unwrap();
+    std::fs::write(month.join(NAME.replace("s000", "s001")), record()).unwrap();
+    let app = app(logs);
+    let (_, inventory) = call(&app, "/api/logs/archives", true, false).await;
+    let selector = inventory["files"][1]["selector"].as_str().unwrap();
+    let path = format!("/api/logs/archives/page?selector={selector}&limit=2");
+    assert_eq!(
+        call(&app, &path, false, false).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(call(&app, &path, true, true).await.0, StatusCode::FORBIDDEN);
+    let (status, first) = call(&app, &path, true, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(first["entries"][0]["instance_id"], "sample");
+    for forbidden in [
+        "private-error",
+        "span-secret",
+        "message-secret",
+        "payload",
+        "spans",
+    ] {
+        assert!(!first.to_string().contains(forbidden));
+    }
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (_, second) = call(&app, &format!("{path}&cursor={cursor}"), true, false).await;
+    assert_eq!(second["entries"][0]["id"], 3);
+    assert!(second["next_cursor"].is_null());
+    let other = inventory["files"][0]["selector"].as_str().unwrap();
+    assert_eq!(
+        call(
+            &app,
+            &format!("/api/logs/archives/page?selector={other}&cursor={cursor}"),
+            true,
+            false
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    std::fs::write(month.join(NAME), record()).unwrap();
+    assert_eq!(call(&app, &path, true, false).await.0, StatusCode::CONFLICT);
+}
+#[tokio::test]
+async fn page_rejects_paths_bad_bounds_unknown_options_and_malformed_compression() {
+    let (temp, logs, _) = fixture();
+    let file = temp
+        .path()
+        .join("runtime/2026-11")
+        .join(format!("{NAME}.zst"));
+    std::fs::write(&file, "not zstd").unwrap();
+    let app = app(logs);
+    let (_, inventory) = call(&app, "/api/logs/archives", true, false).await;
+    let selector = inventory["files"][0]["selector"].as_str().unwrap();
+    for query in [
+        "selector=../../messages",
+        "selector=%2Fetc%2Fpasswd",
+        "path=/etc/passwd",
+        "limit=0",
+        "limit=201",
+        "limit=-1",
+        "cursor=invalid",
+        "include_content=true",
+    ] {
+        let uri = format!("/api/logs/archives/page?selector={selector}&{query}");
+        assert_eq!(
+            call(&app, &uri, true, false).await.0,
+            StatusCode::BAD_REQUEST,
+            "{query}"
+        );
+    }
+    let uri = format!("/api/logs/archives/page?selector={selector}");
+    assert_eq!(
+        call(&app, &uri, true, false).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", &file).unwrap();
+    assert_eq!(call(&app, &uri, true, false).await.0, StatusCode::CONFLICT);
+}
+#[tokio::test]
+async fn compressed_pages_skip_unknown_oversized_and_malformed_lines_truthfully() {
+    let (temp, logs, _) = fixture();
+    let file = temp
+        .path()
+        .join("runtime/2026-11")
+        .join(format!("{NAME}.zst"));
+    let data = format!(
+        "invalid\n{}\n{}\n{}",
+        "x".repeat(17000),
+        json!({"message":"unsafe old secret"}),
+        record()
+    );
+    let compressed = zstd::stream::encode_all(data.as_bytes(), 3).unwrap();
+    std::fs::write(&file, compressed).unwrap();
+    let app = app(logs);
+    let (_, inventory) = call(&app, "/api/logs/archives", true, false).await;
+    let selector = inventory["files"][0]["selector"].as_str().unwrap();
+    let (status, page) = call(
+        &app,
+        &format!("/api/logs/archives/page?selector={selector}"),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["skipped"], 3);
+    assert_eq!(page["scanned"], 4);
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    assert!(page["next_cursor"].is_null());
+}
+#[tokio::test]
+async fn scan_limits_bound_bombs_and_allow_empty_pages_to_advance() {
+    use std::io::{Read as _, Write as _};
+    let (temp, logs, _) = fixture();
+    let month = temp.path().join("runtime/2026-11");
+    std::fs::write(
+        month.join(NAME),
+        format!("{}{}", "bad\n".repeat(5000), record()),
+    )
+    .unwrap();
+    let app = app(logs.clone());
+    let (_, inventory) = call(&app, "/api/logs/archives", true, false).await;
+    let selector = inventory["files"][0]["selector"].as_str().unwrap();
+    let uri = format!("/api/logs/archives/page?selector={selector}");
+    let (_, page) = call(&app, &uri, true, false).await;
+    assert_eq!(page["scanned"], 5000);
+    assert_eq!(page["skipped"], 5000);
+    assert_eq!(page["entries"], json!([]));
+    let (_, page) = call(
+        &app,
+        &format!("{uri}&cursor={}", page["next_cursor"].as_str().unwrap()),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(page["entries"].as_array().unwrap().len(), 1);
+    std::fs::remove_file(month.join(NAME)).unwrap();
+    let file = std::fs::File::create(month.join(format!("{NAME}.zst"))).unwrap();
+    let mut encoder = zstd::stream::write::Encoder::new(file, 3).unwrap();
+    std::io::copy(
+        &mut std::io::repeat(b'x').take(64 * 1024 * 1024 + 1024),
+        &mut encoder,
+    )
+    .unwrap();
+    encoder.write_all(b"\n").unwrap();
+    encoder.finish().unwrap();
+    let (_, inventory) = call(&app, "/api/logs/archives", true, false).await;
+    let selector = inventory["files"][0]["selector"].as_str().unwrap();
+    let (status, page) = call(
+        &app,
+        &format!("/api/logs/archives/page?selector={selector}"),
+        true,
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["limited"], true);
+    assert!(page["next_cursor"].is_null());
+    assert_eq!(page["entries"], json!([]));
+}
+
+#[tokio::test]
+async fn total_line_budget_ends_with_explicit_unavailable_tail() {
+    for length in [100_000, 100_001] {
+        let (temp, logs, _) = fixture();
+        std::fs::write(
+            temp.path().join("runtime/2026-11").join(NAME),
+            "bad\n".repeat(length),
+        )
+        .unwrap();
+        let app = app(logs);
+        let (_, inventory) = call(&app, "/api/logs/archives", true, false).await;
+        let selector = inventory["files"][0]["selector"].as_str().unwrap();
+        let uri = format!("/api/logs/archives/page?selector={selector}");
+        let mut cursor = None;
+        for index in 0..20 {
+            let (_, page) = call(
+                &app,
+                &cursor
+                    .as_ref()
+                    .map_or(uri.clone(), |c| format!("{uri}&cursor={c}")),
+                true,
+                false,
+            )
+            .await;
+            assert_eq!(page["scanned"], 5000);
+            assert_eq!(page["skipped"], 5000);
+            if index < 19 {
+                cursor = Some(page["next_cursor"].as_str().unwrap().to_owned());
+            } else {
+                assert_eq!(page["limited"], length > 100_000);
+                assert!(page["next_cursor"].is_null());
+            }
+        }
+    }
+}

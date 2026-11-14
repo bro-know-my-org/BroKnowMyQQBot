@@ -1,5 +1,6 @@
 //! Multi-sink tracing initialization and log lifecycle management.
 
+pub(crate) mod archive_normalize;
 mod console;
 pub(crate) mod live;
 mod writer;

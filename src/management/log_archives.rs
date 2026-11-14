@@ -1,4 +1,6 @@
 //! Read-only access to writer-managed runtime archives. Never accepts a path.
+#[path = "log_archives_read.rs"]
+mod read;
 use super::auth::{self, AuthState};
 use crate::logging::live::LogBuffer;
 use axum::{
@@ -9,9 +11,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde::Serialize;
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 use std::{path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 
@@ -44,6 +47,7 @@ const MAX_COMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) fn router(logs: LogBuffer, auth: AuthState) -> Router {
     Router::new()
         .route("/api/logs/archives", get(list))
+        .route("/api/logs/archives/page", get(read::page))
         .with_state(Archives {
             logs,
             epoch: uuid::Uuid::new_v4().to_string().into(),
@@ -169,8 +173,9 @@ impl Archives {
     #[cfg(unix)]
     fn selector(&self, month: &str, name: &str, metadata: &std::fs::Metadata) -> String {
         use std::os::unix::fs::MetadataExt as _;
-        let mut hash = Sha256::new();
-        hash.update(self.epoch.as_bytes());
+        let mut hash = Hmac::<Sha256>::new_from_slice(self.epoch.as_bytes())
+            .expect("HMAC accepts any key length");
+        hash.update(b"archive-file-v1");
         hash.update(month.as_bytes());
         hash.update(name.as_bytes());
         for part in [
@@ -182,9 +187,9 @@ impl Archives {
             metadata.ctime().to_le_bytes(),
             metadata.ctime_nsec().to_le_bytes(),
         ] {
-            hash.update(part);
+            hash.update(&part);
         }
-        hex::encode(hash.finalize())
+        hex::encode(hash.finalize().into_bytes())
     }
 }
 

@@ -156,6 +156,10 @@ impl LogBuffer {
         self.archive_directory.get().cloned().flatten()
     }
 
+    pub(super) fn archive_text(&self, text: &str, limit: usize) -> String {
+        self.clean(text.to_owned(), limit, false)
+    }
+
     pub(crate) fn layer(&self) -> LiveLayer {
         LiveLayer(self.clone())
     }

@@ -202,3 +202,17 @@ fn watch_retains_latest_without_receivers_and_reset_checks_session() {
     assert!(fresh.dropped);
     assert_eq!(fresh.next_cursor, 0);
 }
+
+#[test]
+fn archive_normalization_reuses_known_secret_and_control_sanitization() {
+    let secret = "injected-private-credential";
+    let buffer = LogBuffer::new(vec![secret.to_owned()]);
+    let row = super::super::archive_normalize::normalize(&serde_json::json!({
+        "timestamp":"2026-11-14T00:00:00Z","level":"INFO","target":"plugin_host::runtime",
+        "message":"registered plugin","instance_id":secret,"plugin_id":format!("safe\n{secret}"),
+        "body":"never exposed","error":"never exposed"
+    }),1,&buffer).unwrap();
+    assert_eq!(row.instance_id.as_deref(), Some("[REDACTED]"));
+    assert_eq!(row.fields["plugin_id"], "safe\\n[REDACTED]");
+    assert!(!serde_json::to_string(&row).unwrap().contains(secret));
+}
