@@ -1084,6 +1084,7 @@ impl StaticPluginHost {
                 &envelope.delivery_id,
                 "action completion chain exceeded limit",
                 DeliveryFailurePolicy {
+                    error_class: "resource_exhausted",
                     next_attempt_ms: now,
                     max_attempts: delivery.attempt,
                     circuit_threshold: 1,
@@ -1123,6 +1124,7 @@ impl StaticPluginHost {
             &envelope.delivery_id,
             &error.to_string(),
             DeliveryFailurePolicy {
+                error_class: observation::host_error_class(error),
                 next_attempt_ms: failure_time
                     .saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX)),
                 max_attempts,

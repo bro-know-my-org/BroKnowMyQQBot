@@ -39,6 +39,8 @@ pub enum StoreError {
     IdempotencyConflict,
     #[error("plugin installation changed concurrently; reload it and retry")]
     InstallationConflict,
+    #[error("invalid failed delivery page")]
+    InvalidDeliveryPage,
     #[error("plugin delivery is no longer owned by this invocation")]
     StaleDelivery,
 }
@@ -111,8 +113,36 @@ pub struct DeadLetter {
     pub updated_at_ms: i64,
 }
 
+/// Safe metadata only: never loads envelopes, event IDs or diagnostic text.
+#[derive(Debug, Serialize)]
+pub struct FailedDelivery {
+    pub attempts: u32,
+    pub error_class: &'static str,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FailedDeliveryPage {
+    pub entries: Vec<FailedDelivery>,
+    pub next_before: Option<i64>,
+}
+
+fn safe_delivery_class(class: &str) -> &'static str {
+    match class {
+        "guest_trap" => "guest_trap",
+        "resource_exhausted" => "resource_exhausted",
+        "transient" => "transient",
+        "invalid_output" => "invalid_output",
+        "host_failure" => "host_failure",
+        "lifecycle_changed" => "lifecycle_changed",
+        "plugin_error" => "plugin_error",
+        _ => "unknown",
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeliveryFailurePolicy {
+    pub(crate) error_class: &'static str,
     pub(crate) next_attempt_ms: i64,
     pub(crate) max_attempts: u32,
     pub(crate) circuit_threshold: u32,
@@ -282,6 +312,11 @@ impl PluginStore {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&connection, "plugin_installations", "metadata", "BLOB")?;
+        ensure_column(&connection, "plugin_deliveries", "error_class", "TEXT")?;
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS plugin_deliveries_failures
+             ON plugin_deliveries(instance_id, status);",
+        )?;
         migrate_installation_metadata(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
@@ -676,7 +711,7 @@ impl PluginStore {
         let dead_letter = attempt >= policy.max_attempts;
         transaction.execute(
             "UPDATE plugin_deliveries SET status = ?, next_attempt_ms = ?, last_error = ?,
-             updated_at_ms = ?
+             error_class = ?, updated_at_ms = ?
              WHERE instance_id = ? AND event_id = ? AND delivery_id = ? AND status = 'running'",
             params![
                 if dead_letter {
@@ -686,6 +721,7 @@ impl PluginStore {
                 },
                 policy.next_attempt_ms,
                 error,
+                safe_delivery_class(policy.error_class),
                 policy.now_ms,
                 instance_id,
                 event_id,
@@ -905,6 +941,47 @@ impl PluginStore {
             .map_err(StoreError::from)
     }
 
+    /// Keyset pagination with a hard SQL limit and an instance/status index.
+    /// Historical rows without a structured class remain explicitly unknown.
+    pub fn failed_delivery_page(
+        &self,
+        instance_id: &str,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<FailedDeliveryPage, StoreError> {
+        if !(1..=100).contains(&limit) || before.is_some_and(|id| id <= 0) {
+            return Err(StoreError::InvalidDeliveryPage);
+        }
+        let mut connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
+        let transaction = connection.transaction()?;
+        let mut statement = transaction.prepare(
+            "SELECT rowid, attempt, substr(error_class, 1, 32), updated_at_ms FROM plugin_deliveries
+             WHERE instance_id = ? AND status = 'dead_letter' AND rowid < ?
+             ORDER BY rowid DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map(
+            params![instance_id, before.unwrap_or(i64::MAX), limit + 1],
+            |row| {
+                let class: Option<String> = row.get(2)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    FailedDelivery {
+                        attempts: row.get(1)?,
+                        error_class: safe_delivery_class(class.as_deref().unwrap_or("unknown")),
+                        updated_at_ms: row.get(3)?,
+                    },
+                ))
+            },
+        )?;
+        let mut entries = rows.collect::<Result<Vec<_>, _>>()?;
+        let next_before = (entries.len() > limit).then(|| entries[limit - 1].0);
+        entries.truncate(limit);
+        Ok(FailedDeliveryPage {
+            entries: entries.into_iter().map(|(_, entry)| entry).collect(),
+            next_before,
+        })
+    }
+
     pub fn dead_letters(&self, instance_id: Option<&str>) -> Result<Vec<DeadLetter>, StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         let mut output = Vec::new();
@@ -929,8 +1006,43 @@ impl PluginStore {
     }
 
     pub fn recover_dead_letters(&self, instance_id: &str, now_ms: i64) -> Result<u64, StoreError> {
+        self.recover_dead_letters_inner(instance_id, now_ms, None)
+    }
+
+    /// Prepare retries for the next process start, atomically checking and advancing
+    /// the installation revision. The caller must first stop the running instance.
+    pub fn recover_dead_letters_if_updated(
+        &self,
+        instance_id: &str,
+        expected: i64,
+        now_ms: i64,
+    ) -> Result<u64, StoreError> {
+        self.recover_dead_letters_inner(instance_id, now_ms, Some(expected))
+    }
+
+    fn recover_dead_letters_inner(
+        &self,
+        instance_id: &str,
+        now_ms: i64,
+        expected: Option<i64>,
+    ) -> Result<u64, StoreError> {
         let mut connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         let transaction = connection.transaction()?;
+        if let Some(expected) = expected {
+            let next = now_ms.max(
+                expected
+                    .checked_add(1)
+                    .ok_or(StoreError::InstallationConflict)?,
+            );
+            if transaction.execute(
+                "UPDATE plugin_installations SET updated_at_ms = ?
+                 WHERE instance_id = ? AND updated_at_ms = ?",
+                params![next, instance_id, expected],
+            )? != 1
+            {
+                return Err(StoreError::InstallationConflict);
+            }
+        }
         let updated = transaction.execute(
             "UPDATE plugin_deliveries SET status = 'pending', attempt = 0,
              next_attempt_ms = ?, last_error = NULL, updated_at_ms = ?
@@ -1676,6 +1788,7 @@ mod tests {
                 "delivery-1",
                 "temporary",
                 DeliveryFailurePolicy {
+                    error_class: "unknown",
                     next_attempt_ms: 2,
                     max_attempts: 3,
                     circuit_threshold: 3,
@@ -1708,6 +1821,7 @@ mod tests {
                 "delivery-2",
                 "temporary",
                 DeliveryFailurePolicy {
+                    error_class: "unknown",
                     next_attempt_ms: 3,
                     max_attempts: 3,
                     circuit_threshold: 3,
@@ -1733,6 +1847,7 @@ mod tests {
                 "delivery-3",
                 "exhausted",
                 DeliveryFailurePolicy {
+                    error_class: "unknown",
                     next_attempt_ms: 4,
                     max_attempts: 3,
                     circuit_threshold: 3,
@@ -1749,6 +1864,71 @@ mod tests {
         assert_eq!(store.recover_dead_letters("instance", 5).unwrap(), 1);
         assert!(!store.circuit_open("instance").unwrap());
         assert_eq!(store.pending_deliveries("instance", 5).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failed_delivery_pages_are_bounded_scoped_and_never_return_private_data() {
+        let store = PluginStore::in_memory().unwrap();
+        for index in 0..205 {
+            let id = format!("secret-event-{index}");
+            store
+                .begin_delivery("instance", &envelope(&id, &id, &id), &origin(), 1)
+                .unwrap()
+                .unwrap();
+            store
+                .mark_delivery_failed(
+                    "instance",
+                    &id,
+                    &id,
+                    "secret diagnostic",
+                    DeliveryFailurePolicy {
+                        error_class: if index % 2 == 0 {
+                            "guest_trap"
+                        } else {
+                            "secret-class"
+                        },
+                        next_attempt_ms: 2,
+                        max_attempts: 1,
+                        circuit_threshold: u32::MAX,
+                        counts_toward_circuit: false,
+                        now_ms: index,
+                    },
+                )
+                .unwrap();
+        }
+        let mut before = None;
+        let mut seen = 0;
+        loop {
+            let page = store.failed_delivery_page("instance", before, 100).unwrap();
+            assert!(page.entries.len() <= 100);
+            let json = serde_json::to_string(&page).unwrap();
+            assert!(!json.contains("secret"));
+            for entry in &page.entries {
+                assert_eq!(entry.attempts, 1);
+                assert!(matches!(entry.error_class, "guest_trap" | "unknown"));
+                assert_eq!(entry.updated_at_ms, 204 - seen);
+                seen += 1;
+            }
+            before = page.next_before;
+            if before.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen, 205);
+        assert_eq!(
+            store
+                .failed_delivery_page("other", None, 100)
+                .unwrap()
+                .entries
+                .len(),
+            0
+        );
+        for (before, limit) in [(None, 0), (None, 101), (Some(0), 20)] {
+            assert!(matches!(
+                store.failed_delivery_page("instance", before, limit),
+                Err(StoreError::InvalidDeliveryPage)
+            ));
+        }
     }
 
     #[test]
@@ -1770,6 +1950,7 @@ mod tests {
                 "delivery-1",
                 "temporary",
                 DeliveryFailurePolicy {
+                    error_class: "unknown",
                     next_attempt_ms: 10,
                     max_attempts: 3,
                     circuit_threshold: 3,
@@ -1824,6 +2005,7 @@ mod tests {
                 "delivery-1",
                 "failure",
                 DeliveryFailurePolicy {
+                    error_class: "unknown",
                     next_attempt_ms: 2,
                     max_attempts: 1,
                     circuit_threshold: 3,
@@ -1857,6 +2039,7 @@ mod tests {
                     &delivery,
                     "failure",
                     DeliveryFailurePolicy {
+                        error_class: "unknown",
                         next_attempt_ms: i64::from(index + 1),
                         max_attempts: 1,
                         circuit_threshold: 3,
@@ -2097,6 +2280,47 @@ mod tests {
                 .package_sha256,
             "two"
         );
+        let id = &installation.instance_id;
+        store
+            .begin_delivery(id, &envelope("failed", "d", "i"), &origin(), 1)
+            .unwrap();
+        store
+            .mark_delivery_failed(
+                id,
+                "failed",
+                "d",
+                "private error",
+                DeliveryFailurePolicy {
+                    error_class: "guest_trap",
+                    next_attempt_ms: 2,
+                    max_attempts: 1,
+                    circuit_threshold: 1,
+                    counts_toward_circuit: true,
+                    now_ms: 2,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.recover_dead_letters_if_updated(id, 1, 5),
+            Err(StoreError::InstallationConflict)
+        ));
+        assert!(store.circuit_open(id).unwrap());
+        assert_eq!(
+            store
+                .failed_delivery_page(id, None, 20)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        assert_eq!(store.recover_dead_letters_if_updated(id, 2, 5).unwrap(), 1);
+        assert!(!store.circuit_open(id).unwrap());
+        assert_eq!(store.installation(id).unwrap().unwrap().updated_at_ms, 5);
+        assert_eq!(store.pending_deliveries(id, 5).unwrap().len(), 1);
+        assert!(matches!(
+            store.recover_dead_letters_if_updated(id, 2, 6),
+            Err(StoreError::InstallationConflict)
+        ));
     }
 
     #[test]
