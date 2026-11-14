@@ -5,6 +5,7 @@ pub(crate) mod marketplace;
 pub(crate) mod marketplace_install;
 mod operations;
 pub(crate) mod permissions;
+pub(crate) mod status;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -125,6 +126,7 @@ type ShutdownTask = tokio::task::JoinHandle<Result<(), PluginHostError>>;
 #[derive(Clone)]
 pub(crate) struct PluginManager {
     store: PluginStore,
+    status_revision: Arc<std::sync::atomic::AtomicU64>,
     runtime: Arc<RwLock<RuntimeState>>,
     writes: Arc<Mutex<()>>,
     operations: Arc<StdMutex<Operations>>,
@@ -150,6 +152,15 @@ struct RuntimeState {
 }
 
 impl PluginManager {
+    pub(crate) fn status_revision(&self) -> u64 {
+        self.status_revision
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn status_changed(&self) {
+        self.status_revision
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn command_prefix(&self) -> Result<String, ManagementError> {
         Ok(self.snapshot()?.host.command_prefix())
     }
@@ -170,6 +181,7 @@ impl PluginManager {
         Self {
             marketplace: None,
             local_packages: Arc::default(),
+            status_revision: Arc::default(),
             store,
             runtime: Arc::new(RwLock::new(RuntimeState {
                 host,
@@ -315,6 +327,7 @@ impl PluginManager {
         let _write = self.writes.lock().await;
         self.current(instance_id, expected).await?;
         plugin_configuration::save_config(&self.store, instance_id, expected, config).await?;
+        self.status_changed();
         Ok(())
     }
 
@@ -327,6 +340,7 @@ impl PluginManager {
         let _write = self.writes.lock().await;
         self.current(instance_id, expected).await?;
         plugin_configuration::save_enabled(&self.store, instance_id, expected, enabled).await?;
+        self.status_changed();
         Ok(())
     }
 
@@ -361,9 +375,11 @@ impl PluginManager {
                     tracing::warn!("plugin management operation task failed");
                 }
             }
+            let manager = self.clone();
             operations.tasks.spawn(async move {
                 let _permit = permit;
                 let result = task.await;
+                manager.status_changed();
                 let _ = send.send(result);
             });
         }

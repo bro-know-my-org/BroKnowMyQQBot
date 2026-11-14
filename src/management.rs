@@ -16,6 +16,7 @@ mod plugins;
 mod restart;
 mod runtime;
 mod settings;
+mod status_stream;
 mod system_settings;
 pub(crate) use auth::SessionHandoff;
 
@@ -72,6 +73,8 @@ pub(crate) enum ManagementError {
     Serve(#[from] std::io::Error),
     #[error("management validation supervisor failed")]
     ValidationSupervisor(#[source] tokio::task::JoinError),
+    #[error("management status sampler failed")]
+    StatusSupervisor(#[source] tokio::task::JoinError),
     #[error("management server graceful shutdown timed out")]
     ShutdownTimeout,
 }
@@ -108,12 +111,20 @@ pub(crate) async fn serve(
     let listen = listener.local_addr()?;
     restart.record_listener(listen);
     info!(listen = %listen, auth = ?config.auth, "management server listening");
+    let (status_router, status_worker, status_stop) = status_stream::router(
+        manager.clone(),
+        observer.clone(),
+        auth.clone(),
+        Some(shutdown.clone()),
+    );
+    let mut status_supervisor = tokio::spawn(status_worker.run());
     let (app, validation_jobs) = router_parts(
         observer,
         Some((manager, auth.clone(), live_logs, shutdown.clone())),
     );
     let app = app
         .merge(restart::router(restart, auth))
+        .merge(status_router)
         .layer(axum::middleware::from_fn(plugins::security_headers));
     let mut validation_supervisor = tokio::spawn(run_validation_workers(validation_jobs));
     let (serve_result, shutdown_deadline) = {
@@ -139,6 +150,7 @@ pub(crate) async fn serve(
             }
         }
     };
+    let _ = status_stop.send(());
     let supervisor_grace = shutdown_deadline.map_or(shutdown_timeout, |deadline| {
         deadline.saturating_duration_since(tokio::time::Instant::now())
     });
@@ -156,13 +168,26 @@ pub(crate) async fn serve(
                 Err(ManagementError::ShutdownTimeout)
             }
         };
+    let status_grace = shutdown_deadline.map_or(shutdown_timeout, |deadline| {
+        deadline.saturating_duration_since(tokio::time::Instant::now())
+    });
+    let status_result =
+        if let Ok(result) = tokio::time::timeout(status_grace, &mut status_supervisor).await {
+            result.map_err(ManagementError::StatusSupervisor)
+        } else {
+            warn!("bounded status sampling thread exceeded the shutdown grace period");
+            status_supervisor.abort();
+            let _ = status_supervisor.await;
+            Err(ManagementError::ShutdownTimeout)
+        };
     if let Err(error) = supervisor_result {
         if serve_result.is_ok() {
             return Err(error);
         }
         warn!(error = %error, "management validation supervisor also failed");
     }
-    serve_result
+    serve_result?;
+    status_result
 }
 
 #[cfg(test)]

@@ -41,7 +41,7 @@ struct AdapterStatus {
 }
 
 impl RuntimeStatus {
-    fn read(observer: &RuntimeObserver) -> Self {
+    pub(super) fn read(observer: &RuntimeObserver) -> Self {
         let metrics = observer.snapshot();
         let configured_adapters = metrics.adapters.len();
         let online_adapters = metrics
