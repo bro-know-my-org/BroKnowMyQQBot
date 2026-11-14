@@ -124,6 +124,23 @@ impl Default for LogBuffer {
 }
 
 impl LogBuffer {
+    // The callback borrows the fixed 1000-entry ring while locked: trace queries
+    // can select before cloning and cannot accidentally resume across processes.
+    pub(crate) fn inspect_retained<T>(
+        &self,
+        session: &str,
+        inspect: impl FnOnce(u64, &VecDeque<LogEntry>) -> T,
+    ) -> Result<T, &str> {
+        if session != self.session_id.as_ref() {
+            return Err(&self.session_id);
+        }
+        let state = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(inspect(state.0, &state.1))
+    }
+
     fn new(mut redactions: Vec<String>) -> Self {
         redactions.retain(|value| !value.is_empty());
         // Debug formatting can escape quotes and controls in otherwise known credentials.

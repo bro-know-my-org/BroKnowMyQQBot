@@ -112,6 +112,7 @@ pub(super) fn router_with_runtime(
             get(super::plugin_operations::failures),
         )
         .route("/api/logs", get(super::logs::get))
+        .route("/api/logs/trace", get(super::log_trace::get))
         .route(
             "/api/settings/system",
             get(super::system_settings::get).post(super::system_settings::save),

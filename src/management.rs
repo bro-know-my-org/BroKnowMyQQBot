@@ -4,6 +4,7 @@ mod auth;
 mod listener;
 mod local_packages;
 mod log_archives;
+mod log_trace;
 mod logs;
 mod logs_stream;
 mod marketplace;
