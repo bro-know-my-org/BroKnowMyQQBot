@@ -265,6 +265,7 @@ async fn dispatch_to_reply_observes_body_identity_and_outcome_once() {
             assert_eq!(outgoing["instance_id"], "ping/default");
             assert_eq!(outgoing["invocation_id"], "invocation-1");
             for record in &*records {
+                assert_eq!(record.0["message_scope"], "group");
                 assert_eq!(record.0["adapter_id"], adapter_id);
                 assert_eq!(record.0["event_id"], "stable-event");
                 assert!(!format!("{:?}", record.0).contains("private-"));
@@ -332,6 +333,8 @@ async fn shared_action_executor_records_sends_and_media_captions_without_payload
         let records = capture.0.lock().unwrap();
         let fields = &records[records.len() - 2].0;
         assert_eq!(fields["action_type"], kind);
+        assert_eq!(fields["message_scope"], "private");
+        assert_eq!(records.back().unwrap().0["message_scope"], "private");
         assert_eq!(fields["content"], content);
         assert_eq!(fields["event_id"], "schedule:stable");
         assert!(!format!("{fields:?}").contains("private-"));
@@ -354,6 +357,73 @@ async fn shared_action_executor_records_sends_and_media_captions_without_payload
     }
     assert_eq!(capture.0.lock().unwrap().len(), count);
     assert_eq!(adapter.executions.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn scope_is_portable_target_metadata_without_platform_identity() {
+    let capture = Capture::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let (shutdown, _) = shutdown_channel();
+    let mut adapter = MockAdapter {
+        id: "mock".into(),
+        fail: false,
+        shutdown,
+        acknowledgements: AtomicUsize::new(0),
+        executions: AtomicUsize::new(0),
+        last_content_len: AtomicUsize::new(0),
+    };
+    for (target, expected) in [
+        (
+            MessageTarget::Private {
+                user_id: "private-user".into(),
+            },
+            "private",
+        ),
+        (
+            MessageTarget::GuildDirect {
+                guild_id: "private-guild".into(),
+            },
+            "private",
+        ),
+        (
+            MessageTarget::Group {
+                group_id: "private-group".into(),
+            },
+            "group",
+        ),
+        (
+            MessageTarget::Channel {
+                channel_id: "private-channel".into(),
+            },
+            "channel",
+        ),
+    ] {
+        let mut event = envelope(&adapter.id);
+        if let Event::Message(message) = &mut event.event {
+            message.target = target.clone();
+        }
+        for fail in [false, true] {
+            adapter.fail = fail;
+            super::received(&event);
+            let result = super::execute_traced_action(
+                &adapter,
+                "stable-event",
+                Action::SendMessage(SendMessageAction {
+                    target: target.clone(),
+                    content: "body".into(),
+                }),
+            )
+            .await;
+            assert_eq!(result.is_err(), fail);
+            let mut records = capture.0.lock().unwrap();
+            assert_eq!(records.len(), 3);
+            for record in records.drain(..) {
+                assert_eq!(record.0["message_scope"], expected);
+                assert!(!format!("{:?}", record.0).contains("private-"));
+            }
+        }
+    }
 }
 
 #[tokio::test]
