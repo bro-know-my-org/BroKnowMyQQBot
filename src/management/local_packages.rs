@@ -19,6 +19,17 @@ use super::{
 };
 use crate::plugin_management::{ManagementError, PluginManager, local_packages::MAX_UPLOAD_BYTES};
 
+pub(super) async fn commit(
+    State(state): State<super::plugins::ApiState>,
+    request: Result<
+        Json<crate::plugin_management::local_packages::LocalCommit>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Result<Json<crate::plugin_management::marketplace_install::InstallResult>, ApiError> {
+    let Json(request) = request.map_err(|_| ManagementError::InvalidOperation)?;
+    Ok(Json(state.manager.commit_local_package(request).await?))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SelectionRequest {

@@ -1,7 +1,7 @@
 use super::marketplace::selection;
 use super::{ManagementError, PluginManager};
 use crate::plugin_installer::{
-    PendingInstallation, finish_installation_retaining, validate_install_candidate,
+    PendingInstallation, finish_installation_retaining_checked, validate_install_candidate,
 };
 use plugin_host::{PluginInstallation, ValidatedPluginPackage};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,14 @@ impl PluginManager {
         // Keep the slot until blocking validation and persistence finish. Network
         // requests have individual deadlines; HTTP cancellation drops only the receiver.
         let (pending, existing) = self.prepare_marketplace(request, update).await?;
+        self.commit_package(pending, existing).await
+    }
+
+    pub(super) async fn commit_package(
+        &self,
+        pending: PendingInstallation,
+        existing: Option<PluginInstallation>,
+    ) -> Result<InstallResult, ManagementError> {
         let _write = self.writes.lock().await;
         let context = self.marketplace_context()?.clone();
         let store = self.store.clone();
@@ -78,23 +86,31 @@ impl PluginManager {
             .as_ref()
             .map(|i| (i.package_path.clone(), i.package_sha256.clone()));
         let installation = tokio::task::spawn_blocking(move || {
-            if crate::plugins::is_declared_instance_id(
-                context.declarations.as_deref(),
-                &pending.instance_id,
-            )
-            .map_err(|_| ManagementError::NotManaged)?
-            {
-                return Err(ManagementError::NotManaged);
-            }
-            finish_installation_retaining(
+            finish_installation_retaining_checked(
                 &store,
                 &context.database,
                 existing.as_ref(),
                 &pending,
                 &loaded_hashes,
+                || {
+                    if crate::plugins::is_declared_instance_id(
+                        context.declarations.as_deref(),
+                        &pending.instance_id,
+                    )
+                    .map_err(|_| ManagementError::NotManaged)?
+                    {
+                        return Err(ManagementError::NotManaged.into());
+                    }
+                    Ok(())
+                },
             )
             .map_err(|error| {
-                if let Some(error) = error.downcast_ref::<plugin_host::StoreError>() {
+                if error
+                    .downcast_ref::<ManagementError>()
+                    .is_some_and(|e| matches!(e, ManagementError::NotManaged))
+                {
+                    ManagementError::NotManaged
+                } else if let Some(error) = error.downcast_ref::<plugin_host::StoreError>() {
                     if matches!(error, plugin_host::StoreError::InstallationConflict) {
                         ManagementError::Conflict
                     } else {

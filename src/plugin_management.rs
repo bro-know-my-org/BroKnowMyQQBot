@@ -67,6 +67,8 @@ pub(crate) enum ManagementError {
     Busy,
     #[error("插件包不得超过 32 MiB")]
     UploadTooLarge,
+    #[error("上传选择已过期或已使用，请重新选择并检查插件包")]
+    ExpiredSelection,
 }
 
 impl From<StoreError> for ManagementError {

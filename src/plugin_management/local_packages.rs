@@ -6,7 +6,7 @@ use std::{
 };
 
 use plugin_host::ValidatedPluginPackage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::{ManagementError, PluginManager};
@@ -30,7 +30,7 @@ impl Default for Staging {
 }
 
 pub(super) struct StagedPackage {
-    _bytes: Vec<u8>,
+    bytes: Vec<u8>,
     expires: Instant,
     _permit: OwnedSemaphorePermit,
 }
@@ -50,7 +50,143 @@ pub(crate) struct LocalInspection {
     default_instance_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalCommit {
+    selection: String,
+    sha256: String,
+    plugin_id: String,
+    version: String,
+    instance_id: String,
+    expected_updated_at_ms: Option<i64>,
+    grants: std::collections::BTreeSet<String>,
+    confirm_unsigned: bool,
+    confirm: bool,
+}
+
 impl PluginManager {
+    pub(crate) async fn commit_local_package(
+        &self,
+        request: LocalCommit,
+    ) -> Result<super::marketplace_install::InstallResult, ManagementError> {
+        if !request.confirm
+            || !request.confirm_unsigned
+            || uuid::Uuid::parse_str(&request.selection).is_err()
+            || request.sha256.len() != 64
+            || request.plugin_id.len() > 128
+            || request.version.len() > 128
+            || request.expected_updated_at_ms.is_some_and(|n| n < 0)
+            || request.instance_id.is_empty()
+            || request.instance_id.len() > 192
+            || !request
+                .instance_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b))
+            || request
+                .instance_id
+                .split('/')
+                .any(|part| part.is_empty() || matches!(part, "." | ".."))
+            || request.grants.len() > 128
+            || request.grants.iter().any(|p| p.len() > 256)
+        {
+            return Err(ManagementError::InvalidOperation);
+        }
+        let manager = self.clone();
+        self.operation(async move { manager.commit_local_inner(request).await })
+            .await
+    }
+
+    async fn commit_local_inner(
+        &self,
+        request: LocalCommit,
+    ) -> Result<super::marketplace_install::InstallResult, ManagementError> {
+        let staged = self
+            .local_packages
+            .selections
+            .lock()
+            .map_err(|_| ManagementError::Store)?
+            .remove(&request.selection)
+            .filter(|s| s.expires > Instant::now())
+            .ok_or(ManagementError::ExpiredSelection)?;
+        let StagedPackage {
+            bytes,
+            _permit: selection_permit,
+            ..
+        } = staged;
+        let _permit = selection_permit;
+        let (bytes, package) = tokio::task::spawn_blocking(move || {
+            let package = ValidatedPluginPackage::from_bytes(&bytes)
+                .map_err(|_| ManagementError::InvalidPackage)?;
+            Ok::<_, ManagementError>((bytes, package))
+        })
+        .await
+        .map_err(|_| ManagementError::Store)??;
+        let manifest = package.manifest().clone();
+        if package.package_sha256() != request.sha256
+            || manifest.id.as_str() != request.plugin_id
+            || manifest.version != request.version
+        {
+            return Err(ManagementError::InvalidPackage);
+        }
+        let id = &request.instance_id;
+        let runtime = self.snapshot()?;
+        if crate::plugins::is_reserved_bundled_instance_id(id)
+            || self.file_instances.contains(id)
+            || (runtime.host.instance_manifest(id).is_some() && !runtime.packages.contains_key(id))
+        {
+            return Err(ManagementError::NotManaged);
+        }
+        let store = self.store.clone();
+        let instance_id = id.clone();
+        let existing = tokio::task::spawn_blocking(move || store.installation(&instance_id))
+            .await
+            .map_err(|_| ManagementError::Store)??;
+        if existing.as_ref().map(|i| i.updated_at_ms) != request.expected_updated_at_ms {
+            return Err(ManagementError::Conflict);
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|i| i.plugin_id != request.plugin_id)
+        {
+            return Err(ManagementError::NotManaged);
+        }
+        let requested = manifest.requested_capabilities();
+        if !request.grants.is_subset(&requested) {
+            return Err(ManagementError::InvalidOperation);
+        }
+        let mut granted: std::collections::BTreeSet<_> = existing
+            .as_ref()
+            .map(|i| {
+                i.granted_permissions
+                    .iter()
+                    .filter(|p| requested.contains(*p))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        granted.extend(request.grants);
+        let config = existing
+            .as_ref()
+            .map(|i| i.config.clone())
+            .unwrap_or_default();
+        let config_error = crate::plugin_installer::validate_install_candidate(package, &config)
+            .await
+            .map_err(|_| ManagementError::InvalidPackage)?;
+        let pending = crate::plugin_installer::PendingInstallation {
+            manifest,
+            instance_id: request.instance_id,
+            package_sha256: request.sha256,
+            package_bytes: bytes,
+            source: "browser-upload".to_owned(),
+            permissions_complete: requested.is_subset(&granted),
+            requested,
+            granted,
+            config,
+            config_error,
+            update: existing.is_some(),
+        };
+        self.commit_package(pending, existing).await
+    }
     pub(crate) fn discard_local_selection(&self, selection: &str) -> Result<(), ManagementError> {
         self.local_packages
             .selections
@@ -115,7 +251,7 @@ impl PluginManager {
                     .insert(
                         selection,
                         StagedPackage {
-                            _bytes: bytes,
+                            bytes,
                             expires: Instant::now() + SELECTION_TTL,
                             _permit: permit,
                         },

@@ -57,7 +57,21 @@ pub(crate) fn finish_installation_retaining(
     pending: &PendingInstallation,
     loaded_hashes: &BTreeSet<String>,
 ) -> Result<PluginInstallation, Box<dyn std::error::Error>> {
+    finish_installation_retaining_checked(store, database, existing, pending, loaded_hashes, || {
+        Ok(())
+    })
+}
+
+pub(crate) fn finish_installation_retaining_checked(
+    store: &PluginStore,
+    database: &Path,
+    existing: Option<&PluginInstallation>,
+    pending: &PendingInstallation,
+    loaded_hashes: &BTreeSet<String>,
+    check: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<PluginInstallation, Box<dyn std::error::Error>> {
     let _lifecycle_lock = lock_managed_package_lifecycle(database)?;
+    check()?;
     let destination = persist_installed_package(
         database,
         &pending.manifest,

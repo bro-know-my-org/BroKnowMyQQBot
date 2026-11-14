@@ -85,6 +85,10 @@ pub(super) fn router_with_runtime(
         .route("/api/marketplace/details", get(super::marketplace::details))
         .route("/api/plugins", get(list))
         .route(
+            "/api/plugins/local/commit",
+            post(super::local_packages::commit),
+        )
+        .route(
             "/api/plugins/local/discard",
             post(super::local_packages::discard),
         )
@@ -260,6 +264,7 @@ impl IntoResponse for ApiError {
             ManagementError::Conflict | ManagementError::StaleMarketplace => StatusCode::CONFLICT,
             ManagementError::Busy => StatusCode::TOO_MANY_REQUESTS,
             ManagementError::UploadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ManagementError::ExpiredSelection => StatusCode::GONE,
             ManagementError::Store => StatusCode::INTERNAL_SERVER_ERROR,
             ManagementError::Lifecycle | ManagementError::MarketplaceUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE

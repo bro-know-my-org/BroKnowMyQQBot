@@ -9,6 +9,207 @@ use tower::ServiceExt as _;
 
 const TOKEN: &str = "local-package-test-token-0123456789abcdef";
 
+async fn local_request(
+    app: &axum::Router,
+    path: &str,
+    body: Body,
+    binary: bool,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header("Authorization", format!("Bearer {TOKEN}"))
+                .header(
+                    "Content-Type",
+                    if binary {
+                        "application/octet-stream"
+                    } else {
+                        "application/json"
+                    },
+                )
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    (
+        status,
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap(),
+    )
+}
+
+async fn inspect(app: &axum::Router, bytes: &[u8]) -> Value {
+    let (status, inspection) = local_request(
+        app,
+        "/api/plugins/local/inspect",
+        Body::from(bytes.to_vec()),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    inspection
+}
+
+fn commit_body(inspection: &Value, id: &str, revision: Option<i64>) -> Value {
+    serde_json::json!({"selection":inspection["selection"], "sha256":inspection["sha256"], "plugin_id":inspection["plugin_id"], "version":inspection["version"], "instance_id":id, "expected_updated_at_ms":revision, "grants":[], "confirm_unsigned":true, "confirm":true})
+}
+
+async fn commit(app: &axum::Router, body: Value) -> (StatusCode, Value) {
+    local_request(
+        app,
+        "/api/plugins/local/commit",
+        Body::from(body.to_string()),
+        false,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn local_commit_is_fixed_confirmed_cas_protected_and_preserves_disabled_update() {
+    let fixture = Fixture::new(false);
+    let manager = fixture
+        .manager()
+        .await
+        .with_marketplace(
+            fixture.directory.join("plugins.db"),
+            None,
+            crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+        )
+        .unwrap();
+    let app = router(manager.clone(), token_digest(TOKEN).unwrap());
+    let bytes = std::fs::read(&fixture.installation.package_path).unwrap();
+    let id = &fixture.installation.instance_id;
+    let inspection = inspect(&app, &bytes).await;
+    let mut body = commit_body(&inspection, id, Some(1));
+    body["confirm"] = false.into();
+    assert_eq!(commit(&app, body.clone()).await.0, StatusCode::BAD_REQUEST);
+    body["confirm"] = true.into();
+    body["confirm_unsigned"] = false.into();
+    assert_eq!(commit(&app, body.clone()).await.0, StatusCode::BAD_REQUEST);
+    body["confirm_unsigned"] = true.into();
+    body["sha256"] = "0".repeat(64).into();
+    assert_eq!(commit(&app, body).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        fixture.store.installation(id).unwrap().unwrap(),
+        fixture.installation
+    );
+    let inspection = inspect(&app, &bytes).await;
+    assert_eq!(
+        commit(&app, commit_body(&inspection, id, None)).await.0,
+        StatusCode::CONFLICT
+    );
+    let inspection = inspect(&app, &bytes).await;
+    let (status, installed) = commit(&app, commit_body(&inspection, id, Some(1))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(installed["enabled"], false);
+    assert_eq!(installed["restart_required"], true);
+    assert_eq!(installed["loaded_version"], Value::Null);
+    let saved = fixture.store.installation(id).unwrap().unwrap();
+    assert_eq!(saved.config, fixture.installation.config);
+    assert_eq!(
+        saved.granted_permissions,
+        fixture.installation.granted_permissions
+    );
+    assert_eq!(
+        commit(
+            &app,
+            commit_body(&inspection, id, Some(saved.updated_at_ms))
+        )
+        .await
+        .0,
+        StatusCode::GONE
+    );
+    let inspection = inspect(&app, &bytes).await;
+    let (status, installed) = commit(
+        &app,
+        commit_body(&inspection, "dev.bkm.wasm-ping/new", None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(installed["enabled"], false);
+    assert!(
+        !installed["missing_permissions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_commit_rechecks_declarations_and_identity_without_accepting_host_paths() {
+    let fixture = Fixture::new(false);
+    let declaration = fixture.directory.join("declarations.toml");
+    std::fs::write(&declaration, "bundled = []\n").unwrap();
+    let manager = fixture
+        .manager()
+        .await
+        .with_marketplace(
+            fixture.directory.join("plugins.db"),
+            Some(declaration.clone()),
+            crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+        )
+        .unwrap();
+    let app = router(manager, token_digest(TOKEN).unwrap());
+    let bytes = std::fs::read(&fixture.installation.package_path).unwrap();
+    let id = &fixture.installation.instance_id;
+    for (key, value, status) in [
+        (
+            "instance_id",
+            serde_json::json!("../../escape"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "path",
+            serde_json::json!("/host/private"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "grants",
+            serde_json::json!(["arbitrary.permission"]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "instance_id",
+            serde_json::json!("dev.bkm.ping/default"),
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let inspection = inspect(&app, &bytes).await;
+        let mut body = commit_body(&inspection, id, Some(1));
+        body[key] = value;
+        assert_eq!(commit(&app, body).await.0, status);
+        // Invalid pre-admission requests intentionally preserve a usable ticket.
+        local_request(
+            &app,
+            "/api/plugins/local/discard",
+            Body::from(serde_json::json!({"selection":inspection["selection"]}).to_string()),
+            false,
+        )
+        .await;
+    }
+    let inspection = inspect(&app, &bytes).await;
+    std::fs::write(
+        &declaration,
+        format!(
+            "bundled = []\n[[wasm]]\npackage = 'unused'\ninstance_id = '{id}'\nenabled = false\n"
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        commit(&app, commit_body(&inspection, id, Some(1))).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        fixture.store.installation(id).unwrap().unwrap(),
+        fixture.installation
+    );
+    assert!(!fixture.directory.join("plugins").exists());
+}
+
 #[tokio::test]
 async fn irregular_chunks_cannot_grow_retained_upload_allocation_past_budget() {
     let stream = futures_util::stream::iter(
