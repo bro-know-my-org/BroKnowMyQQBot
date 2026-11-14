@@ -25,6 +25,11 @@ const MAX_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 512 * 1024;
 const MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
+mod archive;
+pub use archive::{
+    LogicalArchive, LogicalArchiveError, LogicalArchiveManifest, MAX_LOGICAL_ARCHIVE_BYTES,
+};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LogicalStateEntry {

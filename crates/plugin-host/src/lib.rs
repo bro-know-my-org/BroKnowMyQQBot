@@ -23,8 +23,9 @@ pub use runtime::{
     validate_plugin_config,
 };
 pub use storage::{
-    CommitOptions, DeadLetter, FailedDelivery, FailedDeliveryPage, LogicalSnapshot,
-    LogicalStateEntry, OutboxOrigin, PluginInstallation, PluginInstallationStatus,
+    CommitOptions, DeadLetter, FailedDelivery, FailedDeliveryPage, LogicalArchive,
+    LogicalArchiveError, LogicalArchiveManifest, LogicalSnapshot, LogicalStateEntry,
+    MAX_LOGICAL_ARCHIVE_BYTES, OutboxOrigin, PluginInstallation, PluginInstallationStatus,
     PluginStore, StoreError,
 };
 #[cfg(feature = "wasm")]

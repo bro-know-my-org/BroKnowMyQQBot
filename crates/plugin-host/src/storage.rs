@@ -19,7 +19,10 @@ const MAX_STATE_ENTRIES: u64 = 4_096;
 const MAX_SCHEDULED_TASKS: u64 = 1_024;
 
 mod logical;
-pub use logical::{LogicalSnapshot, LogicalStateEntry};
+pub use logical::{
+    LogicalArchive, LogicalArchiveError, LogicalArchiveManifest, LogicalSnapshot,
+    LogicalStateEntry, MAX_LOGICAL_ARCHIVE_BYTES,
+};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
