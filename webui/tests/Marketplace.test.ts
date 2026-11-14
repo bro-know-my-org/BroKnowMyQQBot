@@ -28,7 +28,7 @@ async function mount() {
   const root = document.createElement('div'); document.body.append(root);
   app = createApp(MarketplacePage, { request: request as Request, onBusy: busy, onInstalled: installed }).use(router); app.mount(root); await flush();
 }
-beforeEach(() => { selected = item(); page = { source: 'https://example.com/index.json', total: 1, offset: 0, plugins: [selected] }; fail = false; pending = undefined; posts.length = 0; vi.clearAllMocks(); vi.spyOn(window, 'scrollTo').mockImplementation(() => {}); });
+beforeEach(() => { selected = item(); page = { source: 'https://example.com/index.json', total: 1, offset: 0, plugins: [selected] }; fail = false; pending = undefined; posts.length = 0; vi.clearAllMocks(); vi.spyOn(window, 'scrollTo').mockImplementation(() => {}); vi.spyOn(window, 'confirm').mockReturnValue(true); });
 afterEach(() => { app?.unmount(); document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 it('真实目录、详情、固定哈希与权限可读；默认不授权且需单独确认', async () => {
@@ -47,7 +47,7 @@ it('真实目录、详情、固定哈希与权限可读；默认不授权且需�
   expect(get<HTMLButtonElement>('.market-details .primary').disabled).toBe(true);
   expect([...document.querySelectorAll<HTMLInputElement>('.market-details input')].every(input => !input.checked)).toBe(true);
   await check('.market-permission input[value="message.reply"]');
-  expect(posts).toHaveLength(0);
+  expect(posts).toHaveLength(0); expect(window.confirm).not.toHaveBeenCalled();
   await check('.market-confirm input'); await click('.market-details .primary');
   expect(posts).toEqual([{ path: '/api/marketplace/install', body: { selector: 'ping', selection: 'b'.repeat(64), version: '1.0.0', sha256: 'a'.repeat(64), expected_updated_at_ms: null, grants: ['message.reply'], confirm_unsigned: true } }]);
   expect(document.body.textContent).toContain('RESTART REQUIRED');
@@ -92,7 +92,7 @@ it('安装中报告全局忙碌状态并阻止重复提交', async () => {
   pending = () => {}; await click('.market-details .primary');
   expect(busy).toHaveBeenLastCalledWith(true); expect(get<HTMLFieldSetElement>('fieldset').disabled).toBe(true);
   await click('.market-details .section-heading button'); expect(document.querySelector('.market-details')).not.toBeNull();
-  await click('.market-details .primary'); expect(posts).toHaveLength(1);
+  await click('.market-details .primary'); expect(posts).toHaveLength(1); expect(window.confirm).toHaveBeenCalledOnce();
   pending!(); await flush(); expect(busy).toHaveBeenLastCalledWith(false);
 });
 it('离开页面后忽略晚到响应', async () => {
@@ -140,4 +140,36 @@ it('已保存版本与实例运行状态分别说明，版本相同仍允许核�
   expect(get('.market-install-state').textContent).toContain('需重启加载');
   await check('.market-permission input[value="message.reply"]'); await check('.market-confirm input'); await click('.market-details .primary');
   expect(posts[0]).toMatchObject({ path: '/api/marketplace/update', body: { expected_updated_at_ms: 7, grants: ['message.reply'] } });
+});
+
+it.each([false, true])('取消最终%s安装/更新确认不写入且保留逐项授权与未签名选择', async update => {
+  if (update) selected.installed = { version: '0.9.0', saved_version: '0.9.0', loaded_version: '0.8.0', restart_required: true, enabled: true, updated_at_ms: 7, granted_permissions: ['message.reply'], runtime_state: 'ready' };
+  await mount(); await click('.market-list button');
+  await check('input[value="storage.private"]'); await check('.market-confirm input');
+  vi.mocked(window.confirm).mockReturnValue(false);
+  await click('.market-details .primary');
+  expect(posts).toHaveLength(0); expect(window.confirm).toHaveBeenCalledOnce();
+  expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining(`${update ? '更新' : '安装'}未签名插件`));
+  expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('1.0.0'));
+  expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('新增授权：storage.private'));
+  expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining(`保留授权：${update ? 'message.reply' : '无'}`));
+  expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('重启 Bot'));
+  expect(get<HTMLInputElement>('input[value="storage.private"]').checked).toBe(true);
+  expect(get<HTMLInputElement>('.market-confirm input').checked).toBe(true);
+  expect(get<HTMLFieldSetElement>('fieldset').disabled).toBe(false);
+  expect(busy).toHaveBeenLastCalledWith(false); expect(installed).not.toHaveBeenCalled();
+  expect(document.body.textContent).not.toContain('本次选择已结束');
+  vi.mocked(window.confirm).mockReturnValue(true);
+  await click('.market-details .primary');
+  expect(posts).toEqual([{ path: `/api/marketplace/${update ? 'update' : 'install'}`, body: {
+    selector: 'ping', selection: 'b'.repeat(64), version: '1.0.0', sha256: 'a'.repeat(64),
+    expected_updated_at_ms: update ? 7 : null, grants: ['storage.private'], confirm_unsigned: true,
+  } }]);
+});
+
+it('确认框显示期间的重入点击不会产生第二个框或重复写入', async () => {
+  await mount(); await click('.market-list button'); await check('.market-confirm input');
+  vi.mocked(window.confirm).mockImplementation(() => { get<HTMLButtonElement>('.market-details .primary').click(); return true; });
+  await click('.market-details .primary');
+  expect(window.confirm).toHaveBeenCalledOnce(); expect(posts).toHaveLength(1);
 });

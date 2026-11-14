@@ -49,12 +49,17 @@ async function closeDetails() {
 async function install() {
   const item = selected.value;
   if (!item || !confirmed.value || stale.value || installing.value || !item.manageable) return;
-  installing.value = true; emit('busy', true); error.value = ''; message.value = '';
+  installing.value = true; emit('busy', true);
+  const body = {
+    selector: item.slug, selection: item.selection, version: item.latest.version, sha256: item.latest.sha256,
+    expected_updated_at_ms: item.installed?.updated_at_ms ?? null, grants: [...grants.value], confirm_unsigned: confirmed.value,
+  };
   try {
-    const result = await props.request<InstallResult>(`/api/marketplace/${item.installed ? 'update' : 'install'}`, {
-      selector: item.slug, selection: item.selection, version: item.latest.version, sha256: item.latest.sha256,
-      expected_updated_at_ms: item.installed?.updated_at_ms ?? null, grants: grants.value, confirm_unsigned: confirmed.value,
-    });
+    const retained = item.capabilities.filter(capability => item.installed?.granted_permissions.includes(capability));
+    const action = item.installed ? '更新' : '安装';
+    if (!window.confirm(`确认${action}未签名插件「${item.name}」(${item.plugin_id}) 至 ${body.version}？\n新增授权：${body.grants.join('、') || '无'}\n保留授权：${retained.join('、') || '无'}\n保存后需要重启 Bot 才会加载；当前运行实例不会立即切换。`)) return;
+    error.value = ''; message.value = '';
+    const result = await props.request<InstallResult>(`/api/marketplace/${item.installed ? 'update' : 'install'}`, body);
     if (alive) {
       stale.value = true; confirmed.value = false;
       const updated: CatalogueItem = { ...item, installed: { version: result.version, saved_version: result.version, loaded_version: result.loaded_version, restart_required: result.restart_required, enabled: result.enabled,
