@@ -28,3 +28,5 @@
   .notification-toasts { top: 80px; right: 16px; max-height: calc(100dvh - 96px); }
   .notification-history { top: 72px; max-height: calc(100dvh - 88px); }
 }
+
+.notification-action { max-width: 100%; min-height: 44px; white-space: normal; overflow-wrap: anywhere; margin-top: 8px; }

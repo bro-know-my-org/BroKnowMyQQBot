@@ -1,8 +1,24 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import type { NotificationCenter, NoticeSurface, NoticeTone } from '../notifications';
+import { inject, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { isNavigationFailure, NavigationFailureType, routerKey } from 'vue-router';
+import { noticeActionLabel, noticeActionRoute } from '../noticeActions';
+import type { NoticeEntry, NotificationCenter, NoticeSurface, NoticeTone } from '../notifications';
 import '../notifications.css';
 const props = defineProps<{ center: NotificationCenter }>();
+const router = inject(routerKey, undefined);
+const navigating = ref(false), navigationError = ref<{ id: number; message: string } | null>(null);
+async function navigate(entry: NoticeEntry) {
+  const route = noticeActionRoute(entry.action);
+  if (!route || !router || navigating.value) return;
+  navigating.value = true; navigationError.value = null;
+  try {
+    const failure = await router.push(route);
+    if (!alive || !props.center.state.history.some(item => item.id === entry.id)) return;
+    if (!failure || isNavigationFailure(failure, NavigationFailureType.duplicated)) { props.center.markRead(entry.id); if (props.center.state.open) await close(); }
+    else navigationError.value = { id: entry.id, message: '页面未切换，请先完成操作或处理未保存编辑。' };
+  } catch { if (alive) navigationError.value = { id: entry.id, message: '暂时无法打开目标页面，请重试。' }; }
+  finally { if (alive) navigating.value = false; }
+}
 const closeButton = ref<HTMLButtonElement>();
 const toasts = ref<HTMLElement>(), history = ref<HTMLElement>();
 const observed = new Map<Element, { id: number; surface: NoticeSurface }>();
@@ -69,6 +85,8 @@ onBeforeUnmount(() => {
     <article v-for="entry in center.state.active" :key="entry.id" :data-notification-id="entry.id" class="notification-toast" :class="`notification-${entry.tone}`" @mouseenter="center.setPaused(entry.id, 'pointer', true)" @mouseleave="center.setPaused(entry.id, 'pointer', false)" @focusin="center.setPaused(entry.id, 'focus', true)" @focusout="focusOut(entry.id, $event)">
       <div class="notification-heading"><strong><span aria-hidden="true">{{ marks[entry.tone] }}</span> {{ labels[entry.tone] }}</strong><button type="button" class="notification-close" aria-label="关闭通知" @click="center.dismiss(entry.id)">×</button></div>
       <p :role="entry.tone === 'error' ? 'alert' : 'status'" aria-atomic="true">{{ entry.message }}</p>
+      <p v-if="navigationError?.id === entry.id" role="status">{{ navigationError.message }}</p>
+      <button v-if="entry.action" type="button" class="notification-action" :aria-disabled="navigating || undefined" @click="navigate(entry)">{{ noticeActionLabel(entry.action) }}</button>
       <small>{{ entry.source }} · {{ entry.tone === 'info' || entry.tone === 'success' ? '停留时暂停，关闭后可在历史查看' : '请手动关闭' }}</small>
     </article>
   </section>
@@ -77,7 +95,7 @@ onBeforeUnmount(() => {
     <p class="hint">本标签页最近 100 条操作通知，刷新后保留，退出后清空；并非服务器通知。</p>
     <div class="notification-history-actions"><button type="button" :disabled="!center.unread.value" @click="center.markAllRead">全部已读</button><button type="button" :disabled="!center.state.history.length" @click="center.clearHistory">清空历史</button></div>
     <ol v-if="center.state.history.length" class="notification-history-list">
-      <li v-for="entry in center.state.history" :key="entry.id" :data-notification-id="entry.id"><div class="notification-heading"><strong><span aria-hidden="true">{{ marks[entry.tone] }}</span> {{ labels[entry.tone] }}<span v-if="entry.unread"> · 未读</span></strong><time :datetime="new Date(entry.createdAt).toISOString()">{{ time(entry.createdAt) }}</time></div><p>{{ entry.message }}</p><small>{{ entry.source }}</small></li>
+      <li v-for="entry in center.state.history" :key="entry.id" :data-notification-id="entry.id"><div class="notification-heading"><strong><span aria-hidden="true">{{ marks[entry.tone] }}</span> {{ labels[entry.tone] }}<span v-if="entry.unread"> · 未读</span></strong><time :datetime="new Date(entry.createdAt).toISOString()">{{ time(entry.createdAt) }}</time></div><p>{{ entry.message }}</p><p v-if="navigationError?.id === entry.id" role="status">{{ navigationError.message }}</p><button v-if="entry.action" type="button" class="notification-action" :aria-disabled="navigating || undefined" @click="navigate(entry)">{{ noticeActionLabel(entry.action) }}</button><small>{{ entry.source }}</small></li>
     </ol>
     <p v-else class="notification-history-empty">暂无历史通知</p>
   </aside>

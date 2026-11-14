@@ -1,4 +1,5 @@
 import type { NoticeEntry } from './notifications';
+import { readNoticeAction, readNoticeKey } from './noticeActions';
 
 export const NOTICE_STORAGE_KEY = 'bkmqb.notice-history.v1';
 const MAX_PAYLOAD = 512 * 1024;
@@ -12,7 +13,8 @@ function entry(value: unknown): NoticeEntry | undefined {
     || !Number.isSafeInteger(v.createdAt) || Number(v.createdAt) < 0 || Number(v.createdAt) > 8640000000000000) return;
   // No API objects, tokens, clocks, progress or extra properties enter storage.
   const safe = (s: string) => s.replace(/\b(?:bearer\s+\S+|(?:token|secret|password|authorization|api[_-]?key)\s*[:=]\s*[^\s,;]+)/gi, '[REDACTED]');
-  return { id: Number(v.id), source: safe(v.source), message: safe(v.message), tone: v.tone as NoticeEntry['tone'], createdAt: Number(v.createdAt), unread: v.unread };
+  const action = readNoticeAction(v.action), key = readNoticeKey(v.key);
+  return { ...(action ? { action } : {}), ...(key ? { key } : {}), id: Number(v.id), source: safe(v.source), message: safe(v.message), tone: v.tone as NoticeEntry['tone'], createdAt: Number(v.createdAt), unread: v.unread };
 }
 
 export function noticeStorage(access: () => Storage = () => window.sessionStorage) {
