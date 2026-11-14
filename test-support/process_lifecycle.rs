@@ -478,3 +478,213 @@ async fn automatically_allocated_management_port_is_retained_across_real_exec() 
     let _: Value = response.json().await.unwrap();
     fixture.exited().await;
 }
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One isolated export-to-new-boot acceptance scenario.
+async fn logical_backup_restore_preserves_target_history_and_host() {
+    use base64::Engine as _;
+    let mut f = Fixture::start_with_options("token", true).await;
+    let cookie = f.login(TOKEN).await;
+    let boot = f.ready(None).await["boot_id"].as_str().unwrap().to_owned();
+    let pid = f.child.id();
+    let address = f.base.clone();
+    let database = f.root.join("data/plugins.db");
+    let store = plugin_host::PluginStore::open(&database).unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(include_str!("wasm-plugins/ping/component.bkm-plugin.b64").trim())
+        .unwrap();
+    let package = plugin_host::ValidatedPluginPackage::from_bytes(&bytes).unwrap();
+    let manifest = package.manifest();
+    let path = f.root.join("original.bkm-plugin");
+    fs::write(&path, &bytes).unwrap();
+    let item=serde_json::from_value(json!({"plugin_id":manifest.id,"metadata":manifest.metadata,"instance_id":"dev.bkm.wasm-ping/offline","version":manifest.version,"package_path":path,"package_sha256":package.package_sha256(),"source":"local","trust_level":"local-wasm","signature_status":"unsigned","requested_permissions":manifest.requested_capabilities(),"granted_permissions":manifest.requested_capabilities(),"config":{},"enabled":false,"installed_at_ms":1,"updated_at_ms":1})).unwrap();
+    store.upsert_installation(&item).unwrap();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO plugin_state VALUES ('dev.bkm.counter/default','backup-fixture',?,1)",
+            [b"saved-business-data".as_slice()],
+        )
+        .unwrap();
+    connection.execute_batch("INSERT INTO command_ledger VALUES ('dev.bkm.counter/default','source','source-only','source-key','fixture',X'00','succeeded',NULL); INSERT INTO scheduled_tasks VALUES ('dev.bkm.counter/default','source-only','mock',9223372036854775807,X'00','completed'); INSERT INTO plugin_deliveries(instance_id,event_id,delivery_id,invocation_id,attempt,envelope,origin,status,next_attempt_ms,updated_at_ms) VALUES ('dev.bkm.counter/default','source-only','source-delivery','source',0,X'00',X'00','delivered',0,0);").unwrap();
+    let artifact: Value = f
+        .client
+        .post(format!("{}/api/backups", f.base))
+        .header("Cookie", &cookie)
+        .json(&json!({"confirm_sensitive_plugin_data":true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let response = f
+        .client
+        .get(format!(
+            "{}/api/backups/{}",
+            f.base,
+            artifact["id"].as_str().unwrap()
+        ))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let archive = response.bytes().await.unwrap();
+    store
+        .remove_installation("dev.bkm.wasm-ping/offline")
+        .unwrap();
+    fs::remove_file(&path).unwrap();
+    connection
+        .execute(
+            "UPDATE plugin_state SET value=?,revision=2 WHERE key='backup-fixture'",
+            [b"changed-business-data".as_slice()],
+        )
+        .unwrap();
+    connection.execute_batch("DELETE FROM command_ledger WHERE command_id='source-only'; DELETE FROM scheduled_tasks; DELETE FROM plugin_deliveries; INSERT INTO command_ledger VALUES ('dev.bkm.counter/default','target','target-only','target-key','fixture',X'00','succeeded',NULL); INSERT INTO scheduled_tasks VALUES ('dev.bkm.counter/default','target-pending','mock',9223372036854775807,X'00','pending');").unwrap();
+    drop((connection, store));
+    let current = configuration(0, f.onebot, "!!")
+        .replace("auth=\"token\"", "auth=\"token\"\nauto_port=true")
+        .replace("directory=\"logs\"", "directory=\"current-logs\"");
+    fs::write(
+        f.root.join("bot.toml"),
+        format!("# retain current host\n{current}"),
+    )
+    .unwrap();
+    let plan: Value = f
+        .client
+        .post(format!("{}/api/restores/inspect", f.base))
+        .timeout(Duration::from_secs(30))
+        .header("Cookie", &cookie)
+        .header("content-type", "application/octet-stream")
+        .body(archive)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = plan["operation_id"].as_str().unwrap();
+    assert_eq!(plan["settings_before"]["commands"]["prefix"], "!!");
+    assert_eq!(plan["settings_after"]["commands"]["prefix"], "/");
+    let imported = plan["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["instance_id"] == "dev.bkm.wasm-ping/offline")
+        .unwrap();
+    assert!(imported["retained_grants"].as_array().unwrap().is_empty());
+    let response=f.client.post(format!("{}/api/restores/{id}/commit",f.base)).header("Cookie",&cookie).json(&json!({"expected_boot_id":boot,"confirm_sensitive_plugin_data":true,"confirm_unsigned_disabled":true})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let next = f.ready(Some(&boot)).await;
+    assert_eq!(f.child.id(), pid);
+    assert_eq!(f.base, address);
+    assert_eq!(next["mode"], "token");
+    assert_eq!(f.cookie_session(&cookie).await["authenticated"], true);
+    let outcome: Value = f
+        .client
+        .get(format!("{}/api/restores/{id}/outcome", f.base))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(outcome["status"], "applied");
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(f.root.join("bot.toml")).unwrap()).unwrap();
+    assert_eq!(config["commands"]["prefix"].as_str(), Some("/"));
+    assert_eq!(config["management"]["auth"].as_str(), Some("token"));
+    assert_eq!(config["management"]["listen"].as_str(), Some("127.0.0.1:0"));
+    assert_eq!(config["management"]["auto_port"].as_bool(), Some(true));
+    assert_eq!(
+        config["plugins"]["database"].as_str(),
+        Some("data/plugins.db")
+    );
+    assert_eq!(
+        config["logging"]["files"]["directory"].as_str(),
+        Some("current-logs")
+    );
+    let store = plugin_host::PluginStore::open(&database).unwrap();
+    assert_eq!(
+        store
+            .state_get("dev.bkm.counter/default", "backup-fixture")
+            .unwrap()
+            .unwrap()
+            .value,
+        b"saved-business-data"
+    );
+    let imported = store
+        .installation("dev.bkm.wasm-ping/offline")
+        .unwrap()
+        .unwrap();
+    assert!(!imported.enabled);
+    assert!(imported.granted_permissions.is_empty());
+    assert_eq!(imported.signature_status, "unsigned");
+    assert!(std::path::Path::new(&imported.package_path).is_file());
+    assert_ne!(std::path::Path::new(&imported.package_path), path);
+    assert_eq!(fs::read(&imported.package_path).unwrap(), bytes);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    for table in ["command_ledger", "scheduled_tasks", "plugin_deliveries"] {
+        let count: i64 = connection
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table} WHERE {}='source-only'",
+                    if table == "command_ledger" {
+                        "command_id"
+                    } else if table == "scheduled_tasks" {
+                        "task_id"
+                    } else {
+                        "event_id"
+                    }
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "source execution history must stay excluded: {table}"
+        );
+    }
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM command_ledger WHERE command_id='target-only'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "succeeded");
+    let status: String = connection
+        .query_row(
+            "SELECT status FROM scheduled_tasks WHERE task_id='target-pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "cancelled");
+    let sends: i64 = connection
+        .query_row("SELECT COUNT(*) FROM command_outbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sends, 0);
+    drop((connection, store));
+    let response = f
+        .client
+        .post(format!("{}/api/stop", f.base))
+        .header("Cookie", &cookie)
+        .json(&json!({"expected_boot_id":next["boot_id"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    f.exited().await;
+}

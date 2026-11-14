@@ -558,3 +558,7 @@ mod tests {
         assert!(!intents.intersects(special_intents));
     }
 }
+
+#[cfg(test)]
+#[path = "bootstrap/restore_tests.rs"]
+mod restore_tests;
