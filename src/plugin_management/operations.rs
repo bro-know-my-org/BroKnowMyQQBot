@@ -38,7 +38,7 @@ impl PluginManager {
         .map_err(|_| ManagementError::Store)?
     }
 
-    async fn operation_lock(&self, id: &str) -> Result<std::fs::File, ManagementError> {
+    pub(super) async fn operation_lock(&self, id: &str) -> Result<std::fs::File, ManagementError> {
         let context = self.marketplace_context()?.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {

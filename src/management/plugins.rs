@@ -83,6 +83,10 @@ pub(super) fn router_with_runtime(
         .route("/api/marketplace", get(super::marketplace::list))
         .route("/api/marketplace/details", get(super::marketplace::details))
         .route("/api/plugins", get(list))
+        .route(
+            "/api/plugins/permissions",
+            get(super::permissions::get).post(super::permissions::save),
+        )
         .route("/api/plugins/config", post(save_config))
         .route("/api/plugins/enabled", post(save_enabled))
         .route("/api/plugins/apply", post(apply))
