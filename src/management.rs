@@ -99,7 +99,7 @@ pub(crate) async fn serve(
         shutdown.cancelled().await;
         return Ok(());
     }
-    let auth = auth::AuthState::from_config(&config)?;
+    let mut auth = auth::AuthState::from_config(&config)?;
     auth.resume_restart();
     let listener = listener::bind(&config).await?;
     let listen = listener.local_addr()?;

@@ -178,7 +178,7 @@ async fn none_mode_requires_loopback_host_but_no_token() {
         let status = json(call(app.clone(), "GET", "/api/session", &headers, "").await).await;
         assert_eq!(status["mode"], "none");
         assert_eq!(status["authenticated"], true);
-    assert_eq!(status["boot_id"], crate::restart::boot_id());
+        assert_eq!(status["boot_id"], crate::restart::boot_id());
         assert_eq!(status["history_scope"].as_str().unwrap().len(), 64);
     }
     for headers in [

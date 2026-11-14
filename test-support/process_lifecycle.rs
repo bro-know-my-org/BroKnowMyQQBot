@@ -27,13 +27,16 @@ impl Fixture {
         Self::start_with_auth("none").await
     }
     async fn start_with_auth(auth: &str) -> Self {
+        Self::start_with_options(auth, false).await
+    }
+    async fn start_with_options(auth: &str, auto_port: bool) -> Self {
         for _ in 0..3 {
-            let mut fixture = Self::spawn(auth);
+            let mut fixture = Self::spawn(auth, auto_port);
             for _ in 0..150 {
                 if fixture.child.try_wait().unwrap().is_some() {
                     break;
                 }
-                if fixture.session().await.is_ok() {
+                if fixture.discover_management() && fixture.session().await.is_ok() {
                     return fixture;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -41,7 +44,7 @@ impl Fixture {
         }
         panic!("isolated fixture could not bind after three attempts");
     }
-    fn spawn(auth: &str) -> Self {
+    fn spawn(auth: &str, auto_port: bool) -> Self {
         let root = std::env::temp_dir().join(format!("bkmqb-lifecycle-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let management_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -49,7 +52,14 @@ impl Fixture {
         let management = management_reservation.local_addr().unwrap().port();
         let onebot = onebot_reservation.local_addr().unwrap().port();
         let config = root.join("bot.toml");
-        fs::write(&config, configuration(management, onebot, "/")).unwrap();
+        fs::write(
+            &config,
+            configuration(management, onebot, "/").replace(
+                "auth=\"token\"",
+                &format!("auth=\"token\"\nauto_port={auto_port}"),
+            ),
+        )
+        .unwrap();
         let secrets = root.join("secrets.env");
         fs::write(
             &secrets,
@@ -84,6 +94,50 @@ impl Fixture {
                 .build()
                 .unwrap(),
         }
+    }
+    fn discover_management(&mut self) -> bool {
+        use std::io::Read as _;
+        let Ok(months) = fs::read_dir(self.root.join("logs/runtime")) else {
+            return false;
+        };
+        for month in months.take(4).filter_map(Result::ok) {
+            let Ok(files) = fs::read_dir(month.path()) else {
+                continue;
+            };
+            for file in files.take(16).filter_map(Result::ok) {
+                if file.path().extension().is_none_or(|ext| ext != "jsonl") {
+                    continue;
+                }
+                let mut text = String::new();
+                let Ok(handle) = fs::File::open(file.path()) else {
+                    continue;
+                };
+                if handle.take(64 * 1024).read_to_string(&mut text).is_err() {
+                    continue;
+                }
+                for line in text.lines() {
+                    let Ok(row) = serde_json::from_str::<Value>(line) else {
+                        continue;
+                    };
+                    if row["message"] != "management server listening" {
+                        continue;
+                    }
+                    let Some(address) = row["listen"]
+                        .as_str()
+                        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+                    else {
+                        continue;
+                    };
+                    if !address.ip().is_loopback() {
+                        continue;
+                    }
+                    self.management = address.port();
+                    self.base = format!("http://{address}");
+                    return true;
+                }
+            }
+        }
+        false
     }
     async fn session(&self) -> Result<Value, reqwest::Error> {
         self.client
@@ -296,6 +350,7 @@ async fn only_initiator_cookie_resumes_on_exec_and_rotating_file_token_invalidat
         );
     }
     let cookie = fixture.login(TOKEN).await;
+    let scope = fixture.cookie_session(&cookie).await["history_scope"].clone();
     let other = fixture.login(TOKEN).await;
     let mut stream = fixture
         .client
@@ -325,6 +380,10 @@ async fn only_initiator_cookie_resumes_on_exec_and_rotating_file_token_invalidat
         .unwrap()
         .to_owned();
     assert_eq!(fixture.cookie_session(&cookie).await["authenticated"], true);
+    assert_eq!(
+        fixture.cookie_session(&cookie).await["history_scope"],
+        scope
+    );
     assert_eq!(fixture.cookie_session(&other).await["authenticated"], false);
     let bearer = fixture
         .client
@@ -372,6 +431,46 @@ async fn only_initiator_cookie_resumes_on_exec_and_rotating_file_token_invalidat
         .post(format!("{}/api/stop", fixture.base))
         .header("Cookie", &cookie)
         .json(&json!({"expected_boot_id":last}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let _: Value = response.json().await.unwrap();
+    fixture.exited().await;
+}
+
+#[tokio::test]
+async fn automatically_allocated_management_port_is_retained_across_real_exec() {
+    let mut fixture = Fixture::start_with_options("token", true).await;
+    let boot = fixture.ready(None).await["boot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let port = fixture.management;
+    let pid = fixture.child.id();
+    let cookie = fixture.login(TOKEN).await;
+    let response = fixture
+        .client
+        .post(format!("{}/api/restart", fixture.base))
+        .header("Cookie", &cookie)
+        .json(&json!({"expected_boot_id":boot}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let _: Value = response.json().await.unwrap();
+    let next = fixture.ready(Some(&boot)).await["boot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(fixture.management, port);
+    assert_eq!(fixture.child.id(), pid);
+    assert_eq!(fixture.cookie_session(&cookie).await["authenticated"], true);
+    let response = fixture
+        .client
+        .post(format!("{}/api/stop", fixture.base))
+        .header("Cookie", &cookie)
+        .json(&json!({"expected_boot_id":next}))
         .send()
         .await
         .unwrap();

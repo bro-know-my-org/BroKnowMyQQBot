@@ -16,6 +16,7 @@ const MAX_BYTES: usize = 512;
 #[serde(deny_unknown_fields)]
 struct Payload {
     process_id: u32,
+    notice_epoch: String,
     session: String,
     token: String,
     consume_before_ms: u64,
@@ -24,14 +25,19 @@ struct Payload {
 
 pub(crate) struct SessionHandoff {
     auth: AuthState,
-    digest: [u8; 32],
+    digest: Option<[u8; 32]>,
     payload: Payload,
 }
 impl SessionHandoff {
     pub(crate) fn encode(&self) -> Option<String> {
         // Logout, replacement login and expiration during drain still revoke it.
-        let expires = self.auth.sessions.lock().ok()?.get(&self.digest).copied()?;
-        if expires <= Instant::now() || self.payload.consume_before_ms <= now_ms()? {
+        if let Some(digest) = self.digest {
+            let expires = self.auth.sessions.lock().ok()?.get(&digest).copied()?;
+            if expires <= Instant::now() {
+                return None;
+            }
+        }
+        if self.payload.consume_before_ms <= now_ms()? {
             return None;
         }
         serde_json::to_string(&self.payload).ok()
@@ -51,13 +57,24 @@ impl AuthState {
         &self,
         headers: &HeaderMap,
     ) -> Option<SessionHandoff> {
-        let expected = self.expected?;
         if self.bearer_valid(headers) {
             return None;
         }
-        let digest = session_digest(headers)?;
-        let expires = self.sessions.lock().ok()?.get(&digest).copied()?;
-        let remaining = expires.checked_duration_since(Instant::now())?;
+        let digest = if self.expected.is_some() {
+            Some(session_digest(headers)?)
+        } else {
+            None
+        };
+        let remaining = if let Some(digest) = digest {
+            self.sessions
+                .lock()
+                .ok()?
+                .get(&digest)
+                .copied()?
+                .checked_duration_since(Instant::now())?
+        } else {
+            Duration::from_millis(WINDOW_MS)
+        };
         let wall_now = now_ms()?;
         let expires_at_ms = wall_now.checked_add(remaining.as_millis().try_into().ok()?)?;
         Some(SessionHandoff {
@@ -65,14 +82,15 @@ impl AuthState {
             digest,
             payload: Payload {
                 process_id: std::process::id(),
-                session: hex::encode(digest),
-                token: hex::encode(expected),
+                notice_epoch: self.notice_epoch.to_string(),
+                session: digest.map(hex::encode).unwrap_or_default(),
+                token: self.expected.map(hex::encode).unwrap_or_default(),
                 consume_before_ms: wall_now.checked_add(WINDOW_MS)?.min(expires_at_ms),
                 expires_at_ms,
             },
         })
     }
-    pub(in crate::management) fn resume_restart(&self) {
+    pub(in crate::management) fn resume_restart(&mut self) {
         static CONSUMED: AtomicBool = AtomicBool::new(false);
         if CONSUMED.swap(true, Ordering::SeqCst) {
             return;
@@ -81,17 +99,17 @@ impl AuthState {
             self.accept_handoff(&value);
         }
     }
-    fn accept_handoff(&self, value: &str) {
-        let Some(expected) = self.expected else {
-            return;
-        };
+    fn accept_handoff(&mut self, value: &str) {
         if value.len() > MAX_BYTES {
             return;
         }
         let Ok(payload) = serde_json::from_str::<Payload>(value) else {
             return;
         };
-        if payload.process_id != std::process::id() {
+        if payload.process_id != std::process::id()
+            || payload.notice_epoch.len() != 36
+            || uuid::Uuid::parse_str(&payload.notice_epoch).is_err()
+        {
             return;
         }
         let Some(now) = now_ms() else {
@@ -110,6 +128,13 @@ impl AuthState {
         {
             return;
         }
+        // None-mode has no login to restore; only preserve its notification scope.
+        let Some(expected) = self.expected else {
+            if payload.token.is_empty() && payload.session.is_empty() {
+                self.notice_epoch = payload.notice_epoch.into();
+            }
+            return;
+        };
         let Ok(token) = hex::decode(&payload.token) else {
             return;
         };
@@ -125,6 +150,7 @@ impl AuthState {
         }
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.insert(session, Instant::now() + Duration::from_millis(remaining));
+            self.notice_epoch = payload.notice_epoch.into();
         }
     }
 }
@@ -152,17 +178,40 @@ mod tests {
         let handoff = auth.restart_session(&headers).unwrap();
         let encoded = handoff.encode().unwrap();
         assert!(!encoded.contains(&id));
-        let restored: AuthState = [1; 32].into();
+        let mut restored: AuthState = [1; 32].into();
         restored.accept_handoff(&encoded);
         assert!(restored.authenticated(&headers));
+        assert_eq!(restored.notice_epoch, auth.notice_epoch);
         let ordinary: AuthState = [1; 32].into();
         assert!(!ordinary.authenticated(&headers));
-        let rotated: AuthState = [2; 32].into();
+        let mut rotated: AuthState = [2; 32].into();
         rotated.accept_handoff(&encoded);
         assert!(!rotated.authenticated(&headers));
         auth.sessions.lock().unwrap().clear();
         assert!(handoff.encode().is_none());
     }
+    #[test]
+    fn none_mode_preserves_notice_scope_only_and_auth_mode_changes_invalidate_it() {
+        let config = crate::config::ManagementConfig {
+            auth: crate::config::ManagementAuth::None,
+            ..Default::default()
+        };
+        let auth = AuthState::from_config(&config).unwrap();
+        let encoded = auth
+            .restart_session(&HeaderMap::new())
+            .unwrap()
+            .encode()
+            .unwrap();
+        let mut restored = AuthState::from_config(&config).unwrap();
+        restored.accept_handoff(&encoded);
+        assert_eq!(restored.notice_epoch, auth.notice_epoch);
+        assert!(restored.sessions.lock().unwrap().is_empty());
+        let (mut token_mode, _, _) = fixture();
+        let previous = token_mode.notice_epoch.clone();
+        token_mode.accept_handoff(&encoded);
+        assert_eq!(token_mode.notice_epoch, previous);
+    }
+
     #[test]
     fn expired_malformed_and_unbounded_handoffs_are_rejected() {
         let (auth, headers, _) = fixture();
@@ -174,11 +223,11 @@ mod tests {
         ] {
             let mut payload: serde_json::Value = serde_json::from_str(&encoded).unwrap();
             payload[key] = value.into();
-            let restored: AuthState = [1; 32].into();
+            let mut restored: AuthState = [1; 32].into();
             restored.accept_handoff(&payload.to_string());
             assert!(!restored.authenticated(&headers));
         }
-        let restored: AuthState = [1; 32].into();
+        let mut restored: AuthState = [1; 32].into();
         for invalid in ["x".repeat(MAX_BYTES + 1), "{}".to_owned()] {
             restored.accept_handoff(&invalid);
         }
