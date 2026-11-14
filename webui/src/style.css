@@ -21,13 +21,17 @@ body { margin: 0; font-size: 16px; line-height: 1.55; }
 a { color: inherit; text-underline-offset: 4px; }
 button, input, select, textarea { font: inherit; color: inherit; border-radius: 0; }
 button, .button-link { display: inline-flex; justify-content: center; align-items: center; gap: 8px; min-height: 44px; padding: 10px 16px; border: 1px solid var(--e-ink-rule); background: var(--e-ink-paper); cursor: pointer; font-size: 14px; font-weight: 600; line-height: 1.4; text-decoration: none; }
-button:hover:enabled, .button-link:hover { background: var(--e-ink-panel); border-color: var(--e-ink-text); }
+button:not(.sidebar-backdrop):hover:enabled, .button-link:not([aria-disabled="true"]):hover { background: var(--e-ink-panel); border-color: var(--e-ink-text); }
 button.primary, .button-link.primary { background: var(--e-ink-text); border-color: var(--e-ink-text); color: var(--e-ink-paper); }
-button.primary:hover:enabled, .button-link.primary:hover { background: var(--e-ink-muted); }
-button:active:enabled, .button-link:active { background: var(--e-ink-rule); color: var(--e-ink-text); }
+button.primary:hover:enabled, .button-link.primary:not([aria-disabled="true"]):hover { background: var(--e-ink-muted); }
+button:not(:disabled):not([aria-disabled="true"]):not(.sidebar-backdrop):active,
+.button-link:not([aria-disabled="true"]):active { background: var(--e-ink-text); border-color: var(--e-ink-text); color: var(--e-ink-paper); }
+button.primary:not(:disabled):not([aria-disabled="true"]):active,
+.button-link.primary:not([aria-disabled="true"]):active { background: var(--e-ink-panel); border-color: var(--e-ink-text); color: var(--e-ink-text); }
 button.quiet { background: transparent; }
 button:disabled, input:disabled, select:disabled, textarea:disabled, fieldset:disabled { cursor: not-allowed; }
 button:disabled, input:disabled, select:disabled, textarea:disabled { opacity: .6; }
+.button-link[aria-disabled="true"] { cursor: not-allowed; opacity: .6; }
 :focus-visible { outline: 2px solid var(--e-ink-text); outline-offset: 2px; }
 input:not([type="checkbox"]), select, textarea { display: block; width: 100%; min-height: 44px; padding: 10px 12px; border: 1px solid var(--e-ink-rule); background: var(--e-ink-paper); }
 input::placeholder, textarea::placeholder { color: var(--e-ink-muted); opacity: 1; }
