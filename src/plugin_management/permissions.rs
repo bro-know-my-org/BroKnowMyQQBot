@@ -112,3 +112,7 @@ impl PluginManager {
         self.view(id).await
     }
 }
+
+#[cfg(test)]
+#[path = "permissions_tests.rs"]
+mod tests;

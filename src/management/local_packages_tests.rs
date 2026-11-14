@@ -300,3 +300,210 @@ async fn inspect_uses_real_http_auth_source_limits_and_never_installs() {
             .all(|p| serde_json::to_value(p).unwrap()["loaded_version"].is_null())
     );
 }
+
+fn package_with_required_config(fixture: &Fixture) -> Vec<u8> {
+    use std::io::Write as _;
+    let original =
+        plugin_host::ValidatedPluginPackage::from_path(&fixture.installation.package_path).unwrap();
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, bytes) in original.files() {
+        if name == "config.schema.json" {
+            continue;
+        }
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.start_file(
+        "config.schema.json",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zip.write_all(
+        br#"{"type":"object","required":["greeting"],"properties":{"greeting":{"type":"string"}}}"#,
+    )
+    .unwrap();
+    zip.start_file(
+        "fixture.bin",
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+    )
+    .unwrap();
+    zip.write_all(&vec![7; 1024 * 1024 + 1]).unwrap();
+    zip.finish().unwrap().into_inner()
+}
+
+#[tokio::test]
+async fn large_binary_route_ignores_false_length_and_missing_config_is_saved_disabled() {
+    let fixture = Fixture::new(false);
+    let manager = fixture
+        .manager()
+        .await
+        .with_marketplace(
+            fixture.directory.join("plugins.db"),
+            None,
+            crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+        )
+        .unwrap();
+    let app = router(manager.clone(), token_digest(TOKEN).unwrap());
+    let bytes = package_with_required_config(&fixture);
+    assert!(bytes.len() > 1024 * 1024);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/api/plugins/local/inspect")
+                .header("Authorization", format!("Bearer {TOKEN}"))
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", "1")
+                .body(Body::from(bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let checked: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    let mut body = commit_body(&checked, "dev.bkm.wasm-ping/config-required", None);
+    body["grants"] = checked["requested_permissions"].clone();
+    let (status, installed) = commit(&app, body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(installed["config_incomplete"], true);
+    assert_eq!(installed["enabled"], false);
+    let stored = fixture
+        .store
+        .installation("dev.bkm.wasm-ping/config-required")
+        .unwrap()
+        .unwrap();
+    assert!(!stored.enabled);
+    assert!(stored.config.is_empty());
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn uploads_share_the_existing_four_request_slots() {
+    let fixture = Fixture::new(false);
+    let app = router(fixture.manager().await, token_digest(TOKEN).unwrap());
+    let (ready, mut observed) = tokio::sync::mpsc::unbounded_channel();
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let ready = ready.clone();
+        let mut announced = false;
+        let stream = futures_util::stream::poll_fn(move |_| {
+            if !announced {
+                ready.send(()).unwrap();
+                announced = true;
+            }
+            std::task::Poll::Pending::<Option<Result<Vec<u8>, std::io::Error>>>
+        });
+        let app = app.clone();
+        held.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/api/plugins/config")
+                    .header("Authorization", format!("Bearer {TOKEN}"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+        }));
+    }
+    for _ in 0..4 {
+        tokio::time::timeout(std::time::Duration::from_secs(2), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let (status, _) = local_request(
+        &app,
+        "/api/plugins/local/inspect",
+        Body::from("invalid"),
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    for request in held {
+        request.abort();
+        let _ = request.await;
+    }
+}
+
+#[tokio::test]
+async fn auth_none_uploads_still_require_loopback_same_origin() {
+    use super::super::{auth::AuthState, plugins::router_with_logs};
+    let fixture = Fixture::new(false);
+    let config = crate::config::ManagementConfig {
+        auth: crate::config::ManagementAuth::None,
+        ..Default::default()
+    };
+    let auth = AuthState::from_config(&config).unwrap();
+    let app = router_with_logs(
+        fixture.manager().await,
+        auth,
+        crate::logging::live::LogBuffer::default(),
+    );
+    let bytes = std::fs::read(&fixture.installation.package_path).unwrap();
+    for (host, origin, expected) in [
+        ("localhost:52743", "http://localhost:52743", StatusCode::OK),
+        (
+            "localhost:52743",
+            "https://evil.example",
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "public.example:52743",
+            "http://public.example:52743",
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/plugins/local/inspect")
+                    .header("Host", host)
+                    .header("Origin", origin)
+                    .header("Content-Type", "application/octet-stream")
+                    .body(Body::from(bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(fixture.store.installations().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn local_update_cannot_replace_an_existing_different_identity() {
+    let fixture = Fixture::new(false);
+    let manager = fixture
+        .manager()
+        .await
+        .with_marketplace(
+            fixture.directory.join("plugins.db"),
+            None,
+            crate::plugin_marketplace::DEFAULT_MARKETPLACE_URL.to_owned(),
+        )
+        .unwrap();
+    let app = router(manager.clone(), token_digest(TOKEN).unwrap());
+    let bytes = std::fs::read(&fixture.installation.package_path).unwrap();
+    let checked = inspect(&app, &bytes).await;
+    let mut other = fixture.installation.clone();
+    other.plugin_id = "dev.different.identity".to_owned();
+    fixture.store.upsert_installation(&other).unwrap();
+    assert_eq!(
+        commit(&app, commit_body(&checked, &other.instance_id, Some(1)))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        fixture
+            .store
+            .installation(&other.instance_id)
+            .unwrap()
+            .unwrap(),
+        other
+    );
+    assert!(!fixture.directory.join("plugins").exists());
+    manager.shutdown().await.unwrap();
+}

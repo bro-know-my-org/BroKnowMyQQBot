@@ -283,7 +283,11 @@ impl Fixture {
     async fn rejecting_manager(&self, pause: Option<Pause>) -> PluginManager {
         self.rejecting_manager_inner(pause, false).await
     }
-    async fn rejecting_manager_inner(&self, pause: Option<Pause>, stop: bool) -> PluginManager {
+    pub(super) async fn rejecting_manager_inner(
+        &self,
+        pause: Option<Pause>,
+        stop: bool,
+    ) -> PluginManager {
         let mut host = StaticPluginHost::new(self.store.clone());
         let manifest = checked_package(&self.installation)
             .await
