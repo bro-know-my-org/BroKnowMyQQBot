@@ -19,6 +19,7 @@ const authenticated = ref(false), tokenInput = ref(''), plugins = shallowRef<Plu
 const authMode = ref<Session['mode']>('token'), checkingSession = ref(true), sessionFailed = ref(false);
 const pluginsFailed = ref(false), marketBusy = ref(false), marketReconcile = ref(false);
 const busy = ref(false), pluginDirty = ref(false), settingsDirty = ref(false), settingsBusy = ref(false), conflicts = ref(new Set<string>());
+const systemDirty = ref(false), systemBusy = ref(false);
 const notifications = createNotifications(); provide(notificationKey, notifications);
 const plugin = computed(() => plugins.value.find(p => p.instance_id === route.params.instanceId));
 const conflict = computed(() => !!plugin.value && conflicts.value.has(plugin.value.instance_id));
@@ -30,16 +31,16 @@ function logout(text = '', unloading = false) {
   if (!unloading) notifications.reset();
   api.clear(); epoch++; refreshAfterBusy = false; authenticated.value = false; tokenInput.value = ''; plugins.value = []; refreshedAt.value = '';
   busy.value = false; checkingSession.value = false; sessionFailed.value = false; pluginsFailed.value = false; authMode.value = 'token';
-  pluginDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
+  pluginDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; systemDirty.value = false; systemBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
 }
 const mayDiscard = (dirty: boolean) => !dirty || window.confirm('有未保存更改，是否放弃这些更改？');
 const removeGuard = router.beforeEach((to, from) => {
   if (!authenticated.value) return true;
-  if (busy.value || settingsBusy.value || marketBusy.value) { report('操作进行中，请等待完成后再切换页面。'); return false; }
+  if (busy.value || settingsBusy.value || systemBusy.value || marketBusy.value) { report('操作进行中，请等待完成后再切换页面。'); return false; }
   if (to.name === from.name && to.params.instanceId === from.params.instanceId) return true;
-  return mayDiscard(pluginDirty.value || settingsDirty.value);
+  return mayDiscard(pluginDirty.value || settingsDirty.value || systemDirty.value);
 });
-watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; settingsDirty.value = false; });
+watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; settingsDirty.value = false; systemDirty.value = false; });
 async function perform(task: () => Promise<void>, loading: string) {
   if (busy.value) return;
   const current = epoch; busy.value = true; report(loading, false, true);
@@ -79,7 +80,7 @@ function restoreSession() {
   }, '正在恢复登录状态…');
 }
 function signOut() {
-  if (busy.value || settingsBusy.value || marketBusy.value || !mayDiscard(pluginDirty.value || settingsDirty.value)) return;
+  if (busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || !mayDiscard(pluginDirty.value || settingsDirty.value || systemDirty.value)) return;
   void perform(async () => { await api.request<Session>('/api/session/logout', {}); logout(); }, '正在退出登录…');
 }
 // A lost response may finish later on the server. Keep reconciling on market
@@ -101,7 +102,7 @@ function mutate(change: Mutation) {
     } catch (e) { if (e instanceof ApiError && e.status === 409) conflicts.value.add(p.instance_id); throw e; }
   }, change.action === 'apply' ? '正在应用已保存设置…' : '正在保存设置…');
 }
-function beforeUnload(event: BeforeUnloadEvent) { if (pluginDirty.value || settingsDirty.value || busy.value || settingsBusy.value || marketBusy.value) { event.preventDefault(); event.returnValue = ''; } }
+function beforeUnload(event: BeforeUnloadEvent) { if (pluginDirty.value || settingsDirty.value || systemDirty.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value) { event.preventDefault(); event.returnValue = ''; } }
 const pageHide = () => { notifications.suspendSession(); logout('', true); };
 const pageShow = (event: PageTransitionEvent) => { if (event.persisted) restoreSession(); };
 onMounted(() => { window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
@@ -118,11 +119,11 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
       <p class="hint">登录后刷新页面可恢复会话。退出登录、会话过期或服务重启后需重新登录。</p>
     </main><footer class="login-footer">BKMQB — CONTROL PANEL</footer>
   </div>
-  <AppShell v-else :busy="busy || settingsBusy || marketBusy" :auth-mode="authMode" @logout="signOut">
+  <AppShell v-else :busy="busy || settingsBusy || systemBusy || marketBusy" :auth-mode="authMode" @logout="signOut">
     <button v-if="pluginsFailed" id="retry-plugins" type="button" :disabled="busy" @click="refresh">重试加载插件</button>
     <section v-if="!refreshedAt && route.meta.section === 'plugins'" class="panel empty-state" aria-live="polite"><h1 tabindex="-1">{{ pluginsFailed ? '插件状态暂不可用' : '正在读取插件状态' }}</h1><p>{{ pluginsFailed ? '尚未读取到插件列表，请重试加载。' : '正在连接管理服务，请稍候。' }}</p></section>
     <OverviewPage v-else-if="route.name === 'overview'" :plugins="plugins" :refreshed-at="refreshedAt" :busy="busy" :request="api.request" @refresh="refresh" />
-    <AdaptersPage v-else-if="route.name === 'adapters'" :request="api.request" />
+    <AdaptersPage v-else-if="route.name === 'adapters'" :request="api.request" :locked="busy" @dirty="systemDirty = $event" @busy="systemBusy = $event" />
     <template v-else-if="route.name === 'logs'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">运行 / LOGS</span><h1 tabindex="-1">日志</h1><p class="muted">查看最近运行记录，按级别和插件实例筛选。</p></div></div><LogsPage :request="api.request" :subscribe-logs="api.subscribeLogs" :plugins="plugins" /></template>
     <template v-else-if="route.name === 'plugins'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">插件 / INSTALLED</span><h1 tabindex="-1">已安装插件</h1><p class="muted">查看实例状态，进入插件管理配置。</p></div><div class="actions"><button id="refresh" type="button" :disabled="busy" @click="refresh">刷新状态</button><RouterLink :to="{ name: 'marketplace' }" class="button-link">浏览插件市场 ↗</RouterLink></div></div><PluginList :plugins="plugins" :busy="busy" /></template>
     <template v-else-if="route.meta.section === 'plugins'">

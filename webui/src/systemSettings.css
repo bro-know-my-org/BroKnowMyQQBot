@@ -1,0 +1,14 @@
+.system-settings { margin-top: 24px; }
+.system-settings .actions { margin-top: 24px; }
+.system-group { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--e-ink-rule); }
+.system-group legend { padding: 0 12px 0 0; font-weight: 700; }
+.system-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 16px 24px; }
+.system-fields > div { min-width: 0; }
+.system-fields label { overflow-wrap: anywhere; }
+.system-fields .system-checkbox { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-height: 44px; }
+.system-checkbox label { order: 1; margin: 0; flex: 1; min-height: 44px; display: flex; align-items: center; }
+.system-checkbox input { flex-shrink: 0; }
+.system-checkbox .hint { order: 2; flex: 1 1 100%; margin: 0; }
+.settings-copy { margin-top: 16px; }
+.settings-copy summary { min-height: 44px; cursor: pointer; padding: 12px 0; }
+.settings-copy textarea { white-space: pre; overflow: auto; max-height: 240px; }
