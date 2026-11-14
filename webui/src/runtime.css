@@ -1,0 +1,9 @@
+.runtime-panel { margin-bottom: 24px; }
+.runtime-values { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 24px; margin: 20px 0; }
+.runtime-values dt { color: var(--e-ink-muted); font-size: 13px; }
+.runtime-values dd { margin: 4px 0 0; font-family: var(--font-mono); font-size: 20px; overflow-wrap: anywhere; }
+.runtime-error { border-left: 3px solid var(--e-ink-text); padding-left: 12px; overflow-wrap: anywhere; }
+.adapter-row { border-top: 1px solid var(--e-ink-rule); padding: 16px 0; }
+.adapter-row h3 { margin: 0; font-size: 16px; overflow-wrap: anywhere; }
+.adapter-row .runtime-values { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 600px) { .runtime-values { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; } }

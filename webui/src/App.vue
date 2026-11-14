@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch }
 import { RouterLink, useRoute, useRouter } from 'vue-router';
 import AppShell from './components/AppShell.vue';
 import OverviewPage from './components/OverviewPage.vue';
+import AdaptersPage from './components/AdaptersPage.vue';
 import LogsPage from './components/LogsPage.vue';
 import UnavailablePage from './components/UnavailablePage.vue';
 import MarketplacePage from './components/MarketplacePage.vue';
@@ -117,8 +118,9 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
   </div>
   <AppShell v-else :busy="busy || settingsBusy || marketBusy" :auth-mode="authMode" @logout="signOut">
     <button v-if="pluginsFailed" id="retry-plugins" type="button" :disabled="busy" @click="refresh">重试加载插件</button>
-    <section v-if="!refreshedAt && (route.name === 'overview' || route.meta.section === 'plugins')" class="panel empty-state" aria-live="polite"><h1 tabindex="-1">{{ pluginsFailed ? '插件状态暂不可用' : '正在读取插件状态' }}</h1><p>{{ pluginsFailed ? '尚未读取到插件列表，请重试加载。' : '正在连接管理服务，请稍候。' }}</p></section>
-    <OverviewPage v-else-if="route.name === 'overview'" :plugins="plugins" :refreshed-at="refreshedAt" :busy="busy" @refresh="refresh" />
+    <section v-if="!refreshedAt && route.meta.section === 'plugins'" class="panel empty-state" aria-live="polite"><h1 tabindex="-1">{{ pluginsFailed ? '插件状态暂不可用' : '正在读取插件状态' }}</h1><p>{{ pluginsFailed ? '尚未读取到插件列表，请重试加载。' : '正在连接管理服务，请稍候。' }}</p></section>
+    <OverviewPage v-else-if="route.name === 'overview'" :plugins="plugins" :refreshed-at="refreshedAt" :busy="busy" :request="api.request" @refresh="refresh" />
+    <AdaptersPage v-else-if="route.name === 'adapters'" :request="api.request" />
     <template v-else-if="route.name === 'logs'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">运行 / LOGS</span><h1 tabindex="-1">日志</h1><p class="muted">查看最近运行记录，按级别和插件实例筛选。</p></div></div><LogsPage :request="api.request" :subscribe-logs="api.subscribeLogs" :plugins="plugins" /></template>
     <template v-else-if="route.name === 'plugins'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">插件 / INSTALLED</span><h1 tabindex="-1">已安装插件</h1><p class="muted">查看实例状态，进入插件管理配置。</p></div><div class="actions"><button id="refresh" type="button" :disabled="busy" @click="refresh">刷新状态</button><RouterLink :to="{ name: 'marketplace' }" class="button-link">浏览插件市场 ↗</RouterLink></div></div><PluginList :plugins="plugins" :busy="busy" /></template>
     <template v-else-if="route.meta.section === 'plugins'">

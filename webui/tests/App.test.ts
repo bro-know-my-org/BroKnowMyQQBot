@@ -4,6 +4,7 @@ import type { RouteLocationRaw } from 'vue-router';
 import App from '../src/App.vue';
 import { createManagementRouter, pluginRoute } from '../src/navigation';
 import type { Commands, Config, PluginView } from '../src/types';
+import { runtimeFixture } from './runtimeFixture';
 
 const fixture = (overrides: Partial<PluginView> = {}): PluginView => ({
   instance_id: 'sample', plugin_id: 'dev.bkm.sample', name: '<img src=x onerror=alert(1)>', description: '测试插件', version: '1.0', source: 'local', trust_level: 'local-wasm', signature_status: 'unsigned',
@@ -25,6 +26,7 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
     return new Response(JSON.stringify({ mode: sessionMode, authenticated: sessionMode === 'none' || sessionAuthenticated }));
   }
   if (!sessionAuthenticated && sessionMode !== 'none') return new Response('{}', { status: 401 });
+  if (path === '/api/runtime') return new Response(JSON.stringify(runtimeFixture()));
   if (path === '/api/plugins' && unsafePluginResponse) { unsafePluginResponse = false; return new Response(JSON.stringify({ plugins }).replace('"count":1', '"count":9007199254740993')); }
   if (path === '/api/settings/commands') {
     if (body) { expect(body.expected_revision).toBe(commands.revision); commands = { prefix: String(body.prefix), revision: String(Number(commands.revision) + 1) }; }
@@ -90,7 +92,7 @@ describe('浏览器管理会话', () => {
   it('免认证模式自动进入并显示当前模式', async () => {
     sessionMode = 'none'; await mount({ name: 'overview' });
     expect(text()).toContain('本地免认证'); expect(document.querySelector('#token')).toBeNull(); expect(document.querySelector('#logout')).toBeNull();
-    expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins']);
+    expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins', '/api/runtime']);
   });
   it('浏览器往返缓存恢复时重新核对会话，失效时不会显示旧管理数据', async () => {
     await login(); window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })); await flush();
@@ -205,6 +207,7 @@ describe('插件管理的实际组件交互', () => {
     await login({ name: 'overview' });
     expect(Array.from(document.querySelectorAll('.stat-value')).map(el => el.textContent)).toEqual(['2', '1', '1', '1']);
     expect(text()).toContain('不代表平台连接状态');
+    expect(text()).toContain('运行降级'); expect(text()).toContain('0 / 1');
     await click('.nav-item[aria-label="已安装"]'); await input('#plugin-filter', 'pending');
     expect(document.querySelectorAll('.plugin-item')).toHaveLength(1); expect(get('.plugin-item').textContent).toContain('待处理');
   });
@@ -244,10 +247,54 @@ describe('插件管理的实际组件交互', () => {
     get('#command-prefix').focus(); await go({ name: 'settings', query: { view: 'advanced' }, hash: '#prefix' }); expect(document.activeElement).toBe(get('#command-prefix'));
     vi.mocked(window.confirm).mockReturnValue(false); await go({ name: 'overview' }); expect(value('#command-prefix')).toBe('!!');
   });
-  it.each(['adapters', 'not-found'])('未接入页面 %s 明示边界且不发起不存在的接口请求', async name => {
-    await login(name === 'not-found' ? '/unknown-page' : { name });
-    expect(text()).toContain(name === 'not-found' ? '未找到页面' : '尚未接入'); expect(requests.filter(r => !r.path.startsWith('/api/session')).map(r => r.path)).toEqual(['/api/plugins']);
+  it('未找到页面明示边界且不发起不存在的接口请求', async () => {
+    await login('/unknown-page');
+    expect(text()).toContain('未找到页面'); expect(requests.filter(r => !r.path.startsWith('/api/session')).map(r => r.path)).toEqual(['/api/plugins']);
   });
+});
+
+it('连接页独立读取运行状态，插件读取失败不遮住真实连接', async () => {
+  fail = { path: '/api/plugins', method: 'GET', status: 500 }; await login({ name: 'adapters' });
+  expect(text()).toContain('连接与适配器'); expect(text()).toContain('已配置 · 未在线'); expect(text()).toContain('传输连接失败');
+  expect(text()).toContain('重试加载插件'); expect(document.querySelector('.runtime-panel')).not.toBeNull();
+  await go({ name: 'overview' }); expect(document.querySelector('.runtime-panel')).not.toBeNull();
+});
+
+it('切换路由与退出取消读取，迟到的 401 不撤销新页面或新登录', async () => {
+  let resolve!: (value: Response) => void, signal!: AbortSignal;
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init: RequestInit = {}) => {
+    if (String(input) === '/api/runtime') {
+      signal = init.signal!;
+      return new Promise<Response>(done => { resolve = done; });
+    }
+    return fetcher(input, init);
+  });
+  await login({ name: 'adapters' }); const routeSignal = signal, routeResponse = resolve;
+  await go({ name: 'plugins' }); expect(routeSignal.aborted).toBe(true);
+  routeResponse(new Response('{}', { status: 401 })); await flush(); expect(document.querySelector('#token')).toBeNull();
+  await go({ name: 'overview' }); const sessionSignal = signal, oldSessionResponse = resolve;
+  await click('#logout'); expect(sessionSignal.aborted).toBe(true);
+  await input('#token', 'new-token'); await submit('#login-form');
+  resolve(new Response(JSON.stringify(runtimeFixture()))); await flush();
+  oldSessionResponse(new Response('{}', { status: 401 })); await flush();
+  expect(document.querySelector('#token')).toBeNull(); expect(text()).toContain('运行降级');
+});
+
+it('前台周期刷新只读取运行状态，不重复成功通知；有效 401 返回登录页', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    await login({ name: 'overview' });
+    await click('[aria-controls="notification-history"]');
+    const history = get('#notification-history').textContent;
+    await vi.advanceTimersByTimeAsync(10000); await flush();
+    expect(requests.filter(r => r.path === '/api/runtime')).toHaveLength(3);
+    expect(requests.filter(r => r.path === '/api/plugins')).toHaveLength(1);
+    expect(get('#notification-history').textContent).toBe(history);
+    fail = { path: '/api/runtime', method: 'GET', status: 401 };
+    await vi.advanceTimersByTimeAsync(5000); await flush();
+    expect(document.querySelector('#login-form')).not.toBeNull(); expect(document.querySelector('.runtime-panel')).toBeNull();
+    const count = requests.length; await vi.advanceTimersByTimeAsync(15000); expect(requests).toHaveLength(count);
+  } finally { app?.unmount(); vi.useRealTimers(); }
 });
 
 it('市场路由读取真实接口并展示空市场状态', async () => {

@@ -1,7 +1,7 @@
 import { assertSafeNumbers, parseSafeJson } from './json';
 import { isObject } from './types';
 import type { LogEntry, LogPage, Session, SubscribeLogs } from './types';
-type Path = '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply'}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
+type Path = '/api/runtime' | '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply'}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
 const REQUEST_TIMEOUT_MS = 30000;
 const MARKETPLACE_BROWSE_TIMEOUT_MS = 70000;
 const MARKETPLACE_WRITE_TIMEOUT_MS = 240000;
@@ -13,7 +13,7 @@ function requestTimeout(path: Path): number {
 export class ApiError extends Error {
   constructor(message: string, public readonly status = 0) { super(message); }
 }
-export type Request = <T>(path: Path, body?: unknown) => Promise<T>;
+export type Request = <T>(path: Path, body?: unknown, signal?: AbortSignal) => Promise<T>;
 const levels = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
 const integer = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 const text = (value: unknown, max: number): value is string => typeof value === 'string' && value.length <= max;
@@ -60,13 +60,13 @@ export function createApi(onUnauthorized: () => void) {
         headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
-      if (current !== generation || !valid()) throw new ApiError('会话已结束。');
+      if (current !== generation || !valid() || controller.signal.aborted) throw new ApiError('会话已结束。');
       if (response.status === 401) { unauthorized(); throw new ApiError('登录已失效，请重新输入管理 Token。', 401); }
       if (response.status === 409) throw new ApiError('其他操作已更新设置。请先复制需要保留的编辑，再刷新后重试。', 409);
       let data: unknown;
       try { data = parseSafeJson(await response.text()); }
       catch (e) { throw new ApiError(e instanceof SyntaxError ? `响应无法读取（${response.status}），请刷新确认状态。` : (e as Error).message); }
-      if (current !== generation || !valid()) throw new ApiError('会话已结束。');
+      if (current !== generation || !valid() || controller.signal.aborted) throw new ApiError('会话已结束。');
       if (!response.ok) throw new ApiError(data && typeof data === 'object' && 'error' in data && typeof data.error === 'string' ? data.error : `请求失败（${response.status}），请刷新确认状态。`, response.status);
       return data as T;
     } catch (error) {
@@ -76,7 +76,7 @@ export function createApi(onUnauthorized: () => void) {
       throw error;
     } finally { clearTimeout(timer); active.delete(controller); owner?.removeEventListener('abort', abort); }
   };
-  const request: Request = (path, body) => performRequest(path, body);
+  const request: Request = (path, body, signal) => performRequest(path, body, () => true, signal);
   const subscribeLogs: SubscribeLogs = (query, handlers) => {
     const limit = query.limit ?? 200;
     if (!levels.includes(query.level) || !integer(limit) || limit < 1 || limit > 200
