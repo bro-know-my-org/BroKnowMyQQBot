@@ -72,8 +72,8 @@ export function createNotifications() {
   function authenticate(nextScope: string | undefined, restore: boolean) {
     const previous = restore && nextScope ? persistence.load(nextScope) : [];
     reset(); scope = nextScope;
-    state.history = previous;
-    sequence = Math.max(sequence, ...previous.map(entry => entry.id));
+    // Storage identifiers are data, never authority over the live ID sequence.
+    state.history = previous.map(entry => ({ ...entry, id: ++sequence }));
   }
   function suspendSession() { scope = undefined; reset(false); }
   function reset(clearStored = true) { scope = undefined; if (clearStored) persistence.clear(); for (const entry of [...state.active]) dismiss(entry.id); visible.history.clear(); state.history = []; state.open = false; }

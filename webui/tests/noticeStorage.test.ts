@@ -50,3 +50,14 @@ it('storage denial and quota errors degrade without breaking notification delive
   center.authenticate(scope, false); expect(() => center.notify('控制台', '仍然可见')).not.toThrow();
   expect(center.state.active[0]?.message).toBe('仍然可见');
 });
+
+it('restored IDs cannot overflow the live sequence or reuse old visibility callbacks', () => {
+  noticeStorage().save(scope, [{ id: Number.MAX_SAFE_INTEGER, source: '控制台', message: '旧历史', tone: 'info', createdAt: 1, unread: true }]);
+  center.authenticate(scope, true);
+  const restored = center.state.history[0]!.id;
+  const next = center.notify('控制台', '新通知')!;
+  expect(Number.isSafeInteger(next)).toBe(true); expect(next).toBeGreaterThan(restored);
+  center.suspendSession(); center.authenticate(scope, true);
+  center.setVisible(restored, 'history', true); center.setOpen(true);
+  expect(center.unread.value).toBe(2);
+});
