@@ -1,6 +1,5 @@
 //! Read-only plans and drained, recoverable logical restoration.
-mod files;
-#[allow(dead_code)] // Process-control wiring follows in a separately reviewed stage.
+pub(crate) mod files;
 pub(crate) mod offline;
 pub(crate) mod plan;
 use crate::{backup::Repository, plugin_management::PluginManager};
@@ -24,6 +23,7 @@ pub(crate) struct State {
     pub shutdown: Option<bot_core::ShutdownSignal>,
     expiry: Arc<Mutex<Option<Expiry>>>,
     pub ttl: Duration,
+    pub controller: crate::restart::Controller,
 }
 impl State {
     pub(crate) fn new(manager: PluginManager, shutdown: Option<bot_core::ShutdownSignal>) -> Self {
@@ -35,6 +35,7 @@ impl State {
             shutdown,
             expiry: Arc::default(),
             ttl: Duration::from_secs(900),
+            controller: crate::restart::Controller::new(),
         }
     }
     pub(crate) fn inspection(&self, id: &str) -> crate::backup::Result<plan::Inspection> {

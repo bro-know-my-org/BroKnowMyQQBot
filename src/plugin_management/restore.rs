@@ -62,3 +62,75 @@ impl PluginManager {
         .await
     }
 }
+
+impl PluginManager {
+    pub(crate) async fn accept_restore(
+        &self,
+        repository: Repository,
+        selection: impl FnOnce() -> Result<Prepared> + Send + 'static,
+        controller: crate::restart::Controller,
+        session: Option<crate::management::SessionHandoff>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()> {
+        let manager = self.clone();
+        self.operation(async move {
+            let _permit = permit;
+            let prepared = selection()?;
+            let _write = manager.writes.lock().await;
+            let context = manager.marketplace_context()?.clone();
+            let accepted = tokio::task::spawn_blocking(move || {
+                crate::restore::offline::stage(
+                    repository,
+                    context.database,
+                    context.declarations,
+                    prepared,
+                )
+            })
+            .await
+            .map_err(invalid)??;
+            if controller
+                .request_restore(accepted.clone(), session)
+                .is_err()
+            {
+                tokio::task::spawn_blocking(move || accepted.record_status("rejected"))
+                    .await
+                    .map_err(invalid)??;
+                return Err(super::ManagementError::Conflict);
+            }
+            Ok(())
+        })
+        .await
+    }
+    pub(crate) async fn restore_outcome(
+        &self,
+        repository: Repository,
+        id: String,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<crate::restore::offline::Outcome> {
+        self.operation(async move {
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                if !repository
+                    .root
+                    .join("restore")
+                    .try_exists()
+                    .map_err(invalid)?
+                {
+                    return Err(super::ManagementError::ExpiredSelection);
+                }
+                let files = crate::restore::files::Files::new(&repository)?;
+                if !files.exists("outcome.json")? {
+                    return Err(super::ManagementError::ExpiredSelection);
+                }
+                let outcome: crate::restore::offline::Outcome = files.read("outcome.json", 4096)?;
+                if outcome.operation_id != id {
+                    return Err(super::ManagementError::ExpiredSelection);
+                }
+                Ok(outcome)
+            })
+            .await
+            .map_err(invalid)?
+        })
+        .await
+    }
+}

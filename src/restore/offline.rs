@@ -20,6 +20,22 @@ pub(crate) struct Accepted {
     pub operation_id: String,
     pub work_hash: String,
 }
+impl Accepted {
+    pub(crate) fn record_status(&self, status: &str) -> Result<()> {
+        let _config = config::ConfigFileLock::acquire(&self.repository.config).map_err(invalid)?;
+        let lifecycle =
+            plugin_installer::lock_managed_package_lifecycle(&self.database).map_err(invalid)?;
+        let files = Files::new(&self.repository)?;
+        let current: Outcome = files.read("outcome.json", 4096)?;
+        let result = if current.operation_id == self.operation_id {
+            outcome(&files, &self.operation_id, status)
+        } else {
+            Err(ManagementError::Conflict)
+        };
+        let _ = fs2::FileExt::unlock(&lifecycle);
+        result
+    }
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Work {

@@ -343,3 +343,239 @@ async fn expired_private_ticket_is_released_without_a_followup_request() {
     f.shutdown.shutdown();
     f.state.manager.shutdown().await.unwrap();
 }
+
+impl Fixture {
+    async fn inspect_id(&self) -> String {
+        let response = self
+            .call(
+                "/api/restores/inspect",
+                Method::POST,
+                Body::from(bytes()),
+                true,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        value["operation_id"].as_str().unwrap().into()
+    }
+    async fn confirm(&self, id: &str, boot: &str, consent: bool, origin: &str) -> Response {
+        self.app.clone().oneshot(HttpRequest::post(format!("/api/restores/{id}/commit")).header("host","localhost:52743").header("origin",origin).header("authorization",format!("Bearer {TOKEN}")).header("content-type","application/json").body(Body::from(serde_json::json!({"expected_boot_id":boot,"confirm_sensitive_plugin_data":consent,"confirm_unsigned_disabled":consent}).to_string())).unwrap()).await.unwrap()
+    }
+}
+#[tokio::test]
+async fn final_confirmation_only_stages_retained_work_and_selects_one_graceful_restart() {
+    let f = Fixture::new();
+    let id = f.inspect_id().await;
+    let before = std::fs::read(f.root.join("bot.toml")).unwrap();
+    assert_eq!(
+        f.confirm(
+            &id,
+            crate::restart::boot_id(),
+            false,
+            "http://localhost:52743"
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.confirm(&id, "stale", true, "http://localhost:52743")
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.confirm(&id, crate::restart::boot_id(), true, "http://evil.example")
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        f.confirm(
+            &id,
+            crate::restart::boot_id(),
+            true,
+            "http://localhost:52743"
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        f.confirm(
+            &id,
+            crate::restart::boot_id(),
+            true,
+            "http://localhost:52743"
+        )
+        .await
+        .status(),
+        StatusCode::GONE
+    );
+    assert!(f.state.controller.cancelled().await == crate::restart::Action::Restart);
+    assert_eq!(before, std::fs::read(f.root.join("bot.toml")).unwrap());
+    assert!(f.store.logical_snapshot().unwrap().installations.is_empty());
+    let response = f
+        .call(
+            &format!("/api/restores/{id}/outcome"),
+            Method::GET,
+            Body::empty(),
+            true,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(outcome["status"], "pending");
+    assert_eq!(outcome["operation_id"], id);
+    assert_eq!(
+        f.state
+            .controller
+            .request(crate::restart::boot_id(), crate::restart::Action::Stop),
+        Err(crate::restart::Rejection::Conflict)
+    );
+    f.shutdown.shutdown();
+    f.state.manager.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn stale_config_and_first_action_conflict_refuse_to_apply() {
+    for stopped in [true, false] {
+        let f = Fixture::new();
+        let id = f.inspect_id().await;
+        if stopped {
+            f.state
+                .controller
+                .request(crate::restart::boot_id(), crate::restart::Action::Stop)
+                .unwrap();
+        } else {
+            std::fs::write(f.root.join("bot.toml"), "[commands]\nprefix='changed'\n").unwrap();
+        }
+        let before = std::fs::read(f.root.join("bot.toml")).unwrap();
+        assert_eq!(
+            f.confirm(
+                &id,
+                crate::restart::boot_id(),
+                true,
+                "http://localhost:52743"
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(before, std::fs::read(f.root.join("bot.toml")).unwrap());
+        if stopped {
+            let files =
+                crate::restore::files::Files::new(f.state.repository.as_ref().unwrap()).unwrap();
+            assert_eq!(
+                files
+                    .read::<crate::restore::offline::Outcome>("outcome.json", 4096)
+                    .unwrap()
+                    .status,
+                "rejected"
+            );
+        }
+        f.shutdown.shutdown();
+        f.state.manager.shutdown().await.unwrap();
+    }
+}
+#[tokio::test]
+async fn disconnect_after_final_confirmation_does_not_cancel_the_retained_operation() {
+    let f = std::sync::Arc::new(Fixture::new());
+    let id = f.inspect_id().await;
+    let guard = f.state.manager.hold_writes_for_test().await;
+    let owner = f.clone();
+    let selected = id.clone();
+    let request = tokio::spawn(async move {
+        owner
+            .confirm(
+                &selected,
+                crate::restart::boot_id(),
+                true,
+                "http://localhost:52743",
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.state.tickets.lock().unwrap().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    request.abort();
+    let _ = request.await;
+    drop(guard);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            f.state.controller.cancelled()
+        )
+        .await
+        .unwrap()
+            == crate::restart::Action::Restart
+    );
+    f.shutdown.shutdown();
+    f.state.manager.shutdown().await.unwrap();
+    assert_eq!(f.state.slots.available_permits(), 1);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("bot.toml"))
+            .unwrap()
+            .matches("prefix='!!'")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn busy_manager_preserves_ticket_before_admission() {
+    let f = Fixture::new();
+    let id = f.inspect_id().await;
+    let occupied = f.state.manager.hold_operations_for_test();
+    assert_eq!(
+        f.confirm(
+            &id,
+            crate::restart::boot_id(),
+            true,
+            "http://localhost:52743"
+        )
+        .await
+        .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(f.state.inspection(&id).unwrap().operation_id, id);
+    drop(occupied);
+    assert_eq!(
+        f.confirm(
+            &id,
+            crate::restart::boot_id(),
+            true,
+            "http://localhost:52743"
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    f.shutdown.shutdown();
+    f.state.manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn private_directory_without_outcome_is_a_gone_operation() {
+    let f = Fixture::new();
+    crate::restore::files::Files::new(f.state.repository.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        f.call(
+            "/api/restores/11111111-1111-4111-8111-111111111111/outcome",
+            Method::GET,
+            Body::empty(),
+            true
+        )
+        .await
+        .status(),
+        StatusCode::GONE
+    );
+    f.shutdown.shutdown();
+    f.state.manager.shutdown().await.unwrap();
+}

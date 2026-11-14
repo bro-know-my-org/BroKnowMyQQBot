@@ -172,6 +172,13 @@ impl PluginManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn hold_operations_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.operation_slots
+            .clone()
+            .try_acquire_many_owned(4)
+            .unwrap()
+    }
+    #[cfg(test)]
     pub(crate) async fn hold_writes_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.writes.clone().lock_owned().await
     }

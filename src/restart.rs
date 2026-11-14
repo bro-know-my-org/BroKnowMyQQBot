@@ -53,6 +53,7 @@ struct Pending {
     action: Option<Action>,
     stop: Option<StopWatch>,
     session: Option<crate::management::SessionHandoff>,
+    restore: Option<crate::restore::offline::Accepted>,
 }
 
 #[derive(Clone)]
@@ -103,6 +104,22 @@ impl Controller {
         action: Action,
         session: Option<crate::management::SessionHandoff>,
     ) -> Result<(), Rejection> {
+        self.select(expected, action, session, None)
+    }
+    pub(crate) fn request_restore(
+        &self,
+        restore: crate::restore::offline::Accepted,
+        session: Option<crate::management::SessionHandoff>,
+    ) -> Result<(), Rejection> {
+        self.select(boot_id(), Action::Restart, session, Some(restore))
+    }
+    fn select(
+        &self,
+        expected: &str,
+        action: Action,
+        session: Option<crate::management::SessionHandoff>,
+        restore: Option<crate::restore::offline::Accepted>,
+    ) -> Result<(), Rejection> {
         if expected != boot_id() {
             return Err(Rejection::Stale);
         }
@@ -111,7 +128,7 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(previous) = state.action {
-            return if previous == action {
+            return if previous == action && restore.is_none() && state.restore.is_none() {
                 Ok(())
             } else {
                 Err(Rejection::Conflict)
@@ -127,6 +144,7 @@ impl Controller {
             }
             state.stop = Some(watch);
             state.session = session;
+            state.restore = restore;
         }
         state.action = Some(action);
         self.requested.send_replace(Some(action));
@@ -141,8 +159,46 @@ impl Controller {
             .expect("controller retains the selected shutdown action")
     }
 
+    pub(crate) fn cancel_restore(&self) -> crate::backup::Result<()> {
+        let restore = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restore
+            .clone();
+        restore.map_or(Ok(()), |restore| restore.record_status("cancelled"))
+    }
+
     /// Called after all async state, the runtime and logging guards have dropped.
     pub(crate) fn exec(&self) -> std::process::ExitCode {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let restore = state.restore.clone();
+        let stopped = state
+            .stop
+            .as_ref()
+            .is_some_and(|watch| watch.stopped.load(Ordering::SeqCst));
+        drop(state);
+        if stopped {
+            if let Some(restore) = restore {
+                if restore.record_status("cancelled").is_err() {
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+            return std::process::ExitCode::SUCCESS;
+        }
+        // A signal during offline application lets the recoverable transaction finish;
+        // the second check suppresses exec after a consistent outcome is retained.
+        if let Some(restore) = &restore {
+            if crate::restore::offline::apply(restore).is_err() {
+                eprintln!(
+                    "BroKnowMyQQBot offline restore failed; retained private recovery records; restart not executed"
+                );
+                return std::process::ExitCode::FAILURE;
+            }
+        }
         // All resources have been released. From here a signal exits immediately,
         // closing the flag-check/exec gap without unsafe signal-mask manipulation.
         let stop = self
@@ -150,8 +206,36 @@ impl Controller {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(watch) = stop.stop.as_ref() {
-            watch.finished.store(true, Ordering::SeqCst);
             if watch.stopped.load(Ordering::SeqCst) {
+                if let Some(restore) = &restore {
+                    if restore.record_status("applied_restart_cancelled").is_err() {
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+                return std::process::ExitCode::SUCCESS;
+            }
+            #[cfg(test)]
+            if std::env::var_os("BKMQB_TEST_EXEC_TRANSITION_SIGNAL").is_some() {
+                rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::TERM,
+                )
+                .expect("test signal");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !watch.stopped.load(Ordering::SeqCst) {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+            watch.finished.store(true, Ordering::SeqCst);
+            // A signal before arming sets stopped; a signal after arming exits.
+            // This final read closes the check/arm gap.
+            if watch.stopped.load(Ordering::SeqCst) {
+                if let Some(restore) = &restore {
+                    if restore.record_status("applied_restart_cancelled").is_err() {
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
                 return std::process::ExitCode::SUCCESS;
             }
         }
@@ -182,6 +266,13 @@ impl Controller {
             {
                 let error = command.exec();
                 eprintln!("BroKnowMyQQBot restart failed: {error}");
+                if let Some(restore) = &restore {
+                    if restore.record_status("applied_restart_failed").is_err() {
+                        eprintln!(
+                            "restore outcome could not be updated; private recovery records retained"
+                        );
+                    }
+                }
             }
         }
         std::process::ExitCode::FAILURE
@@ -290,6 +381,137 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the isolated process and both signal boundaries together.
+    fn signal_after_drain_before_exec_cancels_restore_before_first_write() {
+        const CHILD: &str = "BKMQB_RESTORE_SIGNAL_FIXTURE";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = std::path::PathBuf::from(root);
+            let database = root.join("plugins.db");
+            let config = root.join("bot.toml");
+            std::fs::write(&config, "[commands]\nprefix='!'\n").unwrap();
+            drop(plugin_host::PluginStore::open(&database).unwrap());
+            let archive = plugin_host::LogicalArchive::create(
+                std::collections::BTreeMap::from([
+                    (
+                        "bot".into(),
+                        crate::backup::selected(&crate::config::BotConfig::default()),
+                    ),
+                    ("bindings".into(), serde_json::json!([])),
+                ]),
+                plugin_host::LogicalSnapshot {
+                    installations: vec![],
+                    state: vec![],
+                },
+                std::collections::BTreeMap::new(),
+                1,
+            )
+            .unwrap();
+            let prepared = crate::restore::plan::Prepared::new(
+                archive,
+                std::fs::read_to_string(&config).unwrap(),
+                vec![],
+                vec![],
+                &[],
+            )
+            .unwrap();
+            let accepted = crate::restore::offline::stage(
+                crate::backup::Repository::new(&database, config.clone()),
+                database,
+                None,
+                prepared,
+            )
+            .unwrap();
+            let controller = Controller::new();
+            controller.request_restore(accepted.clone(), None).unwrap();
+            let transition = std::env::var_os("BKMQB_TEST_EXEC_TRANSITION_SIGNAL").is_some();
+            if !transition {
+                rustix::process::kill_process(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::TERM,
+                )
+                .unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !controller
+                    .state
+                    .lock()
+                    .unwrap()
+                    .stop
+                    .as_ref()
+                    .unwrap()
+                    .stopped
+                    .load(Ordering::SeqCst)
+                {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+            let code = if std::env::var_os("BKMQB_TEST_DRAIN_EXIT").is_some() {
+                crate::finish(
+                    &crate::bootstrap::Outcome::Exit(std::process::ExitCode::SUCCESS),
+                    &controller,
+                )
+            } else {
+                controller.exec()
+            };
+            assert_eq!(code, std::process::ExitCode::SUCCESS);
+            let saved: crate::config::BotConfig =
+                toml::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+            assert_eq!(saved.commands.prefix, if transition { "/" } else { "!" });
+            let files = crate::restore::files::Files::new(&accepted.repository).unwrap();
+            assert_eq!(
+                files
+                    .read::<crate::restore::offline::Outcome>("outcome.json", 4096)
+                    .unwrap()
+                    .status,
+                if transition {
+                    "applied_restart_cancelled"
+                } else {
+                    "cancelled"
+                }
+            );
+            return;
+        }
+        for boundary in ["before_apply", "transition", "drain_exit"] {
+            let transition = boundary == "transition";
+            let root =
+                std::env::temp_dir().join(format!("bkm-restore-signal-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&root).unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "restart::tests::signal_after_drain_before_exec_cancels_restore_before_first_write",
+                "--nocapture",
+            ])
+            .env(CHILD, &root)
+            .stdout(std::process::Stdio::null());
+            command.env_remove("BKMQB_TEST_EXEC_TRANSITION_SIGNAL");
+            command.env_remove("BKMQB_TEST_DRAIN_EXIT");
+            if boundary == "drain_exit" {
+                command.env("BKMQB_TEST_DRAIN_EXIT", "1");
+            }
+            if transition {
+                command.env("BKMQB_TEST_EXEC_TRANSITION_SIGNAL", "1");
+            }
+            let mut child = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "child status {status:?}");
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("signal fixture timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

@@ -35,8 +35,18 @@ fn main() -> ExitCode {
     let restart = restart::Controller::new();
     let outcome = runtime.block_on(run(restart.clone()));
     drop(runtime);
+    finish(&outcome, &restart)
+}
+
+fn finish(outcome: &bootstrap::Outcome, restart: &restart::Controller) -> ExitCode {
     match outcome {
-        bootstrap::Outcome::Exit(code) => code,
+        bootstrap::Outcome::Exit(code) => {
+            if restart.cancel_restore().is_err() {
+                eprintln!("restore cancellation outcome could not be retained");
+                return ExitCode::FAILURE;
+            }
+            *code
+        }
         bootstrap::Outcome::Restart => restart.exec(),
     }
 }

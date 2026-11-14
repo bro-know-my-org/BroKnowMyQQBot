@@ -41,7 +41,6 @@ pub(crate) struct Inspection {
     pub settings_before: Value,
     pub settings_after: Value,
 }
-#[allow(dead_code)] // The following offline-application stage consumes retained CAS data.
 pub(crate) struct Prepared {
     pub archive: LogicalArchive,
     pub inspection: Inspection,

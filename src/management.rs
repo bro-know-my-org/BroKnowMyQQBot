@@ -112,10 +112,9 @@ pub(crate) async fn serve(
     let listener = listener::bind(&config).await?;
     let listen = listener.local_addr()?;
     restart.record_listener(listen);
-    let restores = restores::router(
-        crate::restore::State::new(manager.clone(), Some(shutdown.clone())),
-        auth.clone(),
-    );
+    let mut restore_state = crate::restore::State::new(manager.clone(), Some(shutdown.clone()));
+    restore_state.controller = restart.clone();
+    let restores = restores::router(restore_state, auth.clone());
     info!(listen = %listen, auth = ?config.auth, "management server listening");
     let (status_router, status_worker, status_stop) = status_stream::router(
         manager.clone(),

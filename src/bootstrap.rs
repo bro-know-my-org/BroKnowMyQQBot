@@ -70,6 +70,12 @@ async fn start(
     restart: crate::restart::Controller,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut config = BotConfig::load()?;
+    let database = config.plugins.database.clone();
+    let repository =
+        crate::backup::Repository::new(&database, crate::config::application_config_path());
+    tokio::task::spawn_blocking(move || crate::restore::offline::recover(&repository, &database))
+        .await??;
+    config = BotConfig::load()?;
     let secrets_file = load_secret_environment()?;
     let qq_credentials = resolve_credentials(&mut config, secrets_file.as_deref())?;
     if let Some(auth) = management_auth {

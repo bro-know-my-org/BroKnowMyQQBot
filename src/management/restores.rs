@@ -1,4 +1,4 @@
-//! Raw bounded upload has its own route; generic JSON limits remain unchanged.
+mod actions;
 use super::{
     auth::{self, AuthState},
     plugins::ApiError,
@@ -18,11 +18,16 @@ pub(super) fn router(state: State, auth: AuthState) -> Router {
     Router::new()
         .route("/api/restores/inspect", post(inspect))
         .route("/api/restores/{id}", get(inspection).delete(discard))
-        .with_state(state)
+        .route(
+            "/api/restores/{id}/commit",
+            post(actions::commit).layer(middleware::from_fn(super::plugins::read_body)),
+        )
+        .route("/api/restores/{id}/outcome", get(actions::outcome))
+        .with_state((state, auth.clone()))
         .route_layer(middleware::from_fn_with_state(auth, auth::authenticate))
 }
 async fn inspection(
-    Extract(state): Extract<State>,
+    Extract((state, _)): Extract<(State, AuthState)>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let permit = std::sync::Arc::new(
@@ -35,7 +40,7 @@ async fn inspection(
     Ok(json(state.inspection(&id)?, permit))
 }
 async fn discard(
-    Extract(state): Extract<State>,
+    Extract((state, _)): Extract<(State, AuthState)>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let mut ticket = state.tickets.lock().map_err(crate::backup::invalid)?;
@@ -47,7 +52,7 @@ async fn discard(
     }
     Ok(StatusCode::NO_CONTENT)
 }
-async fn inspect(Extract(state): Extract<State>, request: Request) -> Response {
+async fn inspect(Extract((state, _)): Extract<(State, AuthState)>, request: Request) -> Response {
     let result = async {
         let permit = std::sync::Arc::new(state
             .slots
