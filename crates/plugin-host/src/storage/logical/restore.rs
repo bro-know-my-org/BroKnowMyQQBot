@@ -6,6 +6,24 @@ use rusqlite::{OptionalExtension as _, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 
 impl PluginStore {
+    /// Read the recovery marker without creating or initializing a missing/unknown DB.
+    pub fn logical_restore_committed_at(
+        path: &std::path::Path,
+        operation_id: &str,
+    ) -> Result<bool, StoreError> {
+        let connection = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let id: Option<String> = connection
+            .query_row(
+                "SELECT operation_id FROM logical_restore_commit WHERE slot = 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id.as_deref() == Some(operation_id))
+    }
     pub fn logical_restore_committed(&self, operation_id: &str) -> Result<bool, StoreError> {
         let connection = self.connection.lock().map_err(|_| StoreError::Poisoned)?;
         let id: Option<String> = connection

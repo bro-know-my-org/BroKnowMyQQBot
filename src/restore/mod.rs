@@ -1,5 +1,7 @@
-#[allow(dead_code)] // Used by the following offline application stage.
+//! Read-only plans and drained, recoverable logical restoration.
 mod files;
+#[allow(dead_code)] // Process-control wiring follows in a separately reviewed stage.
+pub(crate) mod offline;
 pub(crate) mod plan;
 use crate::{backup::Repository, plugin_management::PluginManager};
 use std::{

@@ -146,7 +146,7 @@ fn write_installation_and_cleanup(
     Ok(())
 }
 
-fn persist_installed_package(
+pub(crate) fn persist_installed_package(
     database: &Path,
     manifest: &plugin_api::PluginManifest,
     package_sha256: &str,
