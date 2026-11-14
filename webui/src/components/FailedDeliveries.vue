@@ -45,7 +45,10 @@ async function load(before?: number, nextNumber = 1) {
   } catch (e) { if (current === generation) error.value = (e as Error).message; }
   finally { observer.abort(); if (current === generation) loading.value = false; }
 }
-watch(() => [props.instanceId, props.revision, props.busy] as const, () => {
+watch(() => [props.instanceId, props.revision, props.busy] as const, ([id, revision], previous) => {
+  if (!previous || id !== previous[0] || revision !== previous[1]) {
+    page.value = undefined; number.value = 1; error.value = '';
+  }
   generation++; focusObserver?.abort(); loading.value = false;
   if (!props.busy) void load();
 }, { immediate: true });

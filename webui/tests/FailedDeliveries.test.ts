@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { createApp, nextTick, reactive } from 'vue';
+import { createApp, h, nextTick, reactive } from 'vue';
 import FailedDeliveries from '../src/components/FailedDeliveries.vue';
 import type { Request } from '../src/api';
 
@@ -11,7 +11,7 @@ const flush = async () => { await new Promise<void>(resolve => setImmediate(reso
 const get = (id: string) => document.querySelector<HTMLButtonElement>(id)!;
 async function mount() {
   const root = document.createElement('div'); document.body.append(root);
-  app = createApp(FailedDeliveries, { ...props, request: request as Request }); app.mount(root); await flush();
+  app = createApp({ render: () => h(FailedDeliveries, { ...props, request: request as Request }) }); app.mount(root); await flush();
 }
 beforeEach(() => { vi.clearAllMocks(); props.instanceId = 'plugin/a #?'; props.revision = 1; props.busy = false; });
 afterEach(() => { app?.unmount(); document.body.replaceChildren(); });
@@ -70,4 +70,19 @@ it('卸载后忽略晚到的分页结果', async () => {
   await mount(); app.unmount();
   finish({ entries: [row], next_before: null }); await flush();
   expect(document.querySelector('.failure-list')).toBeNull();
+});
+
+it.each(['revision', 'instanceId'] as const)('恢复或切换实例后清除旧记录和游标，即使新读取失败：%s', async field => {
+  request.mockResolvedValueOnce({ entries: Array.from({ length: 20 }, () => row), next_before: 42 });
+  let fail!: (reason: Error) => void;
+  request.mockImplementationOnce(() => new Promise((_, reject) => { fail = reject; }));
+  await mount(); expect(document.querySelectorAll('.failure-list li')).toHaveLength(20);
+  if (field === 'revision') props.revision++; else props.instanceId = 'other-plugin';
+  await nextTick();
+  expect(document.querySelector('.failure-list')).toBeNull();
+  expect(document.querySelector('#next-failures')).toBeNull();
+  fail(new Error('读取失败')); await flush();
+  expect(document.querySelector('[role="alert"]')?.textContent).toContain('读取失败');
+  expect(document.querySelector('.failure-list')).toBeNull();
+  expect(document.querySelector('#next-failures')).toBeNull();
 });
