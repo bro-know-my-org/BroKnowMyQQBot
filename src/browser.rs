@@ -17,7 +17,7 @@ use plugin_api::{BrowserPermission, BrowserRun};
 use plugin_host::{BrowserArtifact, BrowserExecution, BrowserExecutionError, BrowserExecutor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use tokio::{io::AsyncWriteExt as _, process::Command, time::timeout};
+use tokio::{io::AsyncWriteExt as _, time::timeout};
 use tracing::warn;
 
 const NODE_VERSION: &str = "22.23.2";
@@ -187,7 +187,7 @@ impl BrowserExecutor for InstalledBrowserExecutor {
             "permissions": resolved_permissions,
         }))
         .map_err(|error| BrowserExecutionError::InvalidRequest(error.to_string()))?;
-        let mut child = Command::new(node_executable(&self.runtime));
+        let mut child = crate::restart::child_command(node_executable(&self.runtime));
         if let Some(source) = self.inline_worker {
             child.arg("-e").arg(source);
         } else {
@@ -1138,7 +1138,7 @@ async fn check_runtime(runtime: &Path) -> Result<(), Box<dyn std::error::Error>>
         .await
         .map_err(io::Error::other)?
         .map_err(io::Error::other)?;
-    let mut command = Command::new(node_executable(&runtime));
+    let mut command = crate::restart::child_command(node_executable(&runtime));
     command
         .arg(runtime.join("worker.js"))
         .env("PLAYWRIGHT_BROWSERS_PATH", runtime.join("browsers"))
@@ -2799,7 +2799,7 @@ mod tests {
         let Ok(Some(runtime)) = active_runtime(&home) else {
             return;
         };
-        let output = Command::new(node_executable(&runtime))
+        let output = crate::restart::child_command(node_executable(&runtime))
             .arg("-e")
             .arg(WORKER_SOURCE)
             .env("PLAYWRIGHT_BROWSERS_PATH", runtime.join("browsers"))

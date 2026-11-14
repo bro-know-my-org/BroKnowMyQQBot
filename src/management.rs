@@ -14,6 +14,7 @@ mod restart;
 mod runtime;
 mod settings;
 mod system_settings;
+pub(crate) use auth::SessionHandoff;
 
 use std::{net::SocketAddr, sync::Arc, thread, time::Duration};
 
@@ -99,8 +100,10 @@ pub(crate) async fn serve(
         return Ok(());
     }
     let auth = auth::AuthState::from_config(&config)?;
+    auth.resume_restart();
     let listener = listener::bind(&config).await?;
     let listen = listener.local_addr()?;
+    restart.record_listener(listen);
     info!(listen = %listen, auth = ?config.auth, "management server listening");
     let (app, validation_jobs) = router_parts(
         observer,

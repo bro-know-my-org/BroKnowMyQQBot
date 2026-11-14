@@ -3,7 +3,7 @@ use super::auth::{self, AuthState};
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::post,
@@ -15,7 +15,7 @@ pub(super) fn router(controller: crate::restart::Controller, auth: AuthState) ->
     Router::new()
         .route("/api/restart", post(restart))
         .route("/api/stop", post(stop))
-        .with_state(controller)
+        .with_state((controller, auth.clone()))
         .route_layer(middleware::from_fn(super::plugins::read_body))
         .route_layer(middleware::from_fn_with_state(auth, auth::authenticate))
         .layer(
@@ -35,13 +35,21 @@ struct RestartRequest {
 }
 
 async fn restart(
-    State(controller): State<crate::restart::Controller>,
+    State((controller, auth)): State<(crate::restart::Controller, AuthState)>,
+    headers: HeaderMap,
     Json(request): Json<RestartRequest>,
 ) -> Response {
-    request_shutdown(&controller, &request, crate::restart::Action::Restart)
+    response(
+        controller.request_with_session(
+            &request.expected_boot_id,
+            crate::restart::Action::Restart,
+            auth.restart_session(&headers),
+        ),
+        crate::restart::Action::Restart,
+    )
 }
 async fn stop(
-    State(controller): State<crate::restart::Controller>,
+    State((controller, _)): State<(crate::restart::Controller, AuthState)>,
     Json(request): Json<RestartRequest>,
 ) -> Response {
     request_shutdown(&controller, &request, crate::restart::Action::Stop)
@@ -51,7 +59,16 @@ fn request_shutdown(
     request: &RestartRequest,
     action: crate::restart::Action,
 ) -> Response {
-    match controller.request(&request.expected_boot_id, action) {
+    response(
+        controller.request(&request.expected_boot_id, action),
+        action,
+    )
+}
+fn response(
+    result: Result<(), crate::restart::Rejection>,
+    action: crate::restart::Action,
+) -> Response {
+    match result {
         Ok(()) => (
             StatusCode::ACCEPTED,
             Json(json!({"boot_id":crate::restart::boot_id(), "action":action})),

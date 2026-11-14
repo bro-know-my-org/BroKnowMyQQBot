@@ -11,6 +11,9 @@ use std::{
     time::Duration,
 };
 
+const TOKEN: &str = "isolated-management-token-0123456789abcdef";
+const ROTATED: &str = "rotated-management-token-0123456789abcdef";
+
 struct Fixture {
     child: Child,
     root: PathBuf,
@@ -21,8 +24,11 @@ struct Fixture {
 }
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_auth("none").await
+    }
+    async fn start_with_auth(auth: &str) -> Self {
         for _ in 0..3 {
-            let mut fixture = Self::spawn();
+            let mut fixture = Self::spawn(auth);
             for _ in 0..150 {
                 if fixture.child.try_wait().unwrap().is_some() {
                     break;
@@ -35,7 +41,7 @@ impl Fixture {
         }
         panic!("isolated fixture could not bind after three attempts");
     }
-    fn spawn() -> Self {
+    fn spawn(auth: &str) -> Self {
         let root = std::env::temp_dir().join(format!("bkmqb-lifecycle-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let management_reservation = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -47,13 +53,13 @@ impl Fixture {
         let secrets = root.join("secrets.env");
         fs::write(
             &secrets,
-            "BKMQB_ONEBOT_ACCESS_TOKEN=isolated-fixture-onebot-token\n",
+            format!("BKMQB_ONEBOT_ACCESS_TOKEN=isolated-fixture-onebot-token\nBKMQB_MANAGEMENT_TOKEN={TOKEN}\n"),
         )
         .unwrap();
         fs::set_permissions(&secrets, fs::Permissions::from_mode(0o600)).unwrap();
         drop((management_reservation, onebot_reservation));
         let child = Command::new(env!("CARGO_BIN_EXE_bkmqb"))
-            .args(["run", "--management-auth", "none"])
+            .args(["run", "--management-auth", auth])
             .current_dir(&root)
             .env_clear()
             .env("BKMQB_CONFIG", &config)
@@ -105,6 +111,34 @@ impl Fixture {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         panic!("fixture did not become ready");
+    }
+    async fn cookie_session(&self, cookie: &str) -> Value {
+        self.client
+            .get(format!("{}/api/session", self.base))
+            .header("Cookie", cookie)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+    async fn login(&self, token: &str) -> String {
+        let response = self
+            .client
+            .post(format!("{}/api/session/login", self.base))
+            .json(&json!({"token":token}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
     }
     async fn control(&self, action: &str, boot: &str) -> reqwest::Response {
         self.client
@@ -246,4 +280,102 @@ async fn stop_accepts_then_exits_normally_without_restarting_and_releases_listen
     for port in [fixture.management, fixture.onebot] {
         assert!(TcpListener::bind(("127.0.0.1", port)).is_ok());
     }
+}
+
+#[tokio::test]
+async fn only_initiator_cookie_resumes_on_exec_and_rotating_file_token_invalidates_it() {
+    let mut fixture = Fixture::start_with_auth("token").await;
+    let boot = fixture.ready(None).await["boot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for action in ["restart", "stop"] {
+        assert_eq!(
+            fixture.control(action, &boot).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let cookie = fixture.login(TOKEN).await;
+    let other = fixture.login(TOKEN).await;
+    let mut stream = fixture
+        .client
+        .get(format!("{}/api/logs/stream", fixture.base))
+        .header("Cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert!(stream.chunk().await.unwrap().is_some());
+    let response = fixture
+        .client
+        .post(format!("{}/api/restart", fixture.base))
+        .header("Cookie", &cookie)
+        .json(&json!({"expected_boot_id":boot}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let _: Value = response.json().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Ok(Some(_)) = stream.chunk().await {}
+    })
+    .await
+    .unwrap();
+    let next = fixture.ready(Some(&boot)).await["boot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(fixture.cookie_session(&cookie).await["authenticated"], true);
+    assert_eq!(fixture.cookie_session(&other).await["authenticated"], false);
+    let bearer = fixture
+        .client
+        .get(format!("{}/api/runtime", fixture.base))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bearer.status(), StatusCode::OK);
+    fs::write(fixture.root.join("secrets.env"), format!("BKMQB_ONEBOT_ACCESS_TOKEN=isolated-fixture-onebot-token\nBKMQB_MANAGEMENT_TOKEN={ROTATED}\n")).unwrap();
+    let response = fixture
+        .client
+        .post(format!("{}/api/restart", fixture.base))
+        .header("Cookie", &cookie)
+        .json(&json!({"expected_boot_id":next}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let _: Value = response.json().await.unwrap();
+    let last = fixture.ready(Some(&next)).await["boot_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        fixture.cookie_session(&cookie).await["authenticated"],
+        false
+    );
+    for (token, status) in [(TOKEN, StatusCode::UNAUTHORIZED), (ROTATED, StatusCode::OK)] {
+        assert_eq!(
+            fixture
+                .client
+                .get(format!("{}/api/runtime", fixture.base))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            status
+        );
+    }
+    let cookie = fixture.login(ROTATED).await;
+    let response = fixture
+        .client
+        .post(format!("{}/api/stop", fixture.base))
+        .header("Cookie", &cookie)
+        .json(&json!({"expected_boot_id":last}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let _: Value = response.json().await.unwrap();
+    fixture.exited().await;
 }

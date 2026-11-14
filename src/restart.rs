@@ -14,6 +14,15 @@ pub(crate) fn boot_id() -> &'static str {
     ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
+/// Child workers must never receive the process-private restart envelope.
+pub(crate) fn child_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .env_remove("BKMQB_PRIVATE_RESTART_SESSION")
+        .env_remove("BKMQB_INTERNAL_RESTART_LISTEN");
+    command
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Action {
@@ -43,6 +52,7 @@ impl Rejection {
 struct Pending {
     action: Option<Action>,
     stop: Option<StopWatch>,
+    session: Option<crate::management::SessionHandoff>,
 }
 
 #[derive(Clone)]
@@ -50,6 +60,7 @@ pub(crate) struct Controller {
     executable: Option<Arc<PathBuf>>,
     requested: watch::Sender<Option<Action>>,
     state: Arc<Mutex<Pending>>,
+    listener: Arc<Mutex<Option<std::net::SocketAddr>>>,
     environment: Arc<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
 }
 
@@ -58,9 +69,24 @@ impl Controller {
         Self {
             executable: executable().ok().map(Arc::new),
             state: Arc::default(),
-            environment: Arc::new(std::env::vars_os().collect()),
+            listener: Arc::default(),
+            environment: Arc::new(
+                std::env::vars_os()
+                    .filter(|(key, _)| {
+                        key != "BKMQB_PRIVATE_RESTART_SESSION"
+                            && key != "BKMQB_INTERNAL_RESTART_LISTEN"
+                    })
+                    .collect(),
+            ),
             requested: watch::channel(None).0,
         }
+    }
+
+    pub(crate) fn record_listener(&self, address: std::net::SocketAddr) {
+        *self
+            .listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(address);
     }
 
     pub(crate) fn available(&self) -> bool {
@@ -68,6 +94,15 @@ impl Controller {
     }
 
     pub(crate) fn request(&self, expected: &str, action: Action) -> Result<(), Rejection> {
+        self.request_with_session(expected, action, None)
+    }
+
+    pub(crate) fn request_with_session(
+        &self,
+        expected: &str,
+        action: Action,
+        session: Option<crate::management::SessionHandoff>,
+    ) -> Result<(), Rejection> {
         if expected != boot_id() {
             return Err(Rejection::Stale);
         }
@@ -91,6 +126,7 @@ impl Controller {
                 return Err(Rejection::Signal);
             }
             state.stop = Some(watch);
+            state.session = session;
         }
         state.action = Some(action);
         self.requested.send_replace(Some(action));
@@ -119,16 +155,34 @@ impl Controller {
                 return std::process::ExitCode::SUCCESS;
             }
         }
+        let handoff = stop
+            .session
+            .as_ref()
+            .and_then(crate::management::SessionHandoff::encode);
         drop(stop);
-        #[cfg(target_os = "linux")]
         if let Some(executable) = &self.executable {
+            #[cfg(target_os = "linux")]
             use std::os::unix::process::CommandExt as _;
-            let error = std::process::Command::new(executable.as_ref())
+            let mut command = std::process::Command::new(executable.as_ref());
+            command
                 .args(std::env::args_os().skip(1))
                 .env_clear()
-                .envs(self.environment.iter().cloned())
-                .exec();
-            eprintln!("BroKnowMyQQBot restart failed: {error}");
+                .envs(self.environment.iter().cloned());
+            if let Some(address) = *self
+                .listener
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                command.env("BKMQB_INTERNAL_RESTART_LISTEN", address.to_string());
+            }
+            if let Some(handoff) = handoff {
+                command.env("BKMQB_PRIVATE_RESTART_SESSION", handoff);
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let error = command.exec();
+                eprintln!("BroKnowMyQQBot restart failed: {error}");
+            }
         }
         std::process::ExitCode::FAILURE
     }
@@ -202,6 +256,41 @@ fn executable() -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn workers_cannot_inherit_private_restart_environment() {
+        const CHILD: &str = "BKMQB_PRIVATE_ENV_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let output = runtime
+                .block_on(async { child_command("/usr/bin/env").output().await })
+                .unwrap();
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(!text.contains("BKMQB_PRIVATE_RESTART_SESSION"));
+            assert!(!text.contains("BKMQB_INTERNAL_RESTART_LISTEN"));
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "restart::tests::workers_cannot_inherit_private_restart_environment",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("BKMQB_PRIVATE_RESTART_SESSION", "private-fixture")
+            .env("BKMQB_INTERNAL_RESTART_LISTEN", "127.0.0.1:12345")
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn stop_conflict_takes_priority_when_restart_is_unavailable() {

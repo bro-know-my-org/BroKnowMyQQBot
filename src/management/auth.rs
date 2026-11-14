@@ -20,6 +20,10 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq as _;
 
+#[path = "auth_restart.rs"]
+mod restart;
+pub(crate) use restart::SessionHandoff;
+
 const COOKIE: &str = "bkmqb_management_session";
 const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_SESSIONS: usize = 128;
