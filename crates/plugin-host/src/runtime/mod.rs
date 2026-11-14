@@ -6,6 +6,8 @@ mod management;
 mod management_tests;
 mod observation;
 #[cfg(test)]
+mod observation_tests;
+#[cfg(test)]
 mod upgrade_tests;
 mod validation;
 
