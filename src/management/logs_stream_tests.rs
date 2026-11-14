@@ -211,6 +211,8 @@ async fn validates_resume_filters_and_auth_source_policy() {
         "?level=BAD",
         "?instance_id=%0A",
         "?unknown=x",
+        "?category=unknown",
+        "?include_content=yes",
     ] {
         assert_eq!(
             open(&app, query).await.status(),
@@ -423,4 +425,171 @@ async fn shutdown_ends_waiting_and_unpolled_streams() {
             .await
             .is_none()
     );
+}
+
+async fn snapshot(app: &Router, query: &str) -> Value {
+    let response = call(
+        app,
+        &format!("/api/logs{query}"),
+        &[("authorization", &format!("Bearer {TOKEN}"))],
+    )
+    .await;
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn body_capture_is_opt_in_scoped_to_stream_and_hidden_from_other_readers() {
+    let logs = LogBuffer::default();
+    let app = app(&logs, auth(), None);
+    let response = open(&app, "?category=message&include_content=true").await;
+    let mut body = response.into_body().into_data_stream();
+    page(&frame(&mut body).await);
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(logs.layer()), || {
+        tracing::info!(target: crate::logging::live::MESSAGE_TRACE_TARGET,
+            record_kind = "message.received", event_id = "message-event", direction = "inbound",
+            content = "body from explicit capture", "received message");
+        tracing::info!("runtime-only");
+    });
+    let update = page(&frame(&mut body).await);
+    assert_eq!(update["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(update["entries"][0]["category"], "message");
+    assert_eq!(
+        update["entries"][0]["content"],
+        "body from explicit capture"
+    );
+    let explicit = snapshot(&app, "?category=message&include_content=true").await;
+    assert_eq!(
+        explicit["entries"][0]["content"],
+        "body from explicit capture"
+    );
+    let hidden = snapshot(&app, "?category=message").await;
+    assert!(hidden["entries"][0].get("content").is_none());
+    assert_eq!(
+        snapshot(&app, "?category=all").await["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        snapshot(&app, "").await["entries"][0]["message"],
+        "runtime-only"
+    );
+    drop(body);
+    let erased = snapshot(&app, "?category=message&include_content=true").await;
+    assert!(erased["entries"][0].get("content").is_none());
+    // An unpolled response still owns capture; dropping it must release capture too.
+    let unpolled = open(&app, "?category=message&include_content=true").await;
+    drop(unpolled);
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(logs.layer()), || {
+        tracing::info!(target: crate::logging::live::MESSAGE_TRACE_TARGET, content = "not captured", "after close");
+    });
+    let after = snapshot(&app, "?category=message&include_content=true").await;
+    assert!(
+        after["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.get("content").is_none())
+    );
+}
+
+async fn login_cookie(app: &Router, previous: Option<&str>) -> String {
+    let mut request =
+        Request::post("/api/session/login").header(header::CONTENT_TYPE, "application/json");
+    if let Some(cookie) = previous {
+        request = request.header(header::COOKIE, cookie);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(json!({"token": TOKEN}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+fn emit_body(logs: &LogBuffer) {
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(logs.layer()), || {
+        tracing::info!(target: crate::logging::live::MESSAGE_TRACE_TARGET, content = "test private body", "message");
+    });
+}
+
+fn bodies(logs: &LogBuffer) -> Vec<crate::logging::live::LogEntry> {
+    logs.filtered_snapshot(
+        None,
+        1000,
+        crate::logging::live::LogSelection {
+            category: LogCategory::Message,
+            include_content: true,
+            ..Default::default()
+        },
+    )
+    .entries
+}
+
+#[tokio::test]
+async fn capture_revocation_does_not_require_polling_or_dropping_the_body() {
+    for polled in [false, true] {
+        for reason in ["logout", "replace", "shutdown"] {
+            let logs = LogBuffer::default();
+            let (handle, signal) = bot_core::shutdown_channel();
+            let app = app(&logs, auth(), Some(signal));
+            let cookie = login_cookie(&app, None).await;
+            let response = call(
+                &app,
+                "/api/logs/stream?category=message&include_content=true",
+                &[("cookie", &cookie)],
+            )
+            .await;
+            let mut body = response.into_body().into_data_stream();
+            emit_body(&logs);
+            assert!(bodies(&logs)[0].content.is_some());
+            if polled {
+                page(&frame(&mut body).await);
+            }
+            match reason {
+                "logout" => {
+                    app.clone()
+                        .oneshot(
+                            Request::post("/api/session/logout")
+                                .header(header::COOKIE, &cookie)
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                "replace" => {
+                    login_cookie(&app, Some(&cookie)).await;
+                }
+                _ => handle.shutdown(),
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while bodies(&logs).iter().any(|entry| entry.content.is_some()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            emit_body(&logs);
+            assert!(
+                bodies(&logs).iter().all(|entry| entry.content.is_none()),
+                "{reason}, polled={polled}"
+            );
+            drop(body);
+        }
+    }
 }

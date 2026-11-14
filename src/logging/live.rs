@@ -3,10 +3,13 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt::{self, Write as _},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{
     Event, Subscriber,
@@ -19,12 +22,49 @@ const CAPACITY: usize = 1000;
 const FIELD_COUNT: usize = 16;
 pub(crate) const MESSAGE_TRACE_TARGET: &str = "bkm::message_trace";
 
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LogCategory {
+    #[default]
+    Runtime,
+    Message,
+    All,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LogSelection<'a> {
+    pub(crate) level: Option<&'a str>,
+    pub(crate) instance: Option<&'a str>,
+    pub(crate) category: LogCategory,
+    pub(crate) include_content: bool,
+}
+
 #[derive(Clone)]
 pub(crate) struct LogBuffer {
     session_id: Arc<str>,
     entries: Arc<Mutex<(u64, VecDeque<LogEntry>)>>,
     redactions: Arc<Vec<String>>,
     updates: watch::Sender<u64>,
+    content_users: Arc<AtomicUsize>,
+    content_epoch: Arc<AtomicU64>,
+}
+
+pub(crate) struct ContentCapture(LogBuffer);
+
+impl Drop for ContentCapture {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.0.content_users.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.0.content_epoch.fetch_add(1, Ordering::Release);
+            for entry in &mut state.1 {
+                entry.content = None;
+            }
+        }
+    }
 }
 
 impl fmt::Debug for LogBuffer {
@@ -41,7 +81,10 @@ pub(crate) struct LogEntry {
     pub(crate) timestamp: String,
     pub(crate) level: String,
     pub(crate) target: String,
+    pub(crate) category: &'static str,
     pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) content: Option<String>,
     pub(crate) instance_id: Option<String>,
     pub(crate) fields: BTreeMap<String, String>,
 }
@@ -98,6 +141,8 @@ impl LogBuffer {
             entries: Arc::new(Mutex::new((0, VecDeque::with_capacity(CAPACITY)))),
             redactions: Arc::new(redactions),
             updates: watch::channel(0).0,
+            content_users: Arc::new(AtomicUsize::new(0)),
+            content_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -109,6 +154,18 @@ impl LogBuffer {
         self.updates.subscribe()
     }
 
+    pub(crate) fn capture_content(&self) -> ContentCapture {
+        let _state = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.content_users.fetch_add(1, Ordering::Relaxed) == 0 {
+            self.content_epoch.fetch_add(1, Ordering::Release);
+        }
+        ContentCapture(self.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) fn stream_snapshot(
         &self,
         after: Option<u64>,
@@ -117,18 +174,55 @@ impl LogBuffer {
         level: Option<&str>,
         instance: Option<&str>,
     ) -> LogPage {
+        self.filtered_stream_snapshot(
+            after,
+            session_id,
+            limit,
+            LogSelection {
+                level,
+                instance,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub(crate) fn filtered_stream_snapshot(
+        &self,
+        after: Option<u64>,
+        session_id: Option<&str>,
+        limit: usize,
+        selection: LogSelection<'_>,
+    ) -> LogPage {
         let reset = session_id.is_some_and(|session| session != self.session_id.as_ref());
-        let mut page = self.snapshot(if reset { None } else { after }, limit, level, instance);
+        let mut page = self.filtered_snapshot(if reset { None } else { after }, limit, selection);
         page.dropped |= reset;
         page
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(
         &self,
         after: Option<u64>,
         limit: usize,
         level: Option<&str>,
         instance: Option<&str>,
+    ) -> LogPage {
+        self.filtered_snapshot(
+            after,
+            limit,
+            LogSelection {
+                level,
+                instance,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub(crate) fn filtered_snapshot(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+        selection: LogSelection<'_>,
     ) -> LogPage {
         let state = self
             .entries
@@ -137,8 +231,15 @@ impl LogBuffer {
         let (latest, ring) = &*state;
         let limit = limit.clamp(1, CAPACITY);
         let matches = |entry: &&LogEntry| {
-            severity(&entry.level) >= severity(level.unwrap_or("TRACE"))
-                && instance.is_none_or(|instance| entry.instance_id.as_deref() == Some(instance))
+            severity(&entry.level) >= severity(selection.level.unwrap_or("TRACE"))
+                && selection
+                    .instance
+                    .is_none_or(|instance| entry.instance_id.as_deref() == Some(instance))
+                && match selection.category {
+                    LogCategory::Runtime => entry.category == "runtime",
+                    LogCategory::Message => entry.category == "message",
+                    LogCategory::All => true,
+                }
         };
         let reset = after.is_some_and(|cursor| cursor > *latest);
         let dropped = reset
@@ -148,7 +249,7 @@ impl LogBuffer {
             });
         let mut next_cursor = *latest;
         let mut has_more = false;
-        let entries = if after.is_none() || reset {
+        let mut entries = if after.is_none() || reset {
             let mut entries = ring
                 .iter()
                 .rev()
@@ -176,6 +277,11 @@ impl LogBuffer {
             }
             entries
         };
+        if !selection.include_content {
+            for entry in &mut entries {
+                entry.content = None;
+            }
+        }
         LogPage {
             session_id: self.session_id.to_string(),
             entries,
@@ -270,6 +376,7 @@ impl fmt::Write for Bounded {
 #[derive(Clone, Debug, Default)]
 struct Captured {
     message: Option<String>,
+    content: Option<String>,
     instance_id: Option<String>,
     fields: BTreeMap<String, String>,
 }
@@ -290,11 +397,16 @@ impl Captured {
 struct Visitor<'a> {
     buffer: &'a LogBuffer,
     captured: &'a mut Captured,
+    capture_content: bool,
 }
 
 impl Visitor<'_> {
     fn record(&mut self, field: &Field, value: impl FnOnce(usize) -> String) {
         let name = field.name();
+        if name == "content" && self.capture_content {
+            self.captured.content = Some(value(2048));
+            return;
+        }
         let limit = if name == "message" { 2048 } else { 512 };
         let value = if sensitive(name) {
             "[REDACTED]".to_owned()
@@ -368,6 +480,7 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for LiveLayer {
         attributes.record(&mut Visitor {
             buffer: &self.0,
             captured: &mut captured,
+            capture_content: false,
         });
         if let Some(span) = context.span(id) {
             span.extensions_mut().insert(captured);
@@ -381,6 +494,7 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for LiveLayer {
                 values.record(&mut Visitor {
                     buffer: &self.0,
                     captured,
+                    capture_content: false,
                 });
             }
         }
@@ -390,6 +504,8 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for LiveLayer {
         if event.metadata().target() == super::MESSAGE_LOG_TARGET {
             return;
         }
+        let is_message = event.metadata().target() == MESSAGE_TRACE_TARGET;
+        let capture_epoch = self.0.content_epoch.load(Ordering::Acquire);
         let mut captured = Captured::default();
         if let Some(scope) = context.event_scope(event) {
             for span in scope.from_root() {
@@ -401,13 +517,27 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for LiveLayer {
         event.record(&mut Visitor {
             buffer: &self.0,
             captured: &mut captured,
+            capture_content: is_message && capture_epoch % 2 == 1,
         });
+        if is_message {
+            captured.fields.remove("content");
+        }
         let mut state = self
             .0
             .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.0 += 1;
+        // The final capture lease and insertion share the ring lock. A writer
+        // already formatting content cannot reinsert it after capture stops.
+        let body_preview = if is_message
+            && capture_epoch % 2 == 1
+            && self.0.content_epoch.load(Ordering::Acquire) == capture_epoch
+        {
+            captured.content
+        } else {
+            None
+        };
         let entry = LogEntry {
             id: state.0,
             timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -415,7 +545,9 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for LiveLayer {
             target: self
                 .0
                 .clean(event.metadata().target().to_owned(), 128, false),
+            category: if is_message { "message" } else { "runtime" },
             message: captured.message.unwrap_or_default(),
+            content: body_preview,
             instance_id: captured.instance_id,
             fields: captured.fields,
         };
@@ -432,3 +564,7 @@ impl<S: Subscriber + for<'lookup> LookupSpan<'lookup>> Layer<S> for LiveLayer {
 #[cfg(test)]
 #[path = "live_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "live_message_tests.rs"]
+mod message_tests;

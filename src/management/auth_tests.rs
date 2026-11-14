@@ -151,6 +151,7 @@ async fn none_mode_requires_loopback_host_but_no_token() {
         expected: None,
         secure_cookie: false,
         sessions: Arc::default(),
+        changes: tokio::sync::watch::channel(()).0,
     });
     for value in [
         "localhost:9090",

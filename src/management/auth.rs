@@ -29,6 +29,7 @@ pub(super) struct AuthState {
     expected: Option<[u8; 32]>,
     secure_cookie: bool,
     sessions: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    changes: tokio::sync::watch::Sender<()>,
 }
 
 impl From<[u8; 32]> for AuthState {
@@ -37,6 +38,7 @@ impl From<[u8; 32]> for AuthState {
             expected: Some(expected),
             secure_cookie: false,
             sessions: Arc::default(),
+            changes: tokio::sync::watch::channel(()).0,
         }
     }
 }
@@ -50,6 +52,7 @@ impl AuthState {
                 expected: None,
                 secure_cookie: config.session_cookie_secure,
                 sessions: Arc::default(),
+                changes: tokio::sync::watch::channel(()).0,
             });
         }
         let token = std::env::var("BKMQB_MANAGEMENT_TOKEN")
@@ -70,10 +73,7 @@ impl AuthState {
         if self.expected.is_none() {
             return true;
         }
-        if single_header(headers, header::AUTHORIZATION.as_str())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| self.token_valid(token))
-        {
+        if self.bearer_valid(headers) {
             return true;
         }
         let Some(digest) = session_digest(headers) else {
@@ -86,6 +86,28 @@ impl AuthState {
         let now = Instant::now();
         sessions.retain(|_, expires| *expires > now);
         sessions.contains_key(&digest)
+    }
+
+    fn bearer_valid(&self, headers: &HeaderMap) -> bool {
+        single_header(headers, header::AUTHORIZATION.as_str())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| self.token_valid(token))
+    }
+
+    pub(super) fn changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
+    }
+
+    pub(super) fn expires_at(&self, headers: &HeaderMap) -> Option<Instant> {
+        if self.expected.is_none() || self.bearer_valid(headers) {
+            return None;
+        }
+        let digest = session_digest(headers)?;
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&digest)
+            .copied()
     }
 
     fn status(&self, authenticated: bool) -> Json<Value> {
@@ -170,6 +192,7 @@ async fn login(
         sessions.remove(&previous);
     }
     sessions.insert(digest, now + SESSION_TTL);
+    auth.changes.send_replace(());
     (
         [(
             header::SET_COOKIE,
@@ -190,6 +213,7 @@ async fn logout(State(auth): State<AuthState>, headers: HeaderMap, uri: Uri) -> 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&digest);
+        auth.changes.send_replace(());
     }
     (
         [(
@@ -389,5 +413,70 @@ mod stream_expiration_test {
                 .contains("event: auth-required")
         );
         assert!(body.next().await.is_none());
+    }
+    #[tokio::test]
+    async fn expiration_revokes_capture_even_for_an_unpolled_response() {
+        use crate::logging::live::{LogBuffer, LogCategory, LogSelection};
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let auth: AuthState = [0; 32].into();
+        let id = uuid::Uuid::new_v4().to_string();
+        let digest = Sha256::digest(id.as_bytes()).into();
+        auth.sessions
+            .lock()
+            .unwrap()
+            .insert(digest, Instant::now() + SESSION_TTL);
+        let logs = LogBuffer::default();
+        let app = super::super::logs_stream::router(logs.clone(), auth.clone(), None);
+        let response = app
+            .oneshot(
+                Request::get("/api/logs/stream?category=message&include_content=true")
+                    .header(header::COOKIE, format!("{COOKIE}={id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let selection = LogSelection {
+            category: LogCategory::Message,
+            include_content: true,
+            ..Default::default()
+        };
+        let emit = || {
+            tracing::subscriber::with_default(
+                tracing_subscriber::registry().with(logs.layer()),
+                || {
+                    tracing::info!(target: crate::logging::live::MESSAGE_TRACE_TARGET, content = "private body", "message");
+                },
+            );
+        };
+        emit();
+        assert!(
+            logs.filtered_snapshot(None, 1, selection).entries[0]
+                .content
+                .is_some()
+        );
+        auth.sessions
+            .lock()
+            .unwrap()
+            .insert(digest, Instant::now() + Duration::from_millis(20));
+        auth.changes.send_replace(());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while logs.filtered_snapshot(None, 1, selection).entries[0]
+                .content
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        emit();
+        assert!(
+            logs.filtered_snapshot(None, 1, selection).entries[0]
+                .content
+                .is_none()
+        );
+        drop(response);
     }
 }

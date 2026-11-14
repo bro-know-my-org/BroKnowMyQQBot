@@ -1,6 +1,7 @@
 //! Cursor-based access to bounded logs from this process.
 
 use super::plugins::ApiState;
+use crate::logging::live::{LogCategory, LogSelection};
 use axum::{
     Json,
     extract::{Query, State},
@@ -17,9 +18,20 @@ pub(super) struct LogQuery {
     pub(super) limit: Option<usize>,
     pub(super) level: Option<String>,
     pub(super) instance_id: Option<String>,
+    pub(super) category: LogCategory,
+    pub(super) include_content: bool,
 }
 
 impl LogQuery {
+    pub(super) fn selection(&self) -> LogSelection<'_> {
+        LogSelection {
+            level: self.level.as_deref(),
+            instance: self.instance_id.as_deref(),
+            category: self.category,
+            include_content: self.include_content,
+        }
+    }
+
     pub(super) fn valid(&self) -> bool {
         (1..=200).contains(&self.limit.unwrap_or(200))
             && !self.level.as_deref().is_some_and(|level| {
@@ -39,12 +51,11 @@ pub(super) async fn get(State(state): State<ApiState>, Query(query): Query<LogQu
         )
             .into_response();
     }
-    Json(state.logs.snapshot(
-        query.after,
-        query.limit.unwrap_or(200),
-        query.level.as_deref(),
-        query.instance_id.as_deref(),
-    ))
+    Json(
+        state
+            .logs
+            .filtered_snapshot(query.after, query.limit.unwrap_or(200), query.selection()),
+    )
     .into_response()
 }
 
@@ -120,6 +131,8 @@ mod tests {
             "?unknown=value",
             "?instance_id=",
             "?instance_id=%0A",
+            "?category=unknown",
+            "?include_content=1",
         ] {
             assert_eq!(get(&app, query).await.0, StatusCode::BAD_REQUEST, "{query}");
         }

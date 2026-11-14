@@ -1,6 +1,10 @@
 //! Bounded SSE log delivery. The response owns its slot and all waiting state.
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use axum::{
     Json, Router,
@@ -22,7 +26,7 @@ use super::{
     auth::{self, AuthState},
     logs::LogQuery,
 };
-use crate::logging::live::LogBuffer;
+use crate::logging::live::{ContentCapture, LogBuffer, LogCategory};
 
 const IDLE_CHECK: Duration = Duration::from_secs(15);
 const MAX_STREAMS: usize = 16;
@@ -57,6 +61,8 @@ struct StreamQuery {
     limit: Option<usize>,
     level: Option<String>,
     instance_id: Option<String>,
+    category: LogCategory,
+    include_content: bool,
 }
 
 fn valid_session(session: &str) -> bool {
@@ -99,6 +105,8 @@ impl StreamQuery {
             limit: self.limit,
             level: self.level,
             instance_id: self.instance_id,
+            category: self.category,
+            include_content: self.include_content,
         };
         query.valid().then_some((query, self.session_id))
     }
@@ -126,6 +134,8 @@ async fn stream(
     // Subscribe before the first snapshot, including when the body is polled later.
     let updates = context.logs.subscribe();
     let first = query.after.is_none();
+    let capture = (query.include_content && !matches!(query.category, LogCategory::Runtime))
+        .then(|| CaptureLease::new(&context, &headers));
     let state = StreamState {
         context,
         query,
@@ -135,6 +145,7 @@ async fn stream(
         permit: Some(permit),
         first,
         next_page_at: None,
+        capture,
     };
     let events = futures_util::stream::unfold(state, |mut state| async move {
         let event = state.next().await?;
@@ -153,6 +164,60 @@ async fn stream(
     response
 }
 
+// A slow or never-polled body must not keep capturing after its authority ends.
+struct CaptureLease {
+    capture: Arc<Mutex<Option<ContentCapture>>>,
+    watcher: tokio::task::JoinHandle<()>,
+}
+
+impl CaptureLease {
+    fn new(context: &StreamContext, headers: &HeaderMap) -> Self {
+        let mut changes = context.auth.changes();
+        let capture = Arc::new(Mutex::new(Some(context.logs.capture_content())));
+        let held = capture.clone();
+        let auth = context.auth.clone();
+        let headers = headers.clone();
+        let mut shutdown = context.shutdown.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                if !auth.authenticated(&headers)
+                    || shutdown.as_ref().is_some_and(ShutdownSignal::is_shutdown)
+                {
+                    break;
+                }
+                let delay = auth.expires_at(&headers).map_or(IDLE_CHECK, |deadline| {
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(IDLE_CHECK)
+                });
+                tokio::select! {
+                    biased;
+                    () = async {
+                        if let Some(signal) = &mut shutdown { signal.cancelled().await; }
+                        else { std::future::pending::<()>().await; }
+                    } => break,
+                    result = changes.changed() => { if result.is_err() { break; } }
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+            held.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+        });
+        Self { capture, watcher }
+    }
+}
+
+impl Drop for CaptureLease {
+    fn drop(&mut self) {
+        self.capture
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        self.watcher.abort();
+    }
+}
+
 struct StreamState {
     context: StreamContext,
     query: LogQuery,
@@ -162,6 +227,7 @@ struct StreamState {
     permit: Option<OwnedSemaphorePermit>,
     first: bool,
     next_page_at: Option<tokio::time::Instant>,
+    capture: Option<CaptureLease>,
 }
 
 impl StreamState {
@@ -175,10 +241,12 @@ impl StreamState {
                     .is_some_and(ShutdownSignal::is_shutdown)
             {
                 self.permit.take();
+                self.capture.take();
                 return None;
             }
             if !self.context.auth.authenticated(&self.headers) {
                 self.permit.take();
+                self.capture.take();
                 return Some(Event::default().event("auth-required").data("{}"));
             }
             // Coalesce bursts against the bounded ring instead of sending one
@@ -190,12 +258,11 @@ impl StreamState {
             // Mark the notification seen before snapshotting: writes during or
             // after the snapshot remain observable by changed().
             self.updates.borrow_and_update();
-            let page = self.context.logs.stream_snapshot(
+            let page = self.context.logs.filtered_stream_snapshot(
                 self.query.after,
                 self.session_id.as_deref(),
                 self.query.limit.unwrap_or(200),
-                self.query.level.as_deref(),
-                self.query.instance_id.as_deref(),
+                self.query.selection(),
             );
             if self.first || page.dropped || self.query.after != Some(page.next_cursor) {
                 self.first = false;
@@ -222,6 +289,7 @@ impl StreamState {
                     }
                 } => {
                     self.permit.take();
+                    self.capture.take();
                     return None;
                 }
                 result = self.updates.changed() => {
