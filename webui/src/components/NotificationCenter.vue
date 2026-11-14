@@ -74,7 +74,7 @@ onBeforeUnmount(() => {
   </section>
   <aside v-if="center.state.open" id="notification-history" ref="history" class="notification-history" aria-labelledby="notification-history-title">
     <div class="notification-history-header"><h2 id="notification-history-title">通知历史</h2><button ref="closeButton" type="button" class="notification-close" aria-label="关闭通知历史" @click="close">×</button></div>
-    <p class="hint">本次页面会话最近 100 条，刷新或退出后清空。</p>
+    <p class="hint">本标签页最近 100 条操作通知，刷新后保留，退出后清空；并非服务器通知。</p>
     <div class="notification-history-actions"><button type="button" :disabled="!center.unread.value" @click="center.markAllRead">全部已读</button><button type="button" :disabled="!center.state.history.length" @click="center.clearHistory">清空历史</button></div>
     <ol v-if="center.state.history.length" class="notification-history-list">
       <li v-for="entry in center.state.history" :key="entry.id" :data-notification-id="entry.id"><div class="notification-heading"><strong><span aria-hidden="true">{{ marks[entry.tone] }}</span> {{ labels[entry.tone] }}<span v-if="entry.unread"> · 未读</span></strong><time :datetime="new Date(entry.createdAt).toISOString()">{{ time(entry.createdAt) }}</time></div><p>{{ entry.message }}</p><small>{{ entry.source }}</small></li>

@@ -23,7 +23,7 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
   if (path.startsWith('/api/session')) {
     if (path.endsWith('/login')) sessionAuthenticated = true;
     if (path.endsWith('/logout')) sessionAuthenticated = false;
-    return new Response(JSON.stringify({ mode: sessionMode, authenticated: sessionMode === 'none' || sessionAuthenticated }));
+    return new Response(JSON.stringify({ mode: sessionMode, authenticated: sessionMode === 'none' || sessionAuthenticated, history_scope: 'a'.repeat(64) }));
   }
   if (!sessionAuthenticated && sessionMode !== 'none') return new Response('{}', { status: 401 });
   if (path === '/api/runtime') return new Response(JSON.stringify(runtimeFixture()));
@@ -81,7 +81,7 @@ describe('浏览器管理会话', () => {
     expect(value('#field-0')).toBe('1'); expect(document.querySelector('#token')).toBeNull();
     expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins']);
     expect(requests.every(r => r.init.credentials === 'same-origin' && !r.body?.token)).toBe(true);
-    expect(Storage.prototype.setItem).not.toHaveBeenCalled();
+    expect(vi.mocked(Storage.prototype.setItem).mock.calls.every(args => !String(args[1]).includes('test-token'))).toBe(true);
   });
   it('显式退出撤销会话，刷新后仍显示登录表单', async () => {
     await login(); await click('#logout'); expect(sessionAuthenticated).toBe(false);
@@ -134,7 +134,7 @@ describe('插件管理的实际组件交互', () => {
     expect(config).not.toHaveProperty('greeting'); expect(config).not.toHaveProperty('absent');
     expect(requests.every(r => r.init.mode === 'same-origin' && r.init.credentials === 'same-origin' && !(r.init.headers as Record<string, string>).Authorization)).toBe(true);
     expect(requests.filter(r => r.body?.token).map(r => r.path)).toEqual(['/api/session/login']);
-    expect(Storage.prototype.setItem).not.toHaveBeenCalled();
+    expect(vi.mocked(Storage.prototype.setItem).mock.calls.every(args => !String(args[1]).includes('test-token'))).toBe(true);
   });
   it('保存配置和启停不改变运行态，应用携带保存后的版本', async () => {
     await login(); await input('#field-0', '3'); await click('#save');
@@ -168,7 +168,7 @@ describe('插件管理的实际组件交互', () => {
     expect(document.querySelector('[aria-label="插件详情"]')).toBeNull(); expect(value('#token')).toBe(''); expect(text()).toContain('登录已失效');
     await input('#token', 'new-token'); await submit('#login-form');
     expect(requests.filter(r => r.path === '/api/session/login').at(-1)!.body).toEqual({ token: 'new-token' });
-    expect((requests.at(-1)!.init.headers as Record<string, string>).Authorization).toBeUndefined(); expect(Storage.prototype.setItem).not.toHaveBeenCalled();
+    expect((requests.at(-1)!.init.headers as Record<string, string>).Authorization).toBeUndefined(); expect(vi.mocked(Storage.prototype.setItem).mock.calls.every(args => !String(args[1]).includes('test-token'))).toBe(true);
   });
   it('复杂 Schema 用 JSON 编辑并拒绝非对象；文件插件不可编辑', async () => {
     plugins = [fixture({ schema: { allOf: [{ type: 'object' }] } }), fixture({ instance_id: 'file', editable: false, name: '文件插件' })]; await login();
@@ -314,8 +314,7 @@ it('通知按钮可回看跨页历史，退出登录后清空上一会话的通�
   await click('.notification-history-actions button');
   expect(get('[aria-controls="notification-history"]').getAttribute('aria-label')).toContain('0 条未读');
   await click('#logout'); expect(document.querySelector('#notification-history')).toBeNull();
-  await click('[aria-controls="notification-history"]');
-  expect(get('#notification-history').textContent).not.toContain('已保存；点击“立即应用”后更新运行时。');
+  expect(document.querySelector('[aria-controls="notification-history"]')).toBeNull();
 });
 
 it('前缀操作完成进入通知历史，页面保留当前运行值与编辑状态', async () => {
@@ -406,4 +405,34 @@ it('写入响应丢失后离开并重进市场仍同步已安装实例，不重�
   await click('.market-list button'); await flush();
   await go(pluginRoute(item.instance_id));
   expect(text()).toContain('Market Ping'); expect(text()).not.toContain('未找到插件实例'); expect(writes).toBe(1);
+});
+
+it('同标签刷新恢复已认证通知但不重弹旧浮层，过期清空且登录页不显示历史', async () => {
+  vi.mocked(Storage.prototype.setItem).mockRestore(); sessionStorage.clear();
+  await login(); await input('#field-0', '2'); await click('#save');
+  window.dispatchEvent(new PageTransitionEvent('pagehide')); await flush();
+  expect(document.querySelector('#notification-history')).toBeNull();
+  app.unmount(); document.body.replaceChildren(); await mount();
+  expect(Array.from(document.querySelectorAll('.notification-toast')).some(e => e.textContent?.includes('已保存；点击'))).toBe(false);
+  await click('[aria-controls="notification-history"]'); expect(get('#notification-history').textContent).toContain('已保存；点击');
+  window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })); sessionAuthenticated = false;
+  window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })); await flush();
+  expect(document.querySelector('#login-form')).not.toBeNull(); expect(document.querySelector('#notification-history')).toBeNull();
+  expect(sessionStorage.getItem('bkmqb.notice-history.v1')).toBeNull();
+});
+it('401与显式退出清除存储，之后新登录不继承通知', async () => {
+  vi.mocked(Storage.prototype.setItem).mockRestore(); sessionStorage.clear();
+  await login(); await input('#field-0', '2'); await click('#save');
+  fail = { path: '/api/plugins', method: 'GET', status: 401 }; await click('#refresh');
+  expect(sessionStorage.getItem('bkmqb.notice-history.v1')).toBeNull();
+  await input('#token', 'test-token'); await submit('#login-form');
+  await click('[aria-controls="notification-history"]'); expect(get('#notification-history').textContent).not.toContain('已保存；点击');
+  await click('#logout'); expect(sessionStorage.getItem('bkmqb.notice-history.v1')).toBeNull();
+});
+it('none模式刷新同样保留本标签通知历史', async () => {
+  vi.mocked(Storage.prototype.setItem).mockRestore(); sessionStorage.clear(); sessionMode = 'none';
+  await mount(); await input('#field-0', '2'); await click('#save');
+  app.unmount(); document.body.replaceChildren(); await mount();
+  await click('[aria-controls="notification-history"]'); expect(get('#notification-history').textContent).toContain('已保存；点击');
+  sessionStorage.clear();
 });

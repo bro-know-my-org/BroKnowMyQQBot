@@ -73,9 +73,15 @@ async fn cookie_survives_refresh_and_logout_revokes_replay() {
     assert!(!set_cookie.contains("Max-Age"));
     let cookie = session_cookie(&response);
     let headers = [("cookie", cookie.as_str())];
+    let status = json(response).await;
+    assert_eq!(status["mode"], "token");
+    assert_eq!(status["authenticated"], true);
+    let scope = status["history_scope"].as_str().unwrap();
+    assert_eq!(scope.len(), 64);
+    assert!(!cookie.contains(scope));
     assert_eq!(
-        json(response).await,
-        json!({"mode":"token","authenticated":true})
+        json(call(app.clone(), "GET", "/api/session", &headers, "").await).await["history_scope"],
+        scope
     );
     assert_eq!(
         json(call(app.clone(), "GET", "/api/session", &headers, "").await).await["authenticated"],
@@ -149,6 +155,7 @@ async fn bearer_and_login_validate_credentials_without_echoing_them() {
 async fn none_mode_requires_loopback_host_but_no_token() {
     let app = app(AuthState {
         expected: None,
+        notice_epoch: "test-none-epoch".into(),
         secure_cookie: false,
         sessions: Arc::default(),
         changes: tokio::sync::watch::channel(()).0,
@@ -167,10 +174,10 @@ async fn none_mode_requires_loopback_host_but_no_token() {
                 .status(),
             StatusCode::OK
         );
-        assert_eq!(
-            json(call(app.clone(), "GET", "/api/session", &headers, "").await).await,
-            json!({"mode":"none","authenticated":true})
-        );
+        let status = json(call(app.clone(), "GET", "/api/session", &headers, "").await).await;
+        assert_eq!(status["mode"], "none");
+        assert_eq!(status["authenticated"], true);
+        assert_eq!(status["history_scope"].as_str().unwrap().len(), 64);
     }
     for headers in [
         vec![],
@@ -435,5 +442,38 @@ async fn relogin_rotates_cookie_at_capacity_and_secure_proxy_setting_is_explicit
             .to_str()
             .unwrap()
             .contains("; Secure")
+    );
+}
+
+#[tokio::test]
+async fn notification_scope_is_stable_only_within_the_authenticated_session() {
+    let app = app(state());
+    let first = login(app.clone()).await;
+    let cookie = session_cookie(&first);
+    let scope = json(first).await["history_scope"].clone();
+    let headers = [("cookie", cookie.as_str())];
+    let second = call(
+        app.clone(),
+        "POST",
+        "/api/session/login",
+        &headers,
+        &format!("{{\"token\":\"{TOKEN}\"}}"),
+    )
+    .await;
+    let second_cookie = session_cookie(&second);
+    let second_scope = json(second).await["history_scope"].clone();
+    assert_ne!(scope, second_scope);
+    assert!(
+        json(call(app.clone(), "GET", "/api/session", &headers, "").await).await["history_scope"]
+            .is_null()
+    );
+    let headers = [("cookie", second_cookie.as_str())];
+    assert_eq!(
+        json(call(app.clone(), "GET", "/api/session", &headers, "").await).await["history_scope"],
+        second_scope
+    );
+    let _ = call(app.clone(), "POST", "/api/session/logout", &headers, "{}").await;
+    assert!(
+        json(call(app, "GET", "/api/session", &headers, "").await).await["history_scope"].is_null()
     );
 }

@@ -1,4 +1,5 @@
 import { computed, inject, onBeforeUnmount, reactive, watch, type InjectionKey } from 'vue';
+import { noticeStorage } from './noticeStorage';
 
 export type NoticeTone = 'info' | 'success' | 'warning' | 'error' | 'progress';
 export type NoticeSurface = 'toast' | 'history';
@@ -6,9 +7,12 @@ export interface NoticeEntry { id: number; source: string; message: string; tone
 export type NotificationCenter = ReturnType<typeof createNotifications>;
 export const notificationKey: InjectionKey<NotificationCenter> = Symbol('notifications');
 
-/** Per-session, memory-only notifications. Background time never consumes a toast's lifetime. */
+/** Per-session notifications. Background time never consumes a toast's lifetime. */
 export function createNotifications() {
   const state = reactive<{ active: NoticeEntry[]; history: NoticeEntry[]; open: boolean }>({ active: [], history: [], open: false });
+  const persistence = noticeStorage();
+  let scope: string | undefined;
+  const stopSaving = watch(() => state.history, entries => { if (scope) persistence.save(scope, entries); }, { deep: true, flush: 'sync' });
   const clocks = new Map<number, { remaining: number; started?: number; timer?: ReturnType<typeof setTimeout>; pauses: Set<string> }>();
   const visible = { toast: new Set<number>(), history: new Set<number>() };
   let sequence = 0, focused = document.hasFocus(), suspended = false, disposed = false;
@@ -65,14 +69,21 @@ export function createNotifications() {
   function markAllRead() { for (const entry of state.history) entry.unread = false; }
   function setSuspended(value: boolean) { suspended = value; sync(); }
   function clearHistory() { for (const entry of [...state.active]) if (entry.tone !== 'progress') dismiss(entry.id); visible.history.clear(); state.history = []; }
-  function reset() { for (const entry of [...state.active]) dismiss(entry.id); visible.history.clear(); state.history = []; state.open = false; }
+  function authenticate(nextScope: string | undefined, restore: boolean) {
+    const previous = restore && nextScope ? persistence.load(nextScope) : [];
+    reset(); scope = nextScope;
+    state.history = previous;
+    sequence = Math.max(sequence, ...previous.map(entry => entry.id));
+  }
+  function suspendSession() { scope = undefined; reset(false); }
+  function reset(clearStored = true) { scope = undefined; if (clearStored) persistence.clear(); for (const entry of [...state.active]) dismiss(entry.id); visible.history.clear(); state.history = []; state.open = false; }
   const focus = () => { focused = true; sync(); }, blur = () => { focused = false; sync(); };
   function dispose() {
-    reset(); disposed = true;
+    suspendSession(); stopSaving(); disposed = true;
     window.removeEventListener('focus', focus); window.removeEventListener('blur', blur); document.removeEventListener('visibilitychange', sync);
   }
   window.addEventListener('focus', focus); window.addEventListener('blur', blur); document.addEventListener('visibilitychange', sync);
-  return { state, unread, notify, dismiss, clearSource, setPaused, setOpen, setVisible, markAllRead, setSuspended, clearHistory, reset, dispose };
+  return { state, unread, notify, dismiss, clearSource, setPaused, setOpen, setVisible, markAllRead, setSuspended, clearHistory, authenticate, suspendSession, reset, dispose };
 }
 
 /** Standalone pages retain their inline feedback; the application provides the floating center. */

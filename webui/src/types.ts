@@ -11,7 +11,7 @@ export interface PluginView {
 export type PluginAction = 'config' | 'enabled' | 'apply';
 export interface Mutation { action: PluginAction; config?: Config; enabled?: boolean }
 export interface Commands { prefix: string; revision: string; saved_prefix?: string; pending?: boolean }
-export interface Session { mode: 'token' | 'none'; authenticated: boolean }
+export interface Session { mode: 'token' | 'none'; authenticated: boolean; history_scope?: string | null }
 export type LogCategory = 'runtime' | 'message';
 export interface LogEntry { id: number; category: LogCategory; content?: string; timestamp: string; level: string; target: string; message: string; instance_id: string | null; fields: Record<string, string> }
 export interface LogPage { session_id: string; entries: LogEntry[]; next_cursor: number; dropped: boolean; has_more: boolean }

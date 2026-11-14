@@ -27,6 +27,7 @@ const MAX_SESSIONS: usize = 128;
 #[derive(Clone)]
 pub(super) struct AuthState {
     expected: Option<[u8; 32]>,
+    notice_epoch: Arc<str>,
     secure_cookie: bool,
     sessions: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     changes: tokio::sync::watch::Sender<()>,
@@ -36,6 +37,7 @@ impl From<[u8; 32]> for AuthState {
     fn from(expected: [u8; 32]) -> Self {
         Self {
             expected: Some(expected),
+            notice_epoch: uuid::Uuid::new_v4().to_string().into(),
             secure_cookie: false,
             sessions: Arc::default(),
             changes: tokio::sync::watch::channel(()).0,
@@ -50,6 +52,7 @@ impl AuthState {
         if config.auth == crate::config::ManagementAuth::None {
             return Ok(Self {
                 expected: None,
+                notice_epoch: uuid::Uuid::new_v4().to_string().into(),
                 secure_cookie: config.session_cookie_secure,
                 sessions: Arc::default(),
                 changes: tokio::sync::watch::channel(()).0,
@@ -110,9 +113,19 @@ impl AuthState {
             .copied()
     }
 
-    fn status(&self, authenticated: bool) -> Json<Value> {
+    fn status(&self, authenticated: bool, digest: Option<[u8; 32]>) -> Json<Value> {
+        // Separate, non-authenticating identifier: never return the Cookie or its digest.
+        let history_scope = authenticated.then(|| {
+            let mut hash = Sha256::new();
+            hash.update(self.notice_epoch.as_bytes());
+            if let Some(digest) = digest.filter(|_| self.expected.is_some()) {
+                hash.update(digest);
+            }
+            hex::encode(hash.finalize())
+        });
         Json(
-            json!({"mode": if self.expected.is_some() { "token" } else { "none" }, "authenticated": authenticated}),
+            json!({"mode": if self.expected.is_some() { "token" } else { "none" },
+            "authenticated": authenticated, "history_scope": history_scope}),
         )
     }
 }
@@ -150,7 +163,7 @@ async fn check_source(State(auth): State<AuthState>, request: Request, next: Nex
 }
 
 async fn session(State(auth): State<AuthState>, headers: HeaderMap) -> Json<Value> {
-    auth.status(auth.authenticated(&headers))
+    auth.status(auth.authenticated(&headers), session_digest(&headers))
 }
 
 #[derive(Deserialize)]
@@ -166,7 +179,7 @@ async fn login(
     Json(login): Json<Login>,
 ) -> Response {
     if auth.expected.is_none() {
-        return auth.status(true).into_response();
+        return auth.status(true, None).into_response();
     }
     if !auth.token_valid(&login.token) {
         return unauthorized();
@@ -202,7 +215,7 @@ async fn login(
                 auth.secure_cookie || uri.scheme_str() == Some("https"),
             ),
         )],
-        auth.status(true),
+        auth.status(true, Some(digest)),
     )
         .into_response()
 }
@@ -224,7 +237,7 @@ async fn logout(State(auth): State<AuthState>, headers: HeaderMap, uri: Uri) -> 
                 auth.secure_cookie || uri.scheme_str() == Some("https"),
             ),
         )],
-        auth.status(auth.expected.is_none()),
+        auth.status(auth.expected.is_none(), None),
     )
         .into_response()
 }

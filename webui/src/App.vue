@@ -11,7 +11,6 @@ import CommandSettings from './components/CommandSettings.vue';
 import PluginList from './components/PluginList.vue';
 import PluginDetail from './components/PluginDetail.vue';
 import NotificationCenter from './components/NotificationCenter.vue';
-import NotificationButton from './components/NotificationButton.vue';
 import { createNotifications, notificationKey } from './notifications';
 import { ApiError, createApi } from './api';
 import type { Mutation, PluginView, Session } from './types';
@@ -27,8 +26,8 @@ const detailTab = computed(() => route.name === 'plugin-config' ? 'config' : rou
 const api = createApi(() => logout('登录已失效，请重新输入管理 Token。'));
 let epoch = 0, refreshAfterBusy = false;
 function report(text: string, failed = true, progress = false) { notifications.notify('控制台', text, progress ? 'progress' : failed ? 'error' : 'success'); }
-function logout(text = '') {
-  notifications.reset();
+function logout(text = '', unloading = false) {
+  if (!unloading) notifications.reset();
   api.clear(); epoch++; refreshAfterBusy = false; authenticated.value = false; tokenInput.value = ''; plugins.value = []; refreshedAt.value = '';
   busy.value = false; checkingSession.value = false; sessionFailed.value = false; pluginsFailed.value = false; authMode.value = 'token';
   pluginDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
@@ -60,10 +59,12 @@ async function refreshPlugins() {
 function login() {
   if (busy.value) return;
   const value = tokenInput.value.trim(); tokenInput.value = ''; if (!value) { report('请输入管理 Token。'); return; }
+  notifications.reset();
   void perform(async () => { const session = await api.request<Session>('/api/session/login', { token: value }); readSession(session); if (!session.authenticated) throw new Error('登录未完成，请重试。'); await refreshPlugins(); }, '正在验证并加载插件…');
 }
-function readSession(session: Session) {
+function readSession(session: Session, restore = false) {
   if (!session || !['token', 'none'].includes(session.mode) || typeof session.authenticated !== 'boolean') throw new Error('会话响应格式异常，请重试。');
+  notifications.authenticate(session.authenticated && typeof session.history_scope === 'string' && /^[a-f0-9]{64}$/.test(session.history_scope) ? session.history_scope : undefined, restore && session.authenticated);
   authMode.value = session.mode;
   authenticated.value = session.authenticated;
 }
@@ -72,7 +73,7 @@ function restoreSession() {
   const current = epoch;
   checkingSession.value = true; sessionFailed.value = false;
   void perform(async () => {
-    try { const session = await api.request<Session>('/api/session'); readSession(session); if (session.authenticated) await refreshPlugins(); else report('', false); }
+    try { const session = await api.request<Session>('/api/session'); readSession(session, true); if (session.authenticated) await refreshPlugins(); else report('', false); }
     catch (e) { if (current === epoch && !authenticated.value) sessionFailed.value = true; throw e; }
     finally { if (current === epoch) checkingSession.value = false; }
   }, '正在恢复登录状态…');
@@ -101,18 +102,19 @@ function mutate(change: Mutation) {
   }, change.action === 'apply' ? '正在应用已保存设置…' : '正在保存设置…');
 }
 function beforeUnload(event: BeforeUnloadEvent) { if (pluginDirty.value || settingsDirty.value || busy.value || settingsBusy.value || marketBusy.value) { event.preventDefault(); event.returnValue = ''; } }
-const pageHide = () => logout();
+const pageHide = () => { notifications.suspendSession(); logout('', true); };
 const pageShow = (event: PageTransitionEvent) => { if (event.persisted) restoreSession(); };
 onMounted(() => { window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
 onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epoch++; window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('pagehide', pageHide); window.removeEventListener('pageshow', pageShow); });
 </script>
 <template>
   <div v-if="!authenticated" class="login-shell">
-    <header class="login-masthead"><span class="brand-mark" aria-hidden="true">B.</span>BroKnowMyQQBot<NotificationButton /></header>
+    <header class="login-masthead"><span class="brand-mark" aria-hidden="true">B.</span>BroKnowMyQQBot</header>
     <main class="login card" aria-labelledby="login-title">
       <span class="eyebrow">管理控制台 / CONTROL PANEL</span><h1 id="login-title">登录控制台</h1><p class="muted">查看运行情况，管理插件与配置。</p>
       <form v-if="!checkingSession && authMode === 'token'" id="login-form" @submit.prevent="login"><label for="token">管理 Token</label><input id="token" v-model="tokenInput" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required placeholder="输入管理 Token" :disabled="busy"><button class="primary" :disabled="busy">进入控制台</button></form>
       <button v-if="sessionFailed" type="button" :disabled="busy" @click="restoreSession">重试连接</button>
+      <p v-for="entry in notifications.state.active" :key="entry.id" :role="entry.tone === 'error' ? 'alert' : 'status'">{{ entry.message }}</p>
       <p class="hint">登录后刷新页面可恢复会话。退出登录、会话过期或服务重启后需重新登录。</p>
     </main><footer class="login-footer">BKMQB — CONTROL PANEL</footer>
   </div>
@@ -132,5 +134,5 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
     <MarketplacePage v-else-if="route.name === 'marketplace'" :request="api.request" :reconcile="marketReconcile" @busy="marketBusy = $event" @uncertain="marketReconcile = true" @installed="marketplaceInstalled" />
     <UnavailablePage v-else :kind="String(route.name)" />
   </AppShell>
-  <NotificationCenter :center="notifications" />
+  <NotificationCenter v-if="authenticated" :center="notifications" />
 </template>
