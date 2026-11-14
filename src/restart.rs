@@ -14,11 +14,42 @@ pub(crate) fn boot_id() -> &'static str {
     ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Action {
+    Restart,
+    Stop,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Rejection {
+    Stale,
+    Unavailable,
+    Conflict,
+    Signal,
+}
+impl Rejection {
+    pub(crate) fn message(&self) -> &'static str {
+        match self {
+            Self::Stale => "启动标识已变化，请刷新后确认",
+            Self::Unavailable => "当前平台或可执行文件不支持直接重启",
+            Self::Conflict => "已有其他关闭操作进行中",
+            Self::Signal => "无法监听关闭信号，重启未接受",
+        }
+    }
+}
+
+#[derive(Default)]
+struct Pending {
+    action: Option<Action>,
+    stop: Option<StopWatch>,
+}
+
 #[derive(Clone)]
 pub(crate) struct Controller {
     executable: Option<Arc<PathBuf>>,
-    requested: watch::Sender<bool>,
-    stop: Arc<Mutex<Option<StopWatch>>>,
+    requested: watch::Sender<Option<Action>>,
+    state: Arc<Mutex<Pending>>,
     environment: Arc<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
 }
 
@@ -26,9 +57,9 @@ impl Controller {
     pub(crate) fn new() -> Self {
         Self {
             executable: executable().ok().map(Arc::new),
-            stop: Arc::default(),
+            state: Arc::default(),
             environment: Arc::new(std::env::vars_os().collect()),
-            requested: watch::channel(false).0,
+            requested: watch::channel(None).0,
         }
     }
 
@@ -36,31 +67,42 @@ impl Controller {
         self.executable.is_some()
     }
 
-    pub(crate) fn request(&self, expected: &str) -> Result<(), &'static str> {
+    pub(crate) fn request(&self, expected: &str, action: Action) -> Result<(), Rejection> {
         if expected != boot_id() {
-            return Err("启动标识已变化，请刷新后确认");
+            return Err(Rejection::Stale);
         }
-        if !self.available() {
-            return Err("当前平台或可执行文件不支持直接重启");
-        }
-        let mut stop = self
-            .stop
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if stop.is_none() {
+        if let Some(previous) = state.action {
+            return if previous == action {
+                Ok(())
+            } else {
+                Err(Rejection::Conflict)
+            };
+        }
+        if action == Action::Restart {
+            if !self.available() {
+                return Err(Rejection::Unavailable);
+            }
             let watch = StopWatch::new();
             if !watch.registered() {
-                return Err("无法监听关闭信号，重启未接受");
+                return Err(Rejection::Signal);
             }
-            *stop = Some(watch);
+            state.stop = Some(watch);
         }
-        self.requested.send_replace(true);
+        state.action = Some(action);
+        self.requested.send_replace(Some(action));
         Ok(())
     }
 
-    pub(crate) async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) -> Action {
         let mut receiver = self.requested.subscribe();
-        let _ = receiver.wait_for(|requested| *requested).await;
+        let _ = receiver.wait_for(Option::is_some).await;
+        receiver
+            .borrow()
+            .expect("controller retains the selected shutdown action")
     }
 
     /// Called after all async state, the runtime and logging guards have dropped.
@@ -68,10 +110,10 @@ impl Controller {
         // All resources have been released. From here a signal exits immediately,
         // closing the flag-check/exec gap without unsafe signal-mask manipulation.
         let stop = self
-            .stop
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(watch) = stop.as_ref() {
+        if let Some(watch) = stop.stop.as_ref() {
             watch.finished.store(true, Ordering::SeqCst);
             if watch.stopped.load(Ordering::SeqCst) {
                 return std::process::ExitCode::SUCCESS;
@@ -161,6 +203,46 @@ fn executable() -> std::io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn stop_conflict_takes_priority_when_restart_is_unavailable() {
+        let mut controller = Controller::new();
+        controller.executable = None;
+        controller.request(boot_id(), Action::Stop).unwrap();
+        controller.request(boot_id(), Action::Stop).unwrap();
+        assert_eq!(
+            controller.request(boot_id(), Action::Restart),
+            Err(Rejection::Conflict)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn simultaneous_stop_restart_selects_only_one_action() {
+        let controller = Controller::new();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = [Action::Stop, Action::Restart]
+                .into_iter()
+                .map(|action| {
+                    let controller = &controller;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (action, controller.request(boot_id(), action).is_ok())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|(_, accepted)| *accepted).count(), 1);
+        for (action, accepted) in results {
+            assert_eq!(controller.request(boot_id(), action).is_ok(), accepted);
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn signal_after_final_teardown_cannot_cross_exec_handoff() {
@@ -226,11 +308,11 @@ mod tests {
     #[tokio::test]
     async fn request_is_bounded_deduplicated_and_boot_checked() {
         let controller = Controller::new();
-        assert!(controller.request("stale-boot").is_err());
-        assert!(!*controller.requested.borrow());
+        assert!(controller.request("stale-boot", Action::Restart).is_err());
+        assert!(controller.requested.borrow().is_none());
         if cfg!(target_os = "linux") {
-            controller.request(boot_id()).unwrap();
-            controller.request(boot_id()).unwrap();
+            controller.request(boot_id(), Action::Restart).unwrap();
+            controller.request(boot_id(), Action::Restart).unwrap();
             tokio::time::timeout(std::time::Duration::from_secs(1), controller.cancelled())
                 .await
                 .unwrap();

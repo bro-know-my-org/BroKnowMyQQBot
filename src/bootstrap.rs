@@ -303,12 +303,12 @@ async fn supervise_runtime(
             shutdown_handle.shutdown();
             (runtime_run.await, result, Ok(()))
         },
-        () = restart.cancelled() => {
+        action = restart.cancelled() => {
             shutdown_handle.shutdown();
             let ((runtime_result, management_result), decision) = crate::restart::drain(
                 signal.as_mut(), async { tokio::join!(&mut runtime_run, &mut management_run) },
             ).await;
-            restarting = *decision.as_ref().unwrap_or(&false);
+            restarting = action == crate::restart::Action::Restart && *decision.as_ref().unwrap_or(&false);
             (runtime_result, management_result, decision.map(|_| ()))
         }
     };
