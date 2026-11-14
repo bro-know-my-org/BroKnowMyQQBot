@@ -5,6 +5,8 @@
 .logs-instance { flex: 1 1 240px; }
 .logs-toolbar .actions { margin: 0; }
 .logs-toolbar select { max-width: 100%; }
+.logs-capture label { display: flex; align-items: center; gap: 8px; min-height: 44px; }
+.logs-capture input { width: 20px; height: 20px; flex-shrink: 0; }
 .logs-scope { overflow-wrap: anywhere; margin-bottom: 20px; }
 .logs-count { margin-bottom: 12px; }
 .log-list { max-height: 640px; overflow: auto; margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--e-ink-rule); }

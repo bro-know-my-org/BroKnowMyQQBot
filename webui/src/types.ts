@@ -12,9 +12,10 @@ export type PluginAction = 'config' | 'enabled' | 'apply';
 export interface Mutation { action: PluginAction; config?: Config; enabled?: boolean }
 export interface Commands { prefix: string; revision: string; saved_prefix?: string; pending?: boolean }
 export interface Session { mode: 'token' | 'none'; authenticated: boolean }
-export interface LogEntry { id: number; timestamp: string; level: string; target: string; message: string; instance_id: string | null; fields: Record<string, string> }
+export type LogCategory = 'runtime' | 'message';
+export interface LogEntry { id: number; category: LogCategory; content?: string; timestamp: string; level: string; target: string; message: string; instance_id: string | null; fields: Record<string, string> }
 export interface LogPage { session_id: string; entries: LogEntry[]; next_cursor: number; dropped: boolean; has_more: boolean }
-export interface LogQuery { level: string; instance_id?: string; limit?: number; after?: number; session_id?: string }
+export interface LogQuery { level: string; category?: LogCategory | 'all'; include_content?: boolean; instance_id?: string; limit?: number; after?: number; session_id?: string }
 export type LogStreamState = 'connecting' | 'open' | 'reconnecting' | 'closed';
 export interface LogStreamHandlers { onPage: (page: LogPage) => void; onState: (state: LogStreamState) => void; onError: (error: Error) => void }
 export type SubscribeLogs = (query: LogQuery, handlers: LogStreamHandlers) => () => void;

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp, nextTick } from 'vue';
 import App from './App.vue';
-import { ApiError, createApi } from './api';
+import { ApiError, createApi, readLogPage } from './api';
 import { createManagementRouter, pluginRoute } from './navigation';
 import type { LogPage, LogQuery, LogStreamHandlers } from './types';
 
@@ -16,7 +16,7 @@ class MockEventSource extends EventTarget {
   send(data: unknown, type = 'logs') { this.dispatchEvent(new MessageEvent(type, { data: typeof data === 'string' ? data : JSON.stringify(data) })); }
 }
 const source = () => MockEventSource.instances.at(-1)!;
-const row = (id = 1) => ({ id, timestamp: '2026-11-13T10:00:00Z', level: 'INFO', target: 'runtime', message: `日志 ${id}`, instance_id: null, fields: {} });
+const row = (id = 1) => ({ id, category: 'runtime' as const, timestamp: '2026-11-13T10:00:00Z', level: 'INFO', target: 'runtime', message: `日志 ${id}`, instance_id: null, fields: {} });
 const page = (overrides: Partial<LogPage> = {}): LogPage => ({ session_id: 'first', entries: [row()], next_cursor: 1, dropped: false, has_more: false, ...overrides });
 const handlers = (): LogStreamHandlers => ({ onPage: vi.fn(), onState: vi.fn(), onError: vi.fn() });
 const response = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
@@ -31,6 +31,22 @@ beforeEach(() => {
 afterEach(() => { app?.unmount(); app = undefined; api?.clear(); api = undefined; document.body.replaceChildren(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('Cookie SSE API', () => {
+  it('正文默认从响应剥离，显式订阅可读正文，所有流使用相同严格LogPage校验', () => {
+    const message = { ...row(), category: 'message' as const, content: '<script>正文</script>' };
+    expect(readLogPage(page({ entries: [message] })).entries[0]).not.toHaveProperty('content');
+    expect(readLogPage(page({ entries: [message] }), undefined, undefined, true).entries[0]!.content).toBe(message.content);
+    api = createApi(vi.fn()); const metadata = handlers(); api.subscribeLogs({ level: 'INFO', category: 'all' }, metadata);
+    const defaults = new URL(source().url, 'http://localhost').searchParams;
+    expect(defaults.get('category')).toBe('all'); expect(defaults.get('include_content')).toBe('false');
+    source().send(page({ entries: [message] }));
+    expect(vi.mocked(metadata.onPage).mock.calls[0]![0].entries[0]).not.toHaveProperty('content');
+    const body = handlers(); api.subscribeLogs({ level: 'INFO', category: 'message', include_content: true }, body);
+    const enabled = new URL(source().url, 'http://localhost').searchParams;
+    expect(enabled.get('category')).toBe('message'); expect(enabled.get('include_content')).toBe('true');
+    source().send(page({ entries: [message] }));
+    expect(vi.mocked(body.onPage).mock.calls[0]![0].entries[0]!.content).toBe(message.content);
+    expect(readLogPage(page({ entries: [{ ...message, content: 'x'.repeat(2048) }] }), undefined, undefined, true).entries[0]!.content).toHaveLength(2048);
+  });
   it('永久关闭立即显示停止，关闭订阅会取消尚未返回的会话复核', async () => {
     api = createApi(vi.fn()); const callbacks = handlers();
     const close = api.subscribeLogs({ level: 'INFO' }, callbacks);
@@ -55,6 +71,7 @@ describe('Cookie SSE API', () => {
     const stream = source(), url = new URL(stream.url, 'http://localhost');
     expect(url.pathname).toBe('/api/logs/stream'); expect(url.searchParams.get('instance_id')).toBe('sample / #中文');
     expect(url.searchParams.get('after')).toBe('0'); expect(url.searchParams.get('session_id')).toBe('first'); expect(url.searchParams.get('limit')).toBe('200');
+    expect(url.searchParams.get('category')).toBe('runtime'); expect(url.searchParams.get('include_content')).toBe('false');
     expect(stream.options).toBeUndefined(); expect(callbacks.onState).toHaveBeenLastCalledWith('connecting');
     stream.onopen!(); stream.send(page()); stream.send(page({ entries: [], next_cursor: 3 }));
     expect(callbacks.onPage).toHaveBeenCalledTimes(2); stream.onerror!(); await flush();
@@ -65,6 +82,7 @@ describe('Cookie SSE API', () => {
   it.each([
     { level: 'INFO', after: 1 }, { level: 'INFO', session_id: 'first' },
     { level: 'INFO', limit: 201 }, { level: 'INFO', after: Number.MAX_SAFE_INTEGER + 1, session_id: 'first' },
+    { level: 'INFO', category: 'bad' }, { level: 'INFO', include_content: 'true' },
   ])('拒绝无效续接参数且不创建连接', query => {
     api = createApi(vi.fn()); expect(() => api!.subscribeLogs(query as LogQuery, handlers())).toThrow(ApiError);
     expect(MockEventSource.instances).toHaveLength(0);
@@ -101,6 +119,10 @@ describe('Cookie SSE API', () => {
     page({ entries: [], has_more: true }), page({ entries: [row(2), row(1)], next_cursor: 2 }),
     page({ entries: [{ ...row(), fields: { detail: 42 } }] } as unknown as Partial<LogPage>),
     page({ entries: [{ ...row(), level: 'bad' }] }), page({ entries: [{ ...row(), timestamp: 'invalid' }] }),
+    page({ entries: [{ ...row(), category: undefined }] } as unknown as Partial<LogPage>),
+    page({ entries: [{ ...row(), category: 'all' }] } as unknown as Partial<LogPage>),
+    page({ entries: [{ ...row(), content: 'runtime不能含正文' }] }),
+    ...[null, 42, 'x'.repeat(2049)].map(content => page({ entries: [{ ...row(), category: 'message', content }] } as unknown as Partial<LogPage>)),
     page({ entries: Array.from({ length: 201 }, (_, index) => row(index + 1)), next_cursor: 201 }),
   ])('无效JSON或LogPage明确停止，可重新订阅', invalid => {
     api = createApi(vi.fn()); const callbacks = handlers(); api.subscribeLogs({ level: 'INFO' }, callbacks); const old = source();

@@ -4,7 +4,7 @@ import LogsPage from './components/LogsPage.vue';
 import type { Request } from './api';
 import type { LogEntry, LogPage, LogQuery, LogStreamHandlers, PluginView, SubscribeLogs } from './types';
 
-const entry = (id = 1, overrides: Partial<LogEntry> = {}): LogEntry => ({ id, timestamp: '2026-11-13T10:00:00Z', level: 'INFO', target: 'runtime', message: `日志 ${id}`, instance_id: null, fields: {}, ...overrides });
+const entry = (id = 1, overrides: Partial<LogEntry> = {}): LogEntry => ({ id, category: 'runtime', timestamp: '2026-11-13T10:00:00Z', level: 'INFO', target: 'runtime', message: `日志 ${id}`, instance_id: null, fields: {}, ...overrides });
 const page = (entries: LogEntry[] = [], overrides: Partial<LogPage> = {}): LogPage => ({ session_id: 'first', entries, next_cursor: entries.at(-1)?.id ?? 0, dropped: false, has_more: false, ...overrides });
 let app: ReturnType<typeof createApp> | undefined;
 const request = vi.fn<(path: string) => Promise<unknown>>();
@@ -27,10 +27,79 @@ async function select(index: number, value: string) {
   control.dispatchEvent(new Event('change', { bubbles: true })); await flush();
 }
 async function click(label: string) { button(label).click(); await flush(); }
+async function toggleBody() { get<HTMLInputElement>('input[type="checkbox"]').click(); await flush(); }
 beforeEach(() => { vi.useFakeTimers(); streams.length = 0; subscribeLogs.mockClear(); request.mockReset(); request.mockResolvedValue(page()); });
 afterEach(() => { app?.unmount(); app = undefined; document.body.replaceChildren(); vi.useRealTimers(); });
 
 describe('持续日志的实际 DOM 交互', () => {
+  it('日志类型与正文默认值、最近窗口重开及迟到流隔离，正文偏好不持久化', async () => {
+    await mount(); const control = get<HTMLInputElement>('input[type="checkbox"]');
+    expect(control.disabled).toBe(true); expect(control.checked).toBe(false);
+    expect(latest().query).toMatchObject({ category: 'runtime', include_content: false });
+    await emit(page([entry(1)])); const runtime = latest(); await select(1, 'message');
+    expect(runtime.close).toHaveBeenCalledOnce(); expect(control.disabled).toBe(false);
+    expect(latest().query).toEqual({ level: 'INFO', category: 'message', include_content: false, limit: 200 });
+    await emit(page([entry(2, { category: 'message', content: '不应保留', fields: { direction: 'inbound' } })]));
+    expect(document.body.textContent).not.toContain('不应保留'); const metadata = latest(); await toggleBody();
+    expect(metadata.close).toHaveBeenCalledOnce(); expect(latest().query.after).toBeUndefined();
+    expect(latest().query.include_content).toBe(true); expect(document.querySelector('.terminal-line')).toBeNull();
+    metadata.handlers.onPage(page([entry(3, { category: 'message', content: '旧正文' })]));
+    metadata.handlers.onState('reconnecting'); metadata.handlers.onError(new Error('旧错误')); await flush();
+    expect(document.body.textContent).not.toContain('旧正文'); expect(document.querySelector('[role="alert"]')).toBeNull();
+    await select(1, 'all'); expect(latest().query).toMatchObject({ category: 'all', include_content: true });
+    await select(1, 'runtime'); expect(control.disabled).toBe(true); expect(control.checked).toBe(false);
+    expect(latest().query).toMatchObject({ category: 'runtime', include_content: false });
+    await select(1, 'message'); await toggleBody(); app!.unmount(); app = undefined; document.body.replaceChildren();
+    await mount(); expect(get<HTMLInputElement>('input').checked).toBe(false);
+    expect(latest().query).toMatchObject({ category: 'runtime', include_content: false });
+  });
+  it('正文安全转义、缺失正文和真实插件关联，不把无输出推断为已处理', async () => {
+    await mount(); await select(1, 'all'); await toggleBody();
+    await emit(page([
+      entry(1, { category: 'message', content: '<img src=x onerror=alert(1)>\n第二行', fields: { direction: 'inbound', event_id: 'event/1' } }),
+      entry(2, { category: 'message', fields: { direction: 'outbound', record_kind: 'message.failed', status: 'failed' } }),
+      entry(3, { message: '未产生输出', instance_id: 'actual/instance', fields: { plugin_id: 'dev.actual.plugin', command_name: 'echo', event_id: 'event/1', invocation_id: 'invoke/1', record_kind: 'plugin.completed', status: 'no_output', output_count: '0' } }),
+      entry(4, { category: 'message', fields: { direction: 'inbound', record_kind: 'message.received' } }),
+    ]));
+    const rows = document.querySelectorAll('.terminal-line');
+    expect(rows[0]!.textContent).toContain('[入站]'); expect(rows[0]!.textContent).not.toContain('dev.actual.plugin');
+    expect(rows[0]!.textContent).toContain('正文=<img src=x onerror=alert(1)>\n第二行');
+    expect(rows[1]!.textContent).toContain('[出站]'); expect(rows[1]!.textContent).not.toContain('正文未采集');
+    expect(rows[2]!.textContent).toContain('plugin_id=dev.actual.plugin command_name=echo event_id=event/1');
+    expect(rows[2]!.textContent).toContain('未产生输出'); expect(rows[2]!.textContent).not.toContain('已处理');
+    await click('结构化记录'); expect(get('.log-list').textContent).toContain('<img src=x onerror=alert(1)>');
+    expect(get('.log-list').textContent).toContain('正文未采集'); expect(document.querySelector('img,script')).toBeNull();
+  });
+  it('关闭正文清除已显示和待渲染正文，迟到回调及视图切换不能恢复正文', async () => {
+    await mount(); await select(1, 'message'); await toggleBody();
+    await emit(page([entry(1, { category: 'message', content: '已显示正文' })])); const old = latest();
+    old.handlers.onPage(page([entry(2, { category: 'message', content: '待渲染正文' })]));
+    await toggleBody(); expect(old.close).toHaveBeenCalledOnce(); expect(latest().query.after).toBeUndefined();
+    old.handlers.onPage(page([entry(3, { category: 'message', content: '迟到正文' })])); await flush();
+    expect(document.querySelector('.terminal-line')).toBeNull();
+    await emit(page([entry(4, { category: 'message', content: '服务端不应返回正文' })]));
+    await click('结构化记录'); expect(get('.log-list').textContent).not.toContain('正文');
+    await click('实时输出'); expect(get('.terminal-lines').textContent).not.toContain('正文');
+    await toggleBody(); await emit(page([entry(4, { category: 'message' })]));
+    expect(get('.terminal-lines').textContent).toContain('正文未采集');
+  });
+  it('暂停时仅GET一次并保持类型、正文和实例筛选，切换后迟到HTTP无效', async () => {
+    await mount({ instanceId: 'actual / instance' }); await select(1, 'message'); await toggleBody();
+    await emit(page([entry(1, { category: 'message' })])); const active = latest(); await click('暂停接收');
+    expect(active.close).toHaveBeenCalledOnce(); request.mockResolvedValueOnce(page([entry(2, { category: 'message', content: '快照正文' })]));
+    await click('读取最新日志'); const params = new URL(request.mock.calls[0]![0], 'http://localhost').searchParams;
+    expect(Object.fromEntries(params)).toMatchObject({ category: 'message', include_content: 'true', instance_id: 'actual / instance', after: '1', limit: '200' });
+    expect(request).toHaveBeenCalledOnce(); expect(latest()).toBe(active); expect(get('.terminal-lines').textContent).toContain('快照正文');
+    let resolve!: (value: unknown) => void;
+    request.mockImplementationOnce(() => new Promise(finish => { resolve = finish; })); await click('读取最新日志');
+    await toggleBody(); resolve(page([entry(3, { category: 'message', content: '迟到快照正文' })])); await flush();
+    expect(document.querySelector('.terminal-line')).toBeNull(); expect(latest()).toBe(active);
+    request.mockResolvedValueOnce(page([entry(4, { category: 'message', content: '不应显示' })])); await click('读取最新日志');
+    const off = new URL(request.mock.calls[2]![0], 'http://localhost').searchParams;
+    expect(off.get('include_content')).toBe('false'); expect(off.has('after')).toBe(false);
+    expect(get('.terminal-lines').textContent).not.toContain('不应显示'); await click('继续接收');
+    expect(latest().query).toMatchObject({ category: 'message', include_content: false, after: 4 });
+  });
   it('突发一万条只保留一个1000条待渲染窗口，一帧批量提交', async () => {
     await mount(); await emit(page([entry(1)]));
     const content = get('.terminal-lines'), changes: MutationRecord[] = [];
@@ -58,8 +127,8 @@ describe('持续日志的实际 DOM 交互', () => {
   it('按真实文本渲染，固定实例锁定筛选，两种视图共享同一订阅和暂停状态', async () => {
     await mount({ instanceId: 'sample / #中文' });
     await emit(page([entry(1, { message: '<img src=x onerror=alert(1)>', instance_id: 'sample / #中文', fields: { detail: '<script>bad</script>' } })]));
-    expect(document.querySelectorAll('select')).toHaveLength(1);
-    expect(latest().query).toEqual({ level: 'INFO', limit: 200, instance_id: 'sample / #中文' });
+    expect(document.querySelectorAll('select')).toHaveLength(2);
+    expect(latest().query).toEqual({ level: 'INFO', category: 'runtime', include_content: false, limit: 200, instance_id: 'sample / #中文' });
     expect(document.body.textContent).toContain('<img src=x onerror=alert(1)>');
     expect(document.body.textContent).toContain('<script>bad</script>'); expect(document.querySelector('img, script')).toBeNull();
     await click('暂停接收'); await click('结构化记录');
@@ -111,15 +180,15 @@ describe('持续日志的实际 DOM 交互', () => {
     await select(0, 'WARN'); expect(old.close).toHaveBeenCalledTimes(1);
     old.handlers.onPage(page([entry(2)])); old.handlers.onError(new Error('旧错误')); old.handlers.onState('reconnecting'); await flush();
     expect(document.querySelectorAll('.terminal-line')).toHaveLength(0); expect(document.querySelector('[role="alert"]')).toBeNull();
-    expect(latest().query).toEqual({ level: 'WARN', limit: 200, instance_id: 'first' });
+    expect(latest().query).toEqual({ level: 'WARN', category: 'runtime', include_content: false, limit: 200, instance_id: 'first' });
     props.instanceId = 'second'; await flush(); expect(latest().query.instance_id).toBe('second');
     await click('暂停接收'); const count = streams.length; await select(0, 'ERROR'); expect(streams).toHaveLength(count);
     await click('读取最新日志'); expect(request.mock.calls[0]![0]).toContain('level=ERROR'); expect(streams).toHaveLength(count);
   });
   it('全局实例筛选重开流并移除旧游标', async () => {
     await mount({ plugins: [{ instance_id: 'other', name: '其他', plugin_id: 'example' } as PluginView] });
-    await emit(page([entry(1)])); await select(1, 'other');
-    expect(streams[0]!.close).toHaveBeenCalledTimes(1); expect(latest().query).toEqual({ level: 'INFO', limit: 200, instance_id: 'other' });
+    await emit(page([entry(1)])); await select(2, 'other');
+    expect(streams[0]!.close).toHaveBeenCalledTimes(1); expect(latest().query).toEqual({ level: 'INFO', category: 'runtime', include_content: false, limit: 200, instance_id: 'other' });
   });
   it('断开和原生重连保持输出与按钮文字，空重连页不替换记录', async () => {
     await mount(); await emit(page([entry(1)])); const row = get('.terminal-line');

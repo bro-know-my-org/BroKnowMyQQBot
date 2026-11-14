@@ -9,7 +9,7 @@ export type Request = <T>(path: Path, body?: unknown) => Promise<T>;
 const levels = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
 const integer = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
 const text = (value: unknown, max: number): value is string => typeof value === 'string' && value.length <= max;
-export function readLogPage(value: unknown, after?: number, session?: string): LogPage {
+export function readLogPage(value: unknown, after?: number, session?: string, includeContent = false): LogPage {
   const invalid = () => new ApiError('日志响应格式异常，已停止接收，请手动重试。');
   if (!isObject(value) || !text(value.session_id, 128) || !value.session_id || !integer(value.next_cursor)
     || typeof value.dropped !== 'boolean' || typeof value.has_more !== 'boolean' || !Array.isArray(value.entries) || value.entries.length > 200) throw invalid();
@@ -19,10 +19,13 @@ export function readLogPage(value: unknown, after?: number, session?: string): L
     if (!isObject(entry) || !integer(entry.id) || entry.id <= previous || entry.id > nextCursor
       || !text(entry.timestamp, 64) || !Number.isFinite(Date.parse(entry.timestamp)) || !text(entry.level, 5) || !levels.includes(entry.level)
       || !text(entry.target, 128) || !text(entry.message, 2048) || !(entry.instance_id === null || text(entry.instance_id, 512))
+      || (entry.category !== 'runtime' && entry.category !== 'message')
+      || (entry.content !== undefined && (entry.category !== 'message' || !text(entry.content, 2048)))
       || !isObject(entry.fields) || Object.keys(entry.fields).length > 16
       || !Object.entries(entry.fields).every(([key, field]) => key.length <= 64 && text(field, 512))) throw invalid();
     previous = entry.id;
-    return { id: entry.id, timestamp: entry.timestamp, level: entry.level, target: entry.target, message: entry.message,
+    return { id: entry.id, category: entry.category, ...(includeContent && entry.content !== undefined ? { content: entry.content as string } : {}),
+      timestamp: entry.timestamp, level: entry.level, target: entry.target, message: entry.message,
       instance_id: entry.instance_id, fields: { ...entry.fields } as Record<string, string> };
   });
   const sameSession = value.session_id === session;
@@ -69,10 +72,12 @@ export function createApi(onUnauthorized: () => void) {
   const subscribeLogs: SubscribeLogs = (query, handlers) => {
     const limit = query.limit ?? 200;
     if (!levels.includes(query.level) || !integer(limit) || limit < 1 || limit > 200
+      || !['runtime', 'message', 'all'].includes(query.category ?? 'runtime')
+      || (query.include_content !== undefined && typeof query.include_content !== 'boolean')
       || (query.after === undefined) !== (query.session_id === undefined)
       || (query.after !== undefined && !integer(query.after))
       || (query.session_id !== undefined && (!text(query.session_id, 128) || !query.session_id))) throw new ApiError('日志订阅参数无效。');
-    const params = new URLSearchParams({ level: query.level, limit: String(limit) });
+    const params = new URLSearchParams({ level: query.level, limit: String(limit), category: query.category ?? 'runtime', include_content: String(query.include_content ?? false) });
     if (query.instance_id) params.set('instance_id', query.instance_id);
     if (query.after !== undefined) { params.set('after', String(query.after)); params.set('session_id', query.session_id!); }
     const source = new EventSource(`/api/logs/stream?${params}`);
@@ -87,7 +92,7 @@ export function createApi(onUnauthorized: () => void) {
     source.addEventListener('logs', event => {
       if (!live()) return;
       let page: LogPage;
-      try { page = readLogPage(parseSafeJson((event as MessageEvent).data), after, session); }
+      try { page = readLogPage(parseSafeJson((event as MessageEvent).data), after, session, query.include_content); }
       catch { fail(); return; }
       after = page.next_cursor; session = page.session_id;
       handlers.onPage(page);

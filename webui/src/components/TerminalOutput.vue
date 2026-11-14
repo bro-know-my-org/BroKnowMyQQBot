@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type { LogEntry } from '../types';
-const props = defineProps<{ entries: LogEntry[]; sessionId?: string; emptyMessage: string }>();
+import { isMessageResult, messageDirection } from '../logPresentation';
+const props = defineProps<{ entries: LogEntry[]; sessionId?: string; emptyMessage: string; includeContent?: boolean }>();
 const viewport = ref<HTMLElement>(), content = ref<HTMLElement>(), following = ref(true);
 const wrapping = ref(false);
 let observer: ResizeObserver | undefined;
@@ -66,7 +67,7 @@ onBeforeUnmount(() => { observer?.disconnect(); window.removeEventListener('resi
     <div class="terminal-toolbar"><span>BKMQB / LIVE OUTPUT</span><div class="terminal-controls"><button type="button" :aria-pressed="following" @click="toggleFollow">{{ following ? '正在跟随输出 ↓' : '跟随输出 ↓' }}</button><button type="button" :aria-pressed="wrapping" @click="toggleWrap">自动换行：{{ wrapping ? '开' : '关' }}</button></div></div>
     <div ref="viewport" class="terminal-viewport" :class="{ 'is-wrapping': wrapping }" tabindex="0" role="region" aria-label="实时日志输出" @scroll="onScroll">
       <div ref="content" class="terminal-lines">
-      <div v-for="entry in entries" v-memo="[entry, sessionId]" :key="`${sessionId}-${entry.id}`" class="terminal-line" :data-entry-id="entry.id"><time :datetime="entry.timestamp" :title="entry.timestamp">{{ time(entry.timestamp) }}</time>{{ ' ' }}<strong class="terminal-level">{{ entry.level.padEnd(5) }}</strong>{{ ' ' }}<span class="terminal-source">{{ entry.target }}</span>{{ entry.instance_id ? ` [${entry.instance_id}]` : '' }}{{ ': ' }}<span class="terminal-message">{{ entry.message || '（无消息文本）' }}</span><span v-for="(value, key) in entry.fields" :key="key" class="terminal-field">{{ ` ${key}=${field(value)}` }}</span></div>
+      <div v-for="entry in entries" v-memo="[entry, sessionId, includeContent]" :key="`${sessionId}-${entry.id}`" class="terminal-line" :data-entry-id="entry.id"><time :datetime="entry.timestamp" :title="entry.timestamp">{{ time(entry.timestamp) }}</time>{{ ' ' }}<strong class="terminal-level">{{ entry.level.padEnd(5) }}</strong>{{ ' ' }}<span class="terminal-source">{{ entry.target }}</span>{{ entry.instance_id ? ` [${entry.instance_id}]` : '' }}{{ ': ' }}<span v-if="entry.category === 'message'">{{ `[${messageDirection(entry)}] ` }}</span><span class="terminal-message">{{ entry.message || '（无消息文本）' }}</span><span v-for="(value, key) in entry.fields" :key="key" class="terminal-field">{{ ` ${key}=${field(value)}` }}</span><span v-if="entry.category === 'message' && includeContent && (!isMessageResult(entry) || entry.content !== undefined)" class="terminal-body">{{ ` 正文=${entry.content ?? '正文未采集'}` }}</span></div>
       <p v-if="!entries.length" class="terminal-empty">{{ emptyMessage }}</p>
       </div>
     </div>

@@ -4,7 +4,7 @@ import TerminalOutput from './components/TerminalOutput.vue';
 import type { LogEntry } from './types';
 let app: ReturnType<typeof createApp>;
 const flush = async () => { await nextTick(); await nextTick(); };
-const entry = (id: number): LogEntry => ({ id, timestamp: '2026-11-13T10:00:00.123Z', level: 'INFO', target: 'runtime', message: `line ${id}`, instance_id: null, fields: {} });
+const entry = (id: number): LogEntry => ({ id, category: 'runtime', timestamp: '2026-11-13T10:00:00.123Z', level: 'INFO', target: 'runtime', message: `line ${id}`, instance_id: null, fields: {} });
 afterEach(() => { app?.unmount(); document.body.replaceChildren(); vi.restoreAllMocks(); });
 it('新增日志时跟随，向上阅读不抢位置，可以恢复跟随，也可以主动关闭跟随', async () => {
   const entries = ref<LogEntry[]>([]), host = document.createElement('div'); document.body.append(host);
@@ -97,4 +97,16 @@ it('默认长行横向滚动，换行开关保留行节点和跟随状态', asyn
   expect(wrap.textContent).toBe('自动换行：开'); expect(document.querySelector('.terminal-line')).toBe(line);
   wrap.click(); await flush(); expect(viewport.classList.contains('is-wrapping')).toBe(false);
   expect(controls[0]!.getAttribute('aria-pressed')).toBe('true');
+});
+
+it('发送结果只展示状态，不把结果记录误标为正文未采集', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  app = createApp(TerminalOutput, { entries: [
+    { ...entry(1), category: 'message', fields: { record_kind: 'message.sending' }, content: 'pong' },
+    { ...entry(2), category: 'message', fields: { record_kind: 'message.sent', status: 'succeeded' } },
+    { ...entry(3), category: 'message', fields: { record_kind: 'message.failed', status: 'failed' } },
+  ], emptyMessage: '等待输出', includeContent: true }); app.mount(host);
+  expect(document.querySelectorAll('.terminal-body')).toHaveLength(1);
+  expect(host.textContent).toContain('正文=pong');
+  expect(host.textContent).not.toContain('正文未采集');
 });
