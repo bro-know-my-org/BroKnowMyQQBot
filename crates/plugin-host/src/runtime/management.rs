@@ -129,16 +129,17 @@ impl StaticPluginHost {
                 {
                     return Err(crate::StoreError::InvalidStatus.into());
                 }
-                let config = plugin
-                    .config
-                    .lock()
-                    .map_err(|_| crate::StoreError::Poisoned)?;
+                let config = plugin.config.try_lock().map_err(crate::StoreError::from)?;
                 Ok(PluginInstanceStatus {
                     instance_id: plugin.instance_id.clone(),
                     plugin_id: plugin.manifest.id.to_string(),
                     name: metadata.name.clone(),
                     version: plugin.manifest.version.clone(),
-                    state: plugin.state()?,
+                    state: plugin
+                        .state
+                        .try_lock()
+                        .map_err(crate::StoreError::from)?
+                        .state,
                     config_json: bounded_config(&config)?,
                     grants: plugin.granted_capabilities.clone(),
                 })

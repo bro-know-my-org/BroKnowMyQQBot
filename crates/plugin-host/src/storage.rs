@@ -20,6 +20,8 @@ const MAX_SCHEDULED_TASKS: u64 = 1_024;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("plugin status is temporarily busy")]
+    StatusBusy,
     #[error("plugin status metadata exceeds the management bounds")]
     InvalidStatus,
     #[error("plugin store SQLite operation failed")]
@@ -48,6 +50,15 @@ pub enum StoreError {
     InvalidDeliveryPage,
     #[error("plugin delivery is no longer owned by this invocation")]
     StaleDelivery,
+}
+
+impl<T> From<std::sync::TryLockError<T>> for StoreError {
+    fn from(error: std::sync::TryLockError<T>) -> Self {
+        match error {
+            std::sync::TryLockError::WouldBlock => Self::StatusBusy,
+            std::sync::TryLockError::Poisoned(_) => Self::Poisoned,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

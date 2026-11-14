@@ -906,3 +906,17 @@ async fn status_prefix_uses_stable_instance_order_and_marks_unsampled_comparison
     assert_eq!(host.instance_statuses(2).unwrap()[1].instance_id, "b");
     host.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn status_never_waits_for_a_config_or_lifecycle_writer() {
+    let (host, _) = fixture().await;
+    {
+        let _write = host.plugins[0].config.lock().unwrap();
+        assert!(host.instance_statuses(1).is_err());
+    }
+    {
+        let _write = host.plugins[0].state.lock().unwrap();
+        assert!(host.instance_statuses(1).is_err());
+    }
+    host.shutdown().await.unwrap();
+}
