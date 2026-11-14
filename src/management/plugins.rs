@@ -88,6 +88,10 @@ pub(super) fn router_with_runtime(
         .route("/api/plugins/apply", post(apply))
         .route("/api/logs", get(super::logs::get))
         .route(
+            "/api/settings/system",
+            get(super::system_settings::get).post(super::system_settings::save),
+        )
+        .route(
             "/api/settings/commands",
             get(super::settings::get).post(super::settings::save),
         )

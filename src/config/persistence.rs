@@ -7,6 +7,36 @@ use sha2::{Digest as _, Sha256};
 
 use super::ConfigError;
 
+/// Apply only explicitly selected fields while retaining comments and other sections.
+pub(crate) fn patch_document(source: &str, patch: &toml::Value) -> Result<String, ()> {
+    fn merge(target: &mut dyn toml_edit::TableLike, patch: &dyn toml_edit::TableLike) {
+        for (key, value) in patch.iter() {
+            if let Some(existing) = target.get_mut(key) {
+                if let (Some(left), Some(right)) =
+                    (existing.as_table_like_mut(), value.as_table_like())
+                {
+                    merge(left, right);
+                    continue;
+                }
+                let mut replacement = value.clone();
+                if let (Some(old), Some(new)) = (existing.as_value(), replacement.as_value_mut()) {
+                    *new.decor_mut() = old.decor().clone();
+                }
+                *existing = replacement;
+            } else {
+                target.insert(key, value.clone());
+            }
+        }
+    }
+    let mut document = source.parse::<toml_edit::DocumentMut>().map_err(|_| ())?;
+    let patch = toml::to_string(patch)
+        .map_err(|_| ())?
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| ())?;
+    merge(document.as_table_mut(), patch.as_table());
+    Ok(document.to_string())
+}
+
 pub(crate) fn config_revision(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }

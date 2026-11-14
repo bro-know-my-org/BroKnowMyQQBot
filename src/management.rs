@@ -10,6 +10,7 @@ mod message_flow_tests;
 mod plugins;
 mod runtime;
 mod settings;
+mod system_settings;
 
 use std::{net::SocketAddr, sync::Arc, thread, time::Duration};
 

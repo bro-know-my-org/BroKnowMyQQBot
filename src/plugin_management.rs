@@ -54,6 +54,8 @@ pub(crate) enum ManagementError {
     Store,
     #[error("命令前缀无效，请使用 1 至 32 个字符且不含空白或控制字符的字符串")]
     InvalidSettings,
+    #[error("系统设置无效，请检查适配器组合、监听地址、过滤器与容量限制")]
+    InvalidSystemSettings,
     #[error("Bot 配置文件不可写或校验失败，请检查文件权限与配置内容")]
     SettingsUnavailable,
     #[error("插件管理操作繁忙或正在关闭，请稍后重试")]

@@ -51,7 +51,7 @@ pub(super) async fn save(
     Ok(Json(value))
 }
 
-fn source(path: &Path) -> Result<(String, String), ManagementError> {
+pub(super) fn source(path: &Path) -> Result<(String, String), ManagementError> {
     let metadata = fs::symlink_metadata(path).map_err(|_| ManagementError::SettingsUnavailable)?;
     if !metadata.file_type().is_file() || metadata.len() > MAX_CONFIG_BYTES as u64 {
         return Err(ManagementError::SettingsUnavailable);
@@ -91,7 +91,7 @@ fn read_view(path: &Path, manager: &PluginManager) -> Result<Value, ManagementEr
     )
 }
 
-fn update(
+pub(super) fn update(
     path: &Path,
     manager: &PluginManager,
     prefix: &str,
@@ -107,20 +107,10 @@ fn update(
         return Err(ManagementError::Conflict);
     }
     // Change only this setting; never serialize the environment-overridden configuration.
-    let mut document: toml::Value =
-        toml::from_str(&source).map_err(|_| ManagementError::SettingsUnavailable)?;
-    let table = document
-        .as_table_mut()
-        .ok_or(ManagementError::SettingsUnavailable)?;
-    let commands = table
-        .entry("commands")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    commands
-        .as_table_mut()
-        .ok_or(ManagementError::SettingsUnavailable)?
-        .insert("prefix".to_owned(), toml::Value::String(prefix.to_owned()));
-    let encoded =
-        toml::to_string_pretty(&document).map_err(|_| ManagementError::SettingsUnavailable)?;
+    let changes = toml::Value::try_from(json!({"commands":{"prefix":prefix}}))
+        .map_err(|_| ManagementError::SettingsUnavailable)?;
+    let encoded = config::patch_document(&source, &changes)
+        .map_err(|()| ManagementError::SettingsUnavailable)?;
     let effective =
         BotConfig::check_source(&encoded).map_err(|_| ManagementError::SettingsUnavailable)?;
     if effective.commands.prefix != prefix {

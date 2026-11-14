@@ -14,7 +14,8 @@ use std::{
 use thiserror::Error;
 
 pub(crate) use model::{BotConfig, LoggingConfig, ManagementAuth, ManagementConfig};
-pub(crate) use persistence::{ConfigFileLock, config_revision};
+pub(crate) use model::{ConsoleLoggingConfig, OneBot11Config, QqConfig, RuntimeConfig};
+pub(crate) use persistence::{ConfigFileLock, config_revision, patch_document};
 
 #[derive(Debug, Clone)]
 struct ConfigSource {
@@ -235,7 +236,7 @@ impl BotConfig {
         }
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
         plugin_api::validate_command_prefix(&self.commands.prefix)
             .map_err(|error| ConfigError::InvalidValue(error.to_string()))?;
         if !self.qq.enabled && !self.onebot11.enabled {
