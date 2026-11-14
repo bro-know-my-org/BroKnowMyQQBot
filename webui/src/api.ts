@@ -1,7 +1,7 @@
 import { assertSafeNumbers, parseSafeJson } from './json';
 import { isObject } from './types';
 import type { LogEntry, LogPage, Session, SubscribeLogs } from './types';
-type Path = '/api/runtime' | '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply'}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
+type Path = '/api/runtime' | '/api/logs/archives' | `/api/logs/archives/page?${string}` | '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply'}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
 const REQUEST_TIMEOUT_MS = 30000;
 const MARKETPLACE_BROWSE_TIMEOUT_MS = 70000;
 const MARKETPLACE_WRITE_TIMEOUT_MS = 240000;

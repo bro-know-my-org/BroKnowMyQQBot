@@ -3,12 +3,14 @@ import { computed, onBeforeUnmount, onMounted, ref, shallowRef, useId, watch } f
 import { readLogPage } from '../api';
 import type { Request } from '../api';
 import TerminalOutput from './TerminalOutput.vue';
+import ArchiveLogs from './ArchiveLogs.vue';
 import { isMessageResult, messageDirection } from '../logPresentation';
 import { useNoticeSource } from '../notifications';
 import type { LogEntry, LogPage, LogQuery, LogStreamState, PluginView, SubscribeLogs } from '../types';
 
 const props = defineProps<{ request: Request; subscribeLogs: SubscribeLogs; plugins?: PluginView[]; instanceId?: string }>();
 const uid = useId(), levels = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
+const archived = ref(false);
 const level = ref('INFO'), selected = ref(''), paused = ref(false), busy = ref(false);
 const category = ref<NonNullable<LogQuery['category']>>('runtime'), capture = ref(false);
 const includeContent = computed({ get: () => category.value !== 'runtime' && capture.value, set: value => { capture.value = value; } });
@@ -88,16 +90,20 @@ function togglePause() {
   paused.value = !paused.value; stop();
   if (!paused.value) subscribe();
 }
-watch([level, instance, category, includeContent, () => props.request, () => props.subscribeLogs], () => {
+watch([archived, level, instance, category, includeContent, () => props.request, () => props.subscribeLogs], () => {
+  if (archived.value) { capture.value = false; paused.value = false; }
   if (category.value === 'runtime') capture.value = false;
   stop(); if (entries.value.length) entries.value = []; cursor = undefined; session.value = undefined; receivedSession = undefined; notice.value = ''; error.value = '';
-  if (alive && !paused.value) subscribe();
+  if (alive && !paused.value && !archived.value) subscribe();
 });
 onMounted(() => { alive = true; subscribe(); });
 onBeforeUnmount(() => { alive = false; stop(); });
 </script>
 <template>
   <section class="logs-page" aria-label="运行日志">
+    <div v-if="instanceId === undefined" class="logs-view-switch" role="group" aria-label="日志来源"><button type="button" :aria-pressed="!archived" @click="archived = false">实时日志</button><button type="button" :aria-pressed="archived" @click="archived = true">历史运行日志</button></div>
+    <ArchiveLogs v-if="archived" :request="request" :plugins="plugins" />
+    <template v-else>
     <div class="section-heading"><h2>运行日志</h2><span class="status-marker"><span class="status-shape" :class="error ? 'is-error' : paused || state === 'closed' ? 'is-offline' : 'is-ready'" aria-hidden="true" />{{ status }}</span></div>
     <p class="hint">查看当前进程最近 1000 条日志。消息正文默认关闭，开启前的正文无法补取。</p>
     <div class="logs-toolbar">
@@ -123,5 +129,6 @@ onBeforeUnmount(() => { alive = false; stop(); });
       </li>
     </ol>
     <p v-else-if="view === 'structured'" class="empty">{{ busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动重试。' : '当前筛选暂无日志。' }}</p>
+    </template>
   </section>
 </template>
