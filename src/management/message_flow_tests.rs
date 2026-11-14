@@ -31,6 +31,23 @@ struct MockAdapter {
     gate: Option<Arc<Notify>>,
 }
 
+// Same real manifest/candidate declaration, but deliberately produces no output.
+struct QuietPing(plugin_api::PluginManifest);
+
+#[async_trait]
+impl plugin_api::StaticPlugin for QuietPing {
+    fn manifest(&self) -> &plugin_api::PluginManifest {
+        &self.0
+    }
+    async fn on_event(
+        &self,
+        _: &plugin_api::PluginEventEnvelope,
+        _: &dyn plugin_api::HostQueries,
+    ) -> Result<plugin_api::HandlerOutput, plugin_api::PluginError> {
+        Ok(plugin_api::HandlerOutput::default())
+    }
+}
+
 #[async_trait]
 impl Adapter for MockAdapter {
     fn id(&self) -> &AdapterId {
@@ -72,19 +89,25 @@ impl Adapter for MockAdapter {
 
 #[tokio::test]
 async fn received_command_plugin_instance_and_reply_outcome_share_a_source_event() {
-    for fail in [false, true] {
+    for (fail, quiet, instance) in [
+        (false, false, "ping-a"),
+        (true, false, "ping-b"),
+        (false, true, "ping-quiet"),
+    ] {
         let logs = LogBuffer::default();
         let _subscriber =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.layer()));
         let store = PluginStore::in_memory().unwrap();
         let mut host = StaticPluginHost::new(store.clone());
-        host.register_trusted(
-            Arc::new(builtin_plugins::PingPlugin::default()),
-            "ping-a",
-            BTreeMap::new(),
-        )
-        .await
-        .unwrap();
+        let ping = builtin_plugins::PingPlugin::default();
+        let plugin: Arc<dyn plugin_api::StaticPlugin> = if quiet {
+            Arc::new(QuietPing(plugin_api::StaticPlugin::manifest(&ping).clone()))
+        } else {
+            Arc::new(ping)
+        };
+        host.register_trusted(plugin, instance, BTreeMap::new())
+            .await
+            .unwrap();
         let manager = PluginManager::new(
             host.clone(),
             store,
@@ -136,7 +159,7 @@ async fn received_command_plugin_instance_and_reply_outcome_share_a_source_event
                     entry
                         .fields
                         .get("record_kind")
-                        .is_some_and(|kind| kind == "plugin.action.completed")
+                        .is_some_and(|kind| kind == "plugin.completed")
                 }) {
                     break;
                 }
@@ -147,23 +170,66 @@ async fn received_command_plugin_instance_and_reply_outcome_share_a_source_event
         .unwrap();
         shutdown.shutdown();
         running.await.unwrap().unwrap();
-        let response = app
-            .oneshot(
-                Request::get("/api/logs?category=all&include_content=true")
-                    .header("host", "localhost:9090")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        let data: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_flow(&data, &bytes, fail);
+        assert_http_flow(app, fail, quiet, instance).await;
         drop(capture);
     }
 }
 
-fn assert_flow(data: &Value, bytes: &[u8], fail: bool) {
+async fn assert_http_flow(app: axum::Router, fail: bool, quiet: bool, instance: &str) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/api/logs?category=all&include_content=true")
+                .header("host", "localhost:9090")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let data: Value = serde_json::from_slice(&bytes).unwrap();
+    let response = app
+        .oneshot(
+            Request::get(format!(
+                "/api/logs/trace?session_id={}&event_id=flow-event&include_content=true",
+                data["session_id"].as_str().unwrap()
+            ))
+            .header("host", "localhost:9090")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let trace_bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let trace: Value = serde_json::from_slice(&trace_bytes).unwrap();
+    assert_eq!(trace["partial"], true);
+    for (data, bytes) in [(&data, &bytes), (&trace, &trace_bytes)] {
+        if quiet {
+            let rows = data["entries"].as_array().unwrap();
+            let completion = rows
+                .iter()
+                .find(|row| row["fields"]["record_kind"] == "plugin.completed")
+                .unwrap();
+            assert_eq!(completion["fields"]["status"], "no_output");
+            assert_eq!(completion["fields"]["command_name"], "ping");
+            assert_eq!(completion["instance_id"], instance);
+            assert!(
+                rows.iter()
+                    .any(|row| row["fields"]["record_kind"] == "plugin.invoked")
+            );
+            assert!(
+                !rows
+                    .iter()
+                    .any(|row| row["fields"]["record_kind"] == "plugin.action.completed")
+            );
+        } else {
+            assert_flow(data, bytes, fail, instance);
+        }
+    }
+}
+
+fn assert_flow(data: &Value, bytes: &[u8], fail: bool, instance: &str) {
     let entries = data["entries"].as_array().unwrap();
     let incoming = entries
         .iter()
@@ -197,7 +263,7 @@ fn assert_flow(data: &Value, bytes: &[u8], fail: bool) {
         sending["fields"]["command_id"],
         outgoing["fields"]["command_id"]
     );
-    assert_eq!(outgoing["instance_id"], "ping-a");
+    assert_eq!(outgoing["instance_id"], instance);
     assert_eq!(outgoing["fields"]["plugin_id"], "dev.bkm.ping");
     assert_eq!(outgoing["fields"]["event_id"], "flow-event");
     assert_eq!(outgoing["fields"]["command_name"], "ping");

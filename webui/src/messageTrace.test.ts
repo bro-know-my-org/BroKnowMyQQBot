@@ -52,6 +52,7 @@ it('default trace is metadata-only, makes one read and explains global incomplet
   expect(document.body.textContent).toContain('跨全部实例'); expect(document.body.textContent).toContain('发生淘汰');
   expect(document.body.textContent).toContain('已分页'); expect(document.body.textContent).not.toContain('must-hide');
   expect(document.querySelectorAll('.trace-timeline li')).toHaveLength(1);
+  expect(document.querySelector('dialog')?.getAttribute('aria-modal')).toBe('true');
 });
 it('distinguishes candidate, actual invocation, no output and canonical unknown result', async () => {
   const invoked = entry(1, { record_kind: 'plugin.invoked', invocation_id: 'i', command_name: 'ping', plugin_id: 'dev.bkm.ping' });

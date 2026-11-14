@@ -3,6 +3,8 @@ import { computed, onBeforeUnmount, onMounted, ref, shallowRef, useId, watch } f
 import { readLogPage } from '../api';
 import type { Request } from '../api';
 import TerminalOutput from './TerminalOutput.vue';
+import MessageTrace from './MessageTrace.vue';
+import { traceTarget, type TraceTarget } from '../messageTrace';
 import ArchiveLogs from './ArchiveLogs.vue';
 import { isMessageResult, messageDirection } from '../logPresentation';
 import { useNoticeSource } from '../notifications';
@@ -15,9 +17,14 @@ const level = ref('INFO'), selected = ref(''), paused = ref(false), busy = ref(f
 const category = ref<NonNullable<LogQuery['category']>>('runtime'), capture = ref(false);
 const includeContent = computed({ get: () => category.value !== 'runtime' && capture.value, set: value => { capture.value = value; } });
 const entries = shallowRef<LogEntry[]>([]), session = ref<string>(), error = ref(''), notice = ref('');
+const trace = shallowRef<TraceTarget>();
+function openTrace(entry: LogEntry) {
+  if (session.value === receivedSession) trace.value = traceTarget(entry, session.value);
+}
 const state = ref<LogStreamState>('connecting'), view = ref<'terminal' | 'structured'>('terminal');
 const notifications = useNoticeSource('日志', () => error.value || notice.value, () => error.value ? 'error' : 'info');
 const instance = computed(() => props.instanceId ?? selected.value);
+watch([session, includeContent, category, archived, instance, () => props.request], () => { trace.value = undefined; }, { flush: 'sync' });
 const status = computed(() => error.value ? '接收已停止' : paused.value ? '已暂停' : state.value === 'open' ? '实时接收中' : state.value === 'closed' ? '连接已停止，请手动重试' : state.value === 'reconnecting' ? '连接中断，重连中' : '正在连接');
 let alive = false, generation = 0, cursor: number | undefined, closeStream: (() => void) | undefined;
 let receivedSession: string | undefined, pendingEntries: LogEntry[] | undefined, frame: number | undefined;
@@ -34,6 +41,7 @@ function query(): LogQuery {
 }
 function accept(page: LogPage) {
   const changed = receivedSession !== undefined && receivedSession !== page.session_id;
+  if (changed) trace.value = undefined;
   const reset = changed || (cursor !== undefined && page.dropped && page.next_cursor < cursor);
   if (changed) notice.value = '服务日志会话已变化，已重新读取当前进程的最近日志。';
   else if (page.dropped) notice.value = '日志窗口已更新：部分记录已超出内存保留范围，当前列表可能不连续。';
@@ -118,11 +126,12 @@ onBeforeUnmount(() => { alive = false; stop(); });
     <p v-if="error && !notifications" class="notice error" role="alert">{{ error }}</p>
     <p v-if="notice && !notifications" class="notice" role="status">{{ notice }}</p>
     <div class="logs-view-switch" role="group" aria-label="日志显示方式"><button type="button" :aria-pressed="view === 'terminal'" @click="view = 'terminal'">实时输出</button><button type="button" :aria-pressed="view === 'structured'" @click="view = 'structured'">结构化记录</button></div>
-    <TerminalOutput v-if="view === 'terminal'" :entries="entries" :plugins="plugins" :session-id="session" :include-content="includeContent" :empty-message="busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动重试。' : '当前筛选暂无日志，等待新的输出。'" />
+    <TerminalOutput v-if="view === 'terminal'" :entries="entries" :plugins="plugins" :session-id="session" :include-content="includeContent" traceable @trace="openTrace" :empty-message="busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动重试。' : '当前筛选暂无日志，等待新的输出。'" />
     <p v-if="view === 'structured'" class="hint logs-count">已显示 {{ entries.length }} / 1000 条 · 按时间先后排列</p>
     <ol v-if="view === 'structured' && entries.length" class="log-list" tabindex="0" aria-label="日志条目">
       <li v-for="entry in entries" :key="`${session}-${entry.id}`" class="log-entry">
         <div class="log-meta"><time :datetime="entry.timestamp">{{ entry.timestamp }}</time><strong class="log-level">{{ entry.level }}</strong><span>{{ entry.target }}</span><code v-if="entry.instance_id">{{ entry.instance_id }}</code></div>
+        <button v-if="traceTarget(entry, session)" type="button" class="structured-trace" @click="openTrace(entry)">查看消息链路</button>
         <p class="log-message">{{ entry.message || '（无消息文本）' }}</p>
         <p v-if="entry.category === 'message'" class="log-message">{{ messageDirection(entry) }}<span v-if="includeContent && (!isMessageResult(entry) || entry.content !== undefined)"> · {{ entry.content ?? '正文未采集' }}</span></p>
         <details v-if="Object.keys(entry.fields).length"><summary>结构化字段（{{ Object.keys(entry.fields).length }}）</summary><dl class="log-fields"><template v-for="(value, key) in entry.fields" :key="key"><dt>{{ key }}</dt><dd>{{ value }}</dd></template></dl></details>
@@ -130,5 +139,6 @@ onBeforeUnmount(() => { alive = false; stop(); });
     </ol>
     <p v-else-if="view === 'structured'" class="empty">{{ busy ? '正在读取日志…' : error ? '尚未读取到日志，可手动重试。' : '当前筛选暂无日志。' }}</p>
     </template>
+    <MessageTrace v-if="trace" :target="trace" :request="request" :include-content="includeContent" :plugins="plugins" @close="trace = undefined" />
   </section>
 </template>

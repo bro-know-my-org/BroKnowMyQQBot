@@ -40,6 +40,9 @@
 .terminal-panel :focus-visible { outline-color: var(--terminal-ink); }
 .terminal-viewport { height: clamp(320px, 58vh, 720px); overflow: auto; padding: 12px 16px; scrollbar-color: #7c8580 #101d21; overflow-anchor: none; font-family: var(--font-mono); font-size: 13px; line-height: 1.55; font-variant-numeric: tabular-nums; }
 .terminal-line { white-space: pre; overflow-wrap: normal; }
+.terminal-trace { min-width: 44px; min-height: 44px; margin-right: 8px; padding: 4px; border: 1px solid #495554; background: transparent; color: var(--terminal-ink); font: inherit; }
+.terminal-trace:hover:enabled { background: #334144; }
+.structured-trace { margin-top: 8px; }
 .terminal-viewport.is-wrapping .terminal-line { white-space: pre-wrap; overflow-wrap: anywhere; }
 .terminal-line time, .terminal-field { color: var(--terminal-muted); }
 .terminal-level, .terminal-status { font-weight: 700; }

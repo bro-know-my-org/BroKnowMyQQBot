@@ -51,7 +51,7 @@ onBeforeUnmount(() => {
 </script>
 <template>
   <Teleport to="body">
-    <dialog ref="dialog" class="message-trace" :aria-labelledby="`${uid}-title`" :aria-describedby="`${uid}-scope`" tabindex="-1" @cancel.prevent="emit('close')" @keydown="keydown">
+    <dialog ref="dialog" class="message-trace" aria-modal="true" :aria-labelledby="`${uid}-title`" :aria-describedby="`${uid}-scope`" tabindex="-1" @cancel.prevent="emit('close')" @keydown="keydown">
       <div class="section-heading"><h2 :id="`${uid}-title`">消息处理链路</h2><button type="button" @click="emit('close')">关闭链路</button></div>
       <p>事件：<code>{{ page?.event_id ?? target.event_id ?? '尚无保留的事件关联' }}</code></p>
       <p v-if="target.invocation_id">调用：<code>{{ target.invocation_id }}</code></p>
