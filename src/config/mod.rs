@@ -208,6 +208,7 @@ impl BotConfig {
         )?;
         apply_parse_override("BKMQB_DEDUP_CAPACITY", &mut self.runtime.dedup_capacity)?;
         apply_bool_override("BKMQB_MANAGEMENT_ENABLED", &mut self.management.enabled)?;
+        apply_bool_override("BKMQB_MANAGEMENT_AUTO_PORT", &mut self.management.auto_port)?;
         apply_parse_override("BKMQB_MANAGEMENT_AUTH", &mut self.management.auth)?;
         if let Ok(value) = env::var("BKMQB_MANAGEMENT_LISTEN") {
             self.management.listen = value;
@@ -475,9 +476,9 @@ fn validate_management_config(config: &ManagementConfig) -> Result<(), ConfigErr
     let listen = config.listen.parse::<std::net::SocketAddr>().map_err(|_| {
         ConfigError::InvalidValue("management.listen must be an IP socket address".to_owned())
     })?;
-    if listen.port() == 0 {
+    if listen.port() == 0 && !config.auto_port {
         return Err(ConfigError::InvalidValue(
-            "management.listen must use a non-zero port".to_owned(),
+            "management.listen port zero requires management.auto_port = true".to_owned(),
         ));
     }
     if !listen.ip().is_loopback() {
@@ -491,7 +492,7 @@ fn validate_management_config(config: &ManagementConfig) -> Result<(), ConfigErr
 
 fn validate_listener_conflicts(config: &BotConfig) -> Result<(), ConfigError> {
     let mut listeners = Vec::new();
-    if config.management.enabled {
+    if config.management.enabled && !config.management.auto_port {
         listeners.push((
             "management.listen",
             config.management.listen.parse::<std::net::SocketAddr>(),
@@ -1209,6 +1210,86 @@ mod tests {
 
         config.management.listen = "[::1]:9090".to_owned();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn management_defaults_and_explicit_legacy_port_are_preserved() {
+        let config: BotConfig = toml::from_str("").unwrap();
+        assert!(!config.management.enabled);
+        assert!(!config.management.auto_port);
+        assert_eq!(config.management.listen, "127.0.0.1:52743");
+        let legacy: BotConfig =
+            toml::from_str("[management]\nlisten = '127.0.0.1:9090'\n").unwrap();
+        assert_eq!(legacy.management.listen, "127.0.0.1:9090");
+    }
+
+    #[test]
+    fn management_dynamic_port_validation_and_conflicts() {
+        let mut config = BotConfig::default();
+        config.management.enabled = true;
+        config.management.auth = ManagementAuth::None;
+        config.management.listen = "127.0.0.1:0".to_owned();
+        assert!(config.validate().is_err());
+        config.management.auto_port = true;
+        config.validate().unwrap();
+        for listen in ["0.0.0.0:0", "[::]:0", "192.0.2.1:52743"] {
+            config.management.listen = listen.to_owned();
+            assert!(config.validate().is_err());
+        }
+        config.management.listen = "127.0.0.1:6700".to_owned();
+        config.onebot11.enabled = true;
+        config.onebot11.listen = config.management.listen.clone();
+        config.validate().unwrap();
+        config.management.auto_port = false;
+        assert!(config.validate().is_err());
+        config.management.auto_port = true;
+        config.qq.transport = "webhook".to_owned();
+        config.qq.webhook.listen = "127.0.0.1:6700".to_owned();
+        // Automatic management must not suppress conflicts between other listeners.
+        assert!(config.validate().is_err());
+        config.onebot11.enabled = false;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn management_auto_port_environment_override() {
+        // Child-only environments avoid unsafe process-global mutation in parallel tests.
+        if let Ok(value) = env::var("BKMQB_TEST_AUTO_PORT_OVERRIDE") {
+            let mut config = BotConfig::default();
+            config.management.auto_port = true;
+            let result = config.apply_environment_overrides();
+            if value == "invalid" {
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::InvalidEnvironment {
+                        name: "BKMQB_MANAGEMENT_AUTO_PORT",
+                        ..
+                    })
+                ));
+            } else {
+                result.unwrap();
+                assert_eq!(config.management.auto_port, value == "true");
+            }
+            return;
+        }
+        for value in ["true", "false", "invalid"] {
+            let result = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::management_auto_port_environment_override",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("BKMQB_TEST_AUTO_PORT_OVERRIDE", value)
+                .env("BKMQB_MANAGEMENT_AUTO_PORT", value)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+        }
     }
 
     #[test]

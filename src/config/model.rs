@@ -157,6 +157,7 @@ impl Default for RuntimeConfig {
 pub(crate) struct ManagementConfig {
     pub(crate) enabled: bool,
     pub(crate) listen: String,
+    pub(crate) auto_port: bool,
     pub(crate) auth: ManagementAuth,
     pub(crate) session_cookie_secure: bool,
 }
@@ -184,7 +185,8 @@ impl Default for ManagementConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            listen: "127.0.0.1:9090".to_owned(),
+            listen: "127.0.0.1:52743".to_owned(),
+            auto_port: false,
             auth: ManagementAuth::Token,
             session_cookie_secure: false,
         }

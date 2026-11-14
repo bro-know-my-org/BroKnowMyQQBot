@@ -1,6 +1,7 @@
 //! Loopback-only runtime diagnostics and authenticated plugin management.
 
 mod auth;
+mod listener;
 mod log_archives;
 mod logs;
 mod logs_stream;
@@ -52,6 +53,10 @@ pub(crate) enum ManagementError {
     InvalidToken,
     #[error("management listen address `{0}` is invalid")]
     InvalidListen(String),
+    #[error(
+        "BKMQB_INTERNAL_RESTART_LISTEN must be a bounded nonzero socket address on the configured loopback IP"
+    )]
+    InvalidRestartListen,
     #[error("failed to bind management listener at {listen}: {source}")]
     Bind {
         listen: SocketAddr,
@@ -92,13 +97,8 @@ pub(crate) async fn serve(
         return Ok(());
     }
     let auth = auth::AuthState::from_config(&config)?;
-    let listen = config
-        .listen
-        .parse::<SocketAddr>()
-        .map_err(|_| ManagementError::InvalidListen(config.listen.clone()))?;
-    let listener = tokio::net::TcpListener::bind(listen)
-        .await
-        .map_err(|source| ManagementError::Bind { listen, source })?;
+    let listener = listener::bind(&config).await?;
+    let listen = listener.local_addr()?;
     info!(listen = %listen, auth = ?config.auth, "management server listening");
     let (app, validation_jobs) =
         router_parts(observer, Some((manager, auth, live_logs, shutdown.clone())));
