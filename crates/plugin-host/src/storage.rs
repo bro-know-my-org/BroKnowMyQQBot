@@ -18,6 +18,9 @@ use thiserror::Error;
 const MAX_STATE_ENTRIES: u64 = 4_096;
 const MAX_SCHEDULED_TASKS: u64 = 1_024;
 
+mod logical;
+pub use logical::{LogicalSnapshot, LogicalStateEntry};
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("plugin status is temporarily busy")]
@@ -48,6 +51,8 @@ pub enum StoreError {
     InstallationConflict,
     #[error("invalid failed delivery page")]
     InvalidDeliveryPage,
+    #[error("logical plugin snapshot exceeds its resource limits or contains invalid data")]
+    InvalidLogicalSnapshot,
     #[error("plugin delivery is no longer owned by this invocation")]
     StaleDelivery,
 }
