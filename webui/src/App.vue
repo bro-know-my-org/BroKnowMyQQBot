@@ -8,6 +8,7 @@ import LogsPage from './components/LogsPage.vue';
 import UnavailablePage from './components/UnavailablePage.vue';
 import MarketplacePage from './components/MarketplacePage.vue';
 import CommandSettings from './components/CommandSettings.vue';
+import SystemSettings from './components/SystemSettings.vue';
 import PluginList from './components/PluginList.vue';
 import PluginDetail from './components/PluginDetail.vue';
 import NotificationCenter from './components/NotificationCenter.vue';
@@ -131,7 +132,7 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
       <PluginDetail v-if="plugin" :key="plugin.instance_id" :plugin="plugin" :request="api.request" :subscribe-logs="api.subscribeLogs" :tab="detailTab" :busy="busy" :conflict="conflict" @mutate="mutate" @dirty="pluginDirty = $event" @error="report" />
       <section v-else class="panel empty-state"><h1 tabindex="-1">未找到插件实例</h1><p>该实例不在当前管理列表中，可能已移除或未加载。</p><RouterLink :to="{ name: 'plugins' }" class="button-link">返回已安装插件</RouterLink></section>
     </template>
-    <template v-else-if="route.name === 'settings'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">系统 / SETTINGS</span><h1 tabindex="-1">设置</h1><p class="muted">管理 Bot 的全局行为。</p></div></div><CommandSettings :request="api.request" @dirty="settingsDirty = $event" @busy="settingsBusy = $event" /></template>
+    <template v-else-if="route.name === 'settings'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">系统 / SETTINGS</span><h1 tabindex="-1">设置</h1><p class="muted">管理 Bot 的全局行为。</p></div></div><CommandSettings :request="api.request" :locked="systemBusy" @dirty="settingsDirty = $event" @busy="settingsBusy = $event" /><SystemSettings :request="api.request" :locked="settingsBusy" @dirty="systemDirty = $event" @busy="systemBusy = $event" /></template>
     <MarketplacePage v-else-if="route.name === 'marketplace'" :request="api.request" :reconcile="marketReconcile" @busy="marketBusy = $event" @uncertain="marketReconcile = true" @installed="marketplaceInstalled" />
     <UnavailablePage v-else :kind="String(route.name)" />
   </AppShell>

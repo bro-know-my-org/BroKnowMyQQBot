@@ -86,6 +86,39 @@ fn concurrent_command_and_system_saves_have_one_winner_and_fresh_saves_preserve_
     assert!(text.contains("# keep prefix"));
 }
 
+#[test]
+fn concurrent_setup_and_system_saves_cannot_overwrite_each_other() {
+    let f = Fixture::new();
+    let mut setup = BotConfig::load_from_path(&f.path, true).unwrap();
+    setup.commands.prefix = "!!".into();
+    let mut request = f.request("global");
+    request["settings"]["runtime"]["event_concurrency"] = json!(7);
+    let barrier = std::sync::Barrier::new(2);
+    let (system, setup) = std::thread::scope(|scope| {
+        let system = scope.spawn(|| {
+            barrier.wait();
+            f.save(request)
+        });
+        let setup = scope.spawn(|| {
+            barrier.wait();
+            setup.save()
+        });
+        (system.join().unwrap(), setup.join().unwrap())
+    });
+    let saved: BotConfig = toml::from_str(&fs::read_to_string(&f.path).unwrap()).unwrap();
+    match (system, setup) {
+        (Ok(_), Err(config::ConfigError::Conflict(_))) => {
+            assert_eq!(saved.runtime.event_concurrency, 7);
+            assert_eq!(saved.commands.prefix, "/");
+        }
+        (Err(ManagementError::Conflict), Ok(_)) => {
+            assert_eq!(saved.runtime.event_concurrency, 32);
+            assert_eq!(saved.commands.prefix, "!!");
+        }
+        _ => panic!("exactly one configuration writer must win"),
+    }
+}
+
 #[tokio::test]
 async fn route_authentication_and_safe_schema_errors() {
     use axum::{
