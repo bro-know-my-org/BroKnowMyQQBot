@@ -24,3 +24,16 @@ export const runtimeNames: Record<PluginView['runtime_state'], string> = {
 };
 export const json = (value: unknown) => JSON.stringify(value, null, 2);
 export const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+export interface CatalogueItem {
+  slug: string; plugin_id: string; name: string; summary: string; trust: string; repository: string;
+  commands: string[]; capabilities: string[];
+  latest: { version: string; protocol: string; download: string; sha256: string };
+  selection: string; instance_id: string; manageable: boolean;
+  installed: { version: string; enabled: boolean; updated_at_ms: number; granted_permissions: string[]; runtime_state: PluginView['runtime_state'] } | null;
+}
+export interface Catalogue { source: string; total: number; offset: number; plugins: CatalogueItem[] }
+export interface InstallResult {
+  instance_id: string; version: string; enabled: boolean; restart_required: boolean;
+  missing_permissions: string[]; config_incomplete: boolean; updated_at_ms: number;
+}

@@ -30,6 +30,7 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
     if (body) { expect(body.expected_revision).toBe(commands.revision); commands = { prefix: String(body.prefix), revision: String(Number(commands.revision) + 1) }; }
     return new Response(JSON.stringify(commands));
   }
+  if (path.startsWith('/api/marketplace')) return new Response(JSON.stringify({ source: 'https://bkmqb-plugins.github.io/marketplace/index.json', total: 0, offset: 0, plugins: [] }));
   if (!body) return new Response(JSON.stringify({ plugins }));
   const p = plugins.find(p => p.instance_id === body.instance_id)!; expect(body.expected_updated_at_ms).toBe(p.updated_at_ms);
   if (path.endsWith('/config')) p.config = body.config as Config;
@@ -243,8 +244,84 @@ describe('插件管理的实际组件交互', () => {
     get('#command-prefix').focus(); await go({ name: 'settings', query: { view: 'advanced' }, hash: '#prefix' }); expect(document.activeElement).toBe(get('#command-prefix'));
     vi.mocked(window.confirm).mockReturnValue(false); await go({ name: 'overview' }); expect(value('#command-prefix')).toBe('!!');
   });
-  it.each(['marketplace', 'adapters', 'not-found'])('未接入页面 %s 明示边界且不发起不存在的接口请求', async name => {
+  it.each(['adapters', 'not-found'])('未接入页面 %s 明示边界且不发起不存在的接口请求', async name => {
     await login(name === 'not-found' ? '/unknown-page' : { name });
     expect(text()).toContain(name === 'not-found' ? '未找到页面' : '尚未接入'); expect(requests.filter(r => !r.path.startsWith('/api/session')).map(r => r.path)).toEqual(['/api/plugins']);
   });
+});
+
+it('市场路由读取真实接口并展示空市场状态', async () => {
+  await login({ name: 'marketplace' });
+  expect(text()).toContain('没有匹配的插件');
+  expect(requests.some(r => r.path.startsWith('/api/marketplace?'))).toBe(true);
+  expect(posts()).toHaveLength(0);
+});
+
+it('商店保存过程中阻止导航、退出和刷新丢失操作状态', async () => {
+  let complete!: () => void;
+  const item = { slug: 'ping', plugin_id: 'dev.bkm.ping', name: 'Ping', summary: '', trust: 'community', repository: 'https://github.com/example/ping', commands: ['ping'], capabilities: [], latest: { version: '1.0.0', protocol: '>=1.4,<2.0', download: 'https://github.com/example/ping/releases/download/v1.0.0/ping.bkm-plugin', sha256: 'a'.repeat(64) }, selection: 'b'.repeat(64), instance_id: 'dev.bkm.ping/default', installed: null, manageable: true };
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const path = String(input);
+    if (path === '/api/marketplace/install') {
+      await new Promise<void>(resolve => { complete = resolve; });
+      return new Response(JSON.stringify({ instance_id: item.instance_id, version: '1.0.0', enabled: true, restart_required: true, missing_permissions: [], config_incomplete: false, updated_at_ms: 1 }));
+    }
+    if (path.startsWith('/api/marketplace')) return new Response(JSON.stringify({ source: 'https://example.com/index.json', total: 1, offset: 0, plugins: [item] }));
+    return fetcher(input, init);
+  });
+  await login({ name: 'marketplace' }); await click('.market-list button');
+  await input('.market-confirm input', true); await click('.market-details .primary');
+  await go({ name: 'overview' }); expect(router.currentRoute.value.name).toBe('marketplace');
+  expect(disabled('#logout')).toBe(true);
+  const event = new Event('beforeunload', { cancelable: true }); window.dispatchEvent(event); expect(event.defaultPrevented).toBe(true);
+  complete(); await flush(); await go({ name: 'overview' }); expect(router.currentRoute.value.name).toBe('overview');
+});
+
+it('安装完成与插件列表重试重叠时仍排队读取安装后的新快照', async () => {
+  let finishInstall!: () => void, finishRetry!: () => void, reads = 0;
+  const item = { slug: 'ping', plugin_id: 'dev.bkm.market-ping', name: 'Market Ping', summary: '', trust: 'community', repository: 'https://github.com/example/ping', commands: ['ping'], capabilities: [], latest: { version: '1.0.0', protocol: '>=1.4,<2.0', download: 'https://github.com/example/ping/releases/download/v1.0.0/ping.bkm-plugin', sha256: 'a'.repeat(64) }, selection: 'b'.repeat(64), instance_id: 'dev.bkm.market-ping/default', installed: null, manageable: true };
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const path = String(input);
+    if (path === '/api/plugins') {
+      reads++; if (reads === 1) return new Response('{}', { status: 503 });
+      const snapshot = JSON.stringify({ plugins });
+      if (reads === 2) await new Promise<void>(resolve => { finishRetry = resolve; });
+      return new Response(snapshot);
+    }
+    if (path === '/api/marketplace/install') {
+      await new Promise<void>(resolve => { finishInstall = resolve; });
+      plugins.push(fixture({ instance_id: item.instance_id, plugin_id: item.plugin_id, name: 'Market Ping' }));
+      return new Response(JSON.stringify({ instance_id: item.instance_id, version: '1.0.0', enabled: true, restart_required: true, missing_permissions: [], config_incomplete: false, updated_at_ms: 1 }));
+    }
+    if (path.startsWith('/api/marketplace')) return new Response(JSON.stringify({ source: 'https://example.com/index.json', total: 1, offset: 0, plugins: [item] }));
+    return fetcher(input, init);
+  });
+  await login({ name: 'marketplace' }); await click('.market-list button');
+  await input('.market-confirm input', true); await click('.market-details .primary');
+  await click('#retry-plugins'); expect(reads).toBe(2);
+  finishInstall(); await flush(); expect(reads).toBe(2);
+  finishRetry(); await flush(); await flush(); expect(reads).toBe(3);
+  await go({ name: 'plugins' }); expect(text()).toContain('Market Ping');
+});
+
+it('写入响应丢失后离开并重进市场仍同步已安装实例，不重复提交写入', async () => {
+  let writes = 0;
+  const item = { slug: 'ping', plugin_id: 'dev.bkm.market-ping', name: 'Market Ping', summary: '', trust: 'community', repository: 'https://github.com/example/ping', commands: ['ping'], capabilities: [], latest: { version: '1.0.0', protocol: '>=1.4,<2.0', download: 'https://github.com/example/ping/releases/download/v1.0.0/ping.bkm-plugin', sha256: 'a'.repeat(64) }, selection: 'b'.repeat(64), instance_id: 'dev.bkm.market-ping/default', installed: null as unknown, manageable: true };
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const path = String(input);
+    if (path === '/api/marketplace/install') {
+      writes++; plugins.push(fixture({ instance_id: item.instance_id, plugin_id: item.plugin_id, name: 'Market Ping' }));
+      item.installed = { version: '1.0.0', enabled: true, updated_at_ms: 1, granted_permissions: [], runtime_state: 'not_loaded' };
+      throw new TypeError('response lost after commit');
+    }
+    if (path.startsWith('/api/marketplace')) return new Response(JSON.stringify({ source: 'https://example.com/index.json', total: 1, offset: 0, plugins: [item] }));
+    return fetcher(input, init);
+  });
+  await login({ name: 'marketplace' }); await click('.market-list button');
+  await input('.market-confirm input', true); await click('.market-details .primary');
+  expect(text()).toContain('无法连接管理服务'); expect(writes).toBe(1);
+  await go({ name: 'overview' }); await go({ name: 'marketplace' });
+  await click('.market-list button'); await flush();
+  await go(pluginRoute(item.instance_id));
+  expect(text()).toContain('Market Ping'); expect(text()).not.toContain('未找到插件实例'); expect(writes).toBe(1);
 });

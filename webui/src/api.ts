@@ -1,7 +1,15 @@
 import { assertSafeNumbers, parseSafeJson } from './json';
 import { isObject } from './types';
 import type { LogEntry, LogPage, Session, SubscribeLogs } from './types';
-type Path = '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply'}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
+type Path = '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply'}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
+const REQUEST_TIMEOUT_MS = 30000;
+const MARKETPLACE_BROWSE_TIMEOUT_MS = 70000;
+const MARKETPLACE_WRITE_TIMEOUT_MS = 240000;
+function requestTimeout(path: Path): number {
+  if (path === '/api/marketplace/install' || path === '/api/marketplace/update') return MARKETPLACE_WRITE_TIMEOUT_MS;
+  if (path.startsWith('/api/marketplace')) return MARKETPLACE_BROWSE_TIMEOUT_MS;
+  return REQUEST_TIMEOUT_MS;
+}
 export class ApiError extends Error {
   constructor(message: string, public readonly status = 0) { super(message); }
 }
@@ -44,7 +52,7 @@ export function createApi(onUnauthorized: () => void) {
     const abort = () => controller.abort();
     owner?.addEventListener('abort', abort, { once: true });
     if (owner?.aborted) controller.abort();
-    const timer = setTimeout(() => controller.abort(), 30000);
+    const timer = setTimeout(() => controller.abort(), requestTimeout(path));
     try {
       assertSafeNumbers(body);
       const response = await fetch(path, {
