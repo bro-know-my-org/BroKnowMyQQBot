@@ -5,12 +5,14 @@ import type { Request } from '../api';
 import type { Catalogue, CatalogueItem, InstallResult } from '../types';
 import { pluginRoute } from '../navigation';
 import '../marketplace.css';
+import { useNoticeSource } from '../notifications';
 const props = defineProps<{ request: Request; reconcile?: boolean }>();
 const emit = defineEmits<{ busy: [value: boolean]; installed: []; uncertain: [] }>();
 const query = ref(''), submittedQuery = ref(''), offset = ref(0), catalogue = shallowRef<Catalogue>(), selected = shallowRef<CatalogueItem>();
 const detailTitle = ref<HTMLElement>();
 const loading = ref(false), installing = ref(false), message = ref(''), error = ref('');
 const grants = ref<string[]>([]), confirmed = ref(false), stale = ref(false);
+const notifications = useNoticeSource('插件市场', () => error.value || message.value, () => error.value ? 'error' : 'warning');
 let alive = true, detailsTrigger: HTMLElement | undefined;
 onBeforeUnmount(() => { alive = false; emit('busy', false); });
 const report = (e: unknown) => { if (alive) error.value = (e as Error).message; };
@@ -68,8 +70,8 @@ onMounted(() => { void load(); });
   <form class="market-search panel" @submit.prevent="load(0, true)"><label for="market-search">搜索插件</label><input id="market-search" v-model="query" maxlength="128" type="search" placeholder="名称、插件 ID、命令" :disabled="loading || installing"><button :disabled="loading || installing">搜索</button><button type="button" :disabled="loading || installing" @click="load(offset)">刷新市场</button></form>
   <p v-if="catalogue" class="hint market-source">索引来源：{{ catalogue.source }} · {{ catalogue.total }} 个匹配条目 · 当前结果：{{ submittedQuery || '全部' }}。当前管理默认实例 /default。</p>
   <p v-if="loading" role="status">正在读取市场…</p>
-  <div v-if="error" class="notice error" role="alert">{{ error }} <button type="button" :disabled="loading || installing" @click="load(offset)">重试加载市场</button></div>
-  <p v-if="message" class="notice" role="status">{{ message }}</p>
+  <div v-if="error" :class="!notifications ? 'notice error' : undefined" :role="!notifications ? 'alert' : undefined"><template v-if="!notifications">{{ error }} </template><button type="button" :disabled="loading || installing" @click="load(offset)">重试加载市场</button></div>
+  <p v-if="message && !notifications" class="notice" role="status">{{ message }}</p>
   <section v-if="selected" class="panel market-details" aria-labelledby="market-detail-title">
     <div class="section-heading"><h2 id="market-detail-title" ref="detailTitle" tabindex="-1">{{ selected.name }} · {{ selected.latest.version }}</h2><button type="button" :disabled="installing" @click="closeDetails">关闭详情</button></div>
     <p>{{ selected.summary }}</p><p class="mono">{{ selected.plugin_id }}</p>

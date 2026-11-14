@@ -257,6 +257,40 @@ it('市场路由读取真实接口并展示空市场状态', async () => {
   expect(posts()).toHaveLength(0);
 });
 
+it('通知按钮可回看跨页历史，退出登录后清空上一会话的通知', async () => {
+  vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+  await login(); await input('#field-0', '6'); await click('#save');
+  expect(document.querySelector('#page-content > .notice')).toBeNull();
+  await go({ name: 'overview' }); expect(get('.notification-toast').textContent).toContain('已保存；点击“立即应用”后更新运行时。');
+  await click('[aria-controls="notification-history"]');
+  expect(get('#notification-history').textContent).toContain('已保存；点击“立即应用”后更新运行时。');
+  expect(get('[aria-controls="notification-history"]').getAttribute('aria-label')).toContain('0 条未读');
+  await click('#logout'); expect(document.querySelector('#notification-history')).toBeNull();
+  await click('[aria-controls="notification-history"]');
+  expect(get('#notification-history').textContent).not.toContain('已保存；点击“立即应用”后更新运行时。');
+});
+
+it('前缀操作完成进入通知历史，页面保留当前运行值与编辑状态', async () => {
+  await login({ name: 'settings' }); await input('#command-prefix', '!!'); await submit('.settings-form');
+  expect(get('.command-settings').textContent).not.toContain('前缀已保存并立即生效。');
+  expect(get('.command-settings').textContent).toContain('当前运行前缀：!!');
+  await click('[aria-controls="notification-history"]');
+  expect(get('#notification-history').textContent).toContain('前缀已保存并立即生效。');
+});
+
+it('展开移动导航时不消耗被遮住的通知倒计时', async () => {
+  vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+  try {
+    await login({ name: 'overview' }); vi.advanceTimersByTime(1000); await nextTick();
+    await click('[aria-label="打开导航菜单"]');
+    vi.advanceTimersByTime(60000); await nextTick(); expect(document.querySelector('.notification-toast')).not.toBeNull();
+    await click('.mobile-close'); vi.advanceTimersByTime(3999); await nextTick();
+    expect(document.querySelector('.notification-toast')).not.toBeNull();
+    vi.advanceTimersByTime(1); await nextTick(); expect(document.querySelector('.notification-toast')).toBeNull();
+  } finally { app?.unmount(); vi.useRealTimers(); }
+});
+
 it('商店保存过程中阻止导航、退出和刷新丢失操作状态', async () => {
   let complete!: () => void;
   const item = { slug: 'ping', plugin_id: 'dev.bkm.ping', name: 'Ping', summary: '', trust: 'community', repository: 'https://github.com/example/ping', commands: ['ping'], capabilities: [], latest: { version: '1.0.0', protocol: '>=1.4,<2.0', download: 'https://github.com/example/ping/releases/download/v1.0.0/ping.bkm-plugin', sha256: 'a'.repeat(64) }, selection: 'b'.repeat(64), instance_id: 'dev.bkm.ping/default', installed: null, manageable: true };

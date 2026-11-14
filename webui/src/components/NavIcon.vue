@@ -11,6 +11,7 @@ const paths: Record<string, string> = {
   expand: 'M15 6l6 6-6 6 M3 12h18',
   menu: 'M3 6h18 M3 12h18 M3 18h18',
   close: 'M5 5l14 14 M5 19L19 5',
+  bell: 'M5 17h14l-2-3V9a5 5 0 0 0-10 0v5z M10 21h4 M12 2v2',
 };
 </script>
 <template><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" stroke-linejoin="miter" aria-hidden="true" focusable="false"><path :d="paths[name] || paths.overview" /></svg></template>

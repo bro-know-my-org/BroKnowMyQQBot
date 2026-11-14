@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch } from 'vue';
 import { RouterLink, useRoute, useRouter } from 'vue-router';
 import AppShell from './components/AppShell.vue';
 import OverviewPage from './components/OverviewPage.vue';
@@ -9,20 +9,25 @@ import MarketplacePage from './components/MarketplacePage.vue';
 import CommandSettings from './components/CommandSettings.vue';
 import PluginList from './components/PluginList.vue';
 import PluginDetail from './components/PluginDetail.vue';
+import NotificationCenter from './components/NotificationCenter.vue';
+import NotificationButton from './components/NotificationButton.vue';
+import { createNotifications, notificationKey } from './notifications';
 import { ApiError, createApi } from './api';
 import type { Mutation, PluginView, Session } from './types';
 const route = useRoute(), router = useRouter();
 const authenticated = ref(false), tokenInput = ref(''), plugins = shallowRef<PluginView[]>([]), refreshedAt = ref('');
 const authMode = ref<Session['mode']>('token'), checkingSession = ref(true), sessionFailed = ref(false);
 const pluginsFailed = ref(false), marketBusy = ref(false), marketReconcile = ref(false);
-const busy = ref(false), pluginDirty = ref(false), settingsDirty = ref(false), settingsBusy = ref(false), conflicts = ref(new Set<string>()), message = ref(''), error = ref(false);
+const busy = ref(false), pluginDirty = ref(false), settingsDirty = ref(false), settingsBusy = ref(false), conflicts = ref(new Set<string>());
+const notifications = createNotifications(); provide(notificationKey, notifications);
 const plugin = computed(() => plugins.value.find(p => p.instance_id === route.params.instanceId));
 const conflict = computed(() => !!plugin.value && conflicts.value.has(plugin.value.instance_id));
 const detailTab = computed(() => route.name === 'plugin-config' ? 'config' : route.name === 'plugin-logs' ? 'logs' : 'overview');
 const api = createApi(() => logout('登录已失效，请重新输入管理 Token。'));
 let epoch = 0, refreshAfterBusy = false;
-function report(text: string, failed = true) { message.value = text; error.value = failed; }
+function report(text: string, failed = true, progress = false) { notifications.notify('控制台', text, progress ? 'progress' : failed ? 'error' : 'success'); }
 function logout(text = '') {
+  notifications.reset();
   api.clear(); epoch++; refreshAfterBusy = false; authenticated.value = false; tokenInput.value = ''; plugins.value = []; refreshedAt.value = '';
   busy.value = false; checkingSession.value = false; sessionFailed.value = false; pluginsFailed.value = false; authMode.value = 'token';
   pluginDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
@@ -34,12 +39,12 @@ const removeGuard = router.beforeEach((to, from) => {
   if (to.name === from.name && to.params.instanceId === from.params.instanceId) return true;
   return mayDiscard(pluginDirty.value || settingsDirty.value);
 });
-watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; settingsDirty.value = false; report('', false); });
+watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; settingsDirty.value = false; });
 async function perform(task: () => Promise<void>, loading: string) {
   if (busy.value) return;
-  const current = epoch; busy.value = true; report(loading, false);
+  const current = epoch; busy.value = true; report(loading, false, true);
   try { await task(); } catch (e) { if (current === epoch) report((e as Error).message); }
-  finally { if (current === epoch) { busy.value = false; if (refreshAfterBusy) { refreshAfterBusy = false; marketplaceInstalled(); } } }
+  finally { if (current === epoch) { notifications.clearSource('控制台', true); busy.value = false; if (refreshAfterBusy) { refreshAfterBusy = false; marketplaceInstalled(); } } }
 }
 async function refreshPlugins() {
   const current = epoch;
@@ -98,21 +103,19 @@ function beforeUnload(event: BeforeUnloadEvent) { if (pluginDirty.value || setti
 const pageHide = () => logout();
 const pageShow = (event: PageTransitionEvent) => { if (event.persisted) restoreSession(); };
 onMounted(() => { window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
-onBeforeUnmount(() => { removeGuard(); api.clear(); epoch++; window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('pagehide', pageHide); window.removeEventListener('pageshow', pageShow); });
+onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epoch++; window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('pagehide', pageHide); window.removeEventListener('pageshow', pageShow); });
 </script>
 <template>
   <div v-if="!authenticated" class="login-shell">
-    <header class="login-masthead"><span class="brand-mark" aria-hidden="true">B.</span>BroKnowMyQQBot</header>
+    <header class="login-masthead"><span class="brand-mark" aria-hidden="true">B.</span>BroKnowMyQQBot<NotificationButton /></header>
     <main class="login card" aria-labelledby="login-title">
       <span class="eyebrow">管理控制台 / CONTROL PANEL</span><h1 id="login-title">登录控制台</h1><p class="muted">查看运行情况，管理插件与配置。</p>
-      <p v-if="message" class="notice" :class="{ error }" :role="error ? 'alert' : 'status'">{{ error ? '提示：' : '' }}{{ message }}</p>
       <form v-if="!checkingSession && authMode === 'token'" id="login-form" @submit.prevent="login"><label for="token">管理 Token</label><input id="token" v-model="tokenInput" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required placeholder="输入管理 Token" :disabled="busy"><button class="primary" :disabled="busy">进入控制台</button></form>
       <button v-if="sessionFailed" type="button" :disabled="busy" @click="restoreSession">重试连接</button>
       <p class="hint">登录后刷新页面可恢复会话。退出登录、会话过期或服务重启后需重新登录。</p>
     </main><footer class="login-footer">BKMQB — CONTROL PANEL</footer>
   </div>
   <AppShell v-else :busy="busy || settingsBusy || marketBusy" :auth-mode="authMode" @logout="signOut">
-    <p v-if="message" class="notice" :class="{ error }" :role="error ? 'alert' : 'status'" aria-live="polite">{{ error ? '提示：' : '' }}{{ message }}</p>
     <button v-if="pluginsFailed" id="retry-plugins" type="button" :disabled="busy" @click="refresh">重试加载插件</button>
     <section v-if="!refreshedAt && (route.name === 'overview' || route.meta.section === 'plugins')" class="panel empty-state" aria-live="polite"><h1 tabindex="-1">{{ pluginsFailed ? '插件状态暂不可用' : '正在读取插件状态' }}</h1><p>{{ pluginsFailed ? '尚未读取到插件列表，请重试加载。' : '正在连接管理服务，请稍候。' }}</p></section>
     <OverviewPage v-else-if="route.name === 'overview'" :plugins="plugins" :refreshed-at="refreshedAt" :busy="busy" @refresh="refresh" />
@@ -127,4 +130,5 @@ onBeforeUnmount(() => { removeGuard(); api.clear(); epoch++; window.removeEventL
     <MarketplacePage v-else-if="route.name === 'marketplace'" :request="api.request" :reconcile="marketReconcile" @busy="marketBusy = $event" @uncertain="marketReconcile = true" @installed="marketplaceInstalled" />
     <UnavailablePage v-else :kind="String(route.name)" />
   </AppShell>
+  <NotificationCenter :center="notifications" />
 </template>
