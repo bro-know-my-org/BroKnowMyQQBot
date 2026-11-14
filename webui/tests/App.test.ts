@@ -637,6 +637,7 @@ describe('Bot 进程控制', () => {
 it('权限草稿与进行中的写入接入根导航、退出和刷新保护', async () => {
   await login(pluginRoute('sample'));
   await click('#edit-permissions'); await input('input[value="message.reply"]', true);
+  expect(disabled('#restart-bot')).toBe(true); expect(disabled('#stop-bot')).toBe(true);
   vi.mocked(window.confirm).mockReturnValue(false);
   await go({ name: 'logs' }); expect(router.currentRoute.value.name).toBe('plugin-overview');
   await click('#save-permissions'); expect(posts()).toHaveLength(0);
@@ -670,4 +671,28 @@ it('权限未知结果的重新读取保持根忙碌直到响应，避免覆盖�
   finish(new Response(JSON.stringify({ plugins }))); await flush();
   expect(disabled('#logout')).toBe(false); expect(disabled('#save-permissions')).toBe(true);
   vi.mocked(window.confirm).mockReturnValue(false); await go(pluginRoute('sample', 'config')); expect(router.currentRoute.value.name).toBe('plugin-overview');
+});
+
+it('本地上传、安装草稿和不确定结果读取接入重启停止、导航与退出保护', async () => {
+  await login({ name: 'plugins' });
+  let finish!: (response: Response) => void;
+  vi.stubGlobal('fetch', (url: RequestInfo | URL, init: RequestInit = {}) => String(url) === '/api/plugins/local/inspect' ? new Promise<Response>(resolve => { finish = resolve; }) : fetcher(url, init));
+  const file = get<HTMLInputElement>('#local-package-file'); Object.defineProperty(file, 'files', { value: [new File(['fixture'], 'sample.bkm-plugin')] });
+  file.dispatchEvent(new Event('change', { bubbles: true })); await flush();
+  expect(disabled('#restart-bot')).toBe(true); expect(disabled('#stop-bot')).toBe(true); expect(disabled('#logout')).toBe(true);
+  await go({ name: 'logs' }); expect(router.currentRoute.value.name).toBe('plugins');
+  finish(new Response(JSON.stringify({ selection: '11111111-1111-4111-8111-111111111111', expires_in_seconds: 300, plugin_id: 'dev.bkm.sample', version: '2.0', name: 'Sample', description: '', sha256: 'a'.repeat(64), commands: [], requested_permissions: ['message.reply'], signature_status: 'unsigned', default_instance_id: 'sample' }))); await flush();
+  expect(disabled('#restart-bot')).toBe(true); expect(disabled('#stop-bot')).toBe(true); expect(disabled('#logout')).toBe(false);
+  vi.mocked(window.confirm).mockReturnValue(false); await go({ name: 'logs' }); expect(router.currentRoute.value.name).toBe('plugins');
+  await click('#refresh'); expect(get('#local-instance')).not.toBeNull(); expect(disabled('#restart-bot')).toBe(true);
+  await input('#local-unsigned', true); await click('#commit-local-package'); expect(posts()).toHaveLength(0);
+  vi.mocked(window.confirm).mockReturnValue(true);
+  vi.stubGlobal('fetch', (url: RequestInfo | URL, init: RequestInit = {}) => {
+    if (String(url) === '/api/plugins/local/commit') return Promise.resolve(new Response('{"error":"连接丢失"}', { status: 503 }));
+    if (String(url) === '/api/plugins') return new Promise<Response>(resolve => { finish = resolve; });
+    return fetcher(url, init);
+  });
+  await click('#commit-local-package'); expect(disabled('#logout')).toBe(true); expect(disabled('#restart-bot')).toBe(true); expect(disabled('#stop-bot')).toBe(true);
+  finish(new Response(JSON.stringify({ plugins }))); await flush();
+  expect(disabled('#logout')).toBe(false); expect(disabled('#commit-local-package')).toBe(true); expect(text()).toContain('不会自动重复安装');
 });

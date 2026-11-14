@@ -11,6 +11,7 @@ import CommandSettings from './components/CommandSettings.vue';
 import SystemSettings from './components/SystemSettings.vue';
 import PluginList from './components/PluginList.vue';
 import PluginDetail from './components/PluginDetail.vue';
+import LocalPackageInstall from './components/LocalPackageInstall.vue';
 import NotificationCenter from './components/NotificationCenter.vue';
 import RestartControl from './components/RestartControl.vue';
 import type { ProcessSession } from './lifecycle';
@@ -23,7 +24,8 @@ const authMode = ref<Session['mode']>('token'), checkingSession = ref(true), ses
 const pluginsFailed = ref(false), marketBusy = ref(false), marketReconcile = ref(false);
 const busy = ref(false), pluginDirty = ref(false), settingsDirty = ref(false), settingsBusy = ref(false), conflicts = ref(new Set<string>());
 const pluginChildBusy = ref(false), permissionsReadBusy = ref(false), pluginEditorEpoch = ref(0);
-const pluginToolsBusy = computed(() => pluginChildBusy.value || permissionsReadBusy.value);
+const localDirty = ref(false), localBusy = ref(false);
+const pluginToolsBusy = computed(() => pluginChildBusy.value || permissionsReadBusy.value || localBusy.value);
 const systemDirty = ref(false), systemBusy = ref(false);
 const bootId = ref(''), restartLocked = ref(false);
 const notifications = createNotifications(); provide(notificationKey, notifications);
@@ -40,7 +42,7 @@ function logout(text = '', unloading = false) {
   bootId.value = ''; restartLocked.value = false; notifications.setSuspended(false);
   historyScope = undefined;
   busy.value = false; checkingSession.value = false; sessionFailed.value = false; pluginsFailed.value = false; authMode.value = 'token';
-  pluginDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; systemDirty.value = false; systemBusy.value = false; pluginChildBusy.value = false; permissionsReadBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
+  pluginDirty.value = false; localDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; systemDirty.value = false; systemBusy.value = false; pluginChildBusy.value = false; permissionsReadBusy.value = false; localBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
 }
 const mayDiscard = (dirty: boolean) => !dirty || window.confirm('有未保存更改，是否放弃这些更改？');
 const removeGuard = router.beforeEach((to, from) => {
@@ -48,9 +50,9 @@ const removeGuard = router.beforeEach((to, from) => {
   if (restartLocked.value) return false;
   if (busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value) { report('操作进行中，请等待完成后再切换页面。'); return false; }
   if (to.name === from.name && to.params.instanceId === from.params.instanceId) return true;
-  return mayDiscard(pluginDirty.value || settingsDirty.value || systemDirty.value);
+  return mayDiscard(pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value);
 });
-watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; settingsDirty.value = false; systemDirty.value = false; });
+watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; localDirty.value = false; settingsDirty.value = false; systemDirty.value = false; });
 async function perform(task: () => Promise<void>, loading: string) {
   if (busy.value || restartLocked.value) return;
   const current = epoch; busy.value = true; report(loading, false, true);
@@ -102,7 +104,7 @@ function restoreSession() {
   }, '正在恢复登录状态…');
 }
 function signOut() {
-  if (restartLocked.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value || !mayDiscard(pluginDirty.value || settingsDirty.value || systemDirty.value)) return;
+  if (restartLocked.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value || !mayDiscard(pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value)) return;
   void perform(async () => { await api.request<Session>('/api/session/logout', {}); logout(); }, '正在退出登录…');
 }
 // A lost response may finish later on the server. Keep reconciling on market
@@ -111,7 +113,7 @@ function marketplaceInstalled() {
   if (busy.value) { refreshAfterBusy = true; return; }
   void perform(refreshPlugins, '正在读取安装后的插件状态…');
 }
-function refresh() { if (!restartLocked.value && mayDiscard(pluginDirty.value)) void perform(refreshPlugins, '正在刷新插件状态…'); }
+function refresh() { if (!restartLocked.value && !pluginToolsBusy.value && mayDiscard(pluginDirty.value)) void perform(refreshPlugins, '正在刷新插件状态…'); }
 async function mutate(change: Mutation) {
   const p = plugin.value; if (restartLocked.value || pluginToolsBusy.value || !p?.editable || conflict.value || (pluginDirty.value && change.action !== 'config')) return;
   const operation = change.action === 'uninstall' || change.action === 'recover';
@@ -154,7 +156,7 @@ async function reconcilePermissions() {
   catch { /* Keep the editor's choices and stale block until explicit reread. */ }
   finally { if (current === epoch) permissionsReadBusy.value = false; }
 }
-function beforeUnload(event: BeforeUnloadEvent) { if (restartLocked.value || pluginDirty.value || settingsDirty.value || systemDirty.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value) { event.preventDefault(); event.returnValue = ''; } }
+function beforeUnload(event: BeforeUnloadEvent) { if (restartLocked.value || pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value) { event.preventDefault(); event.returnValue = ''; } }
 const pageHide = () => { notifications.suspendSession(); logout('', true); };
 const pageShow = (event: PageTransitionEvent) => { if (event.persisted) restoreSession(); };
 onMounted(() => { window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
@@ -172,14 +174,14 @@ onBeforeUnmount(() => { notifications.dispose(); removeGuard(); api.clear(); epo
     </main><footer class="login-footer">BKMQB — CONTROL PANEL</footer>
   </div>
   <AppShell v-else :inert="restartLocked || undefined" :busy="restartLocked || busy || settingsBusy || systemBusy || marketBusy || pluginToolsBusy" :auth-mode="authMode" @logout="signOut">
-    <template #process-controls><RestartControl :boot-id="bootId" :busy="busy || settingsBusy || systemBusy || marketBusy || pluginToolsBusy" :dirty="pluginDirty || settingsDirty || systemDirty" @lock="processLock" @ready="processReady" @auth-needed="logout('管理服务需要重新登录；配置或 Token 可能已更改，请重新输入管理 Token。')" /></template>
+    <template #process-controls><RestartControl :boot-id="bootId" :busy="busy || settingsBusy || systemBusy || marketBusy || pluginToolsBusy" :dirty="pluginDirty || localDirty || settingsDirty || systemDirty" @lock="processLock" @ready="processReady" @auth-needed="logout('管理服务需要重新登录；配置或 Token 可能已更改，请重新输入管理 Token。')" /></template>
     <template v-if="!restartLocked">
     <button v-if="pluginsFailed" id="retry-plugins" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">重试加载插件</button>
     <section v-if="!refreshedAt && route.meta.section === 'plugins'" class="panel empty-state" aria-live="polite"><h1 tabindex="-1">{{ pluginsFailed ? '插件状态暂不可用' : '正在读取插件状态' }}</h1><p>{{ pluginsFailed ? '尚未读取到插件列表，请重试加载。' : '正在连接管理服务，请稍候。' }}</p></section>
     <OverviewPage v-else-if="route.name === 'overview'" :plugins="plugins" :refreshed-at="refreshedAt" :busy="busy" :request="api.request" @refresh="refresh" />
     <AdaptersPage v-else-if="route.name === 'adapters'" :request="api.request" :locked="busy" @dirty="systemDirty = $event" @busy="systemBusy = $event" />
     <template v-else-if="route.name === 'logs'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">运行 / LOGS</span><h1 tabindex="-1">日志</h1><p class="muted">查看最近运行记录，按级别和插件实例筛选。</p></div></div><LogsPage :request="api.request" :subscribe-logs="api.subscribeLogs" :plugins="plugins" /></template>
-    <template v-else-if="route.name === 'plugins'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">插件 / INSTALLED</span><h1 tabindex="-1">已安装插件</h1><p class="muted">查看实例状态，进入插件管理配置。</p></div><div class="actions"><button id="refresh" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">刷新状态</button><RouterLink :to="{ name: 'marketplace' }" class="button-link">浏览插件市场 ↗</RouterLink></div></div><PluginList :plugins="plugins" :busy="busy" /></template>
+    <template v-else-if="route.name === 'plugins'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">插件 / INSTALLED</span><h1 tabindex="-1">已安装插件</h1><p class="muted">查看实例状态，进入插件管理配置。</p></div><div class="actions"><button id="refresh" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">刷新状态</button><RouterLink :to="{ name: 'marketplace' }" class="button-link">浏览插件市场 ↗</RouterLink></div></div><LocalPackageInstall :request="api.request" :upload="api.upload" :plugins="plugins" :locked="busy || permissionsReadBusy" @dirty="localDirty = $event" @busy="localBusy = $event" @installed="reconcilePermissions" @uncertain="reconcilePermissions" /><PluginList :plugins="plugins" :busy="busy || pluginToolsBusy" /></template>
     <template v-else-if="route.meta.section === 'plugins'">
       <div class="detail-toolbar"><button id="refresh" type="button" :disabled="busy || pluginToolsBusy" @click="refresh">刷新状态</button></div>
       <PluginDetail v-if="plugin" :key="`${plugin.instance_id}:${pluginEditorEpoch}`" :plugin="plugin" :request="api.request" :subscribe-logs="api.subscribeLogs" :tab="detailTab" :busy="busy || pluginToolsBusy" :conflict="conflict" @mutate="mutate" @dirty="pluginDirty = $event" @error="report" @busy="pluginChildBusy = $event" @updated="updatePlugin" @uncertain="reconcilePermissions" />
