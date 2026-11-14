@@ -27,6 +27,11 @@ function request(action: ProcessAction) {
   if (!window.confirm(message)) return;
   void control.start(action, props.bootId, props.busy || props.dirty);
 }
+function restore(id: string): boolean {
+  if (blocked.value) return false;
+  void control.startRestore(id, props.bootId, props.busy || props.dirty); return true;
+}
+defineExpose({ restore });
 function keydown(event: KeyboardEvent) {
   if (event.key === 'Escape') { event.preventDefault(); if (state.value.phase === 'rejected') control.dismissRejection(); }
   if (event.key !== 'Tab') return;

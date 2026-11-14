@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, shallowRef, watch } from 'vue';
 import { RouterLink, useRoute, useRouter } from 'vue-router';
 import AppShell from './components/AppShell.vue';
 import OverviewPage from './components/OverviewPage.vue';
@@ -9,6 +9,8 @@ import UnavailablePage from './components/UnavailablePage.vue';
 import MarketplacePage from './components/MarketplacePage.vue';
 import CommandSettings from './components/CommandSettings.vue';
 import SystemSettings from './components/SystemSettings.vue';
+import BackupRestore from './components/BackupRestore.vue';
+import { restoreMessage } from './backupRestore';
 import PluginList from './components/PluginList.vue';
 import PluginDetail from './components/PluginDetail.vue';
 import LocalPackageInstall from './components/LocalPackageInstall.vue';
@@ -29,7 +31,8 @@ const busy = ref(false), pluginDirty = ref(false), settingsDirty = ref(false), s
 const pluginChildBusy = ref(false), permissionsReadBusy = ref(false), pluginEditorEpoch = ref(0);
 const localDirty = ref(false), localBusy = ref(false);
 const pluginToolsBusy = computed(() => pluginChildBusy.value || permissionsReadBusy.value || localBusy.value);
-const systemDirty = ref(false), systemBusy = ref(false);
+const systemDirty = ref(false), systemBusy = ref(false), backupDirty = ref(false), backupBusy = ref(false);
+const restartControl = ref<InstanceType<typeof RestartControl>>();
 const bootId = ref(''), restartLocked = ref(false);
 const notifications = createNotifications(); provide(notificationKey, notifications);
 const unreconciledIds = ref(new Set<string>());
@@ -43,8 +46,8 @@ const removedPlugins = ref(new Set<string>()), autoError = ref('');
 let epoch = 0, refreshAfterBusy = false, readGeneration = 0, reconciliationQueued = false, pendingStatus = false, resetStatusRevision = false;
 let retryNotBefore = 0, reconcileDelay = 1000;
 let reconcileTimer: ReturnType<typeof setTimeout> | undefined, reconcileRead: AbortController | undefined;
-const synchronizationBusy = computed(() => busy.value || pluginToolsBusy.value || settingsBusy.value || systemBusy.value || marketBusy.value);
-const editing = computed(() => pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value);
+const synchronizationBusy = computed(() => busy.value || pluginToolsBusy.value || settingsBusy.value || systemBusy.value || backupBusy.value || marketBusy.value);
+const editing = computed(() => pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value || backupDirty.value);
 function protectedIds() { const ids = new Set(conflicts.value); if (pluginDirty.value && plugin.value) ids.add(plugin.value.instance_id); return ids; }
 function invalidateRead() { readGeneration++; clearTimeout(reconcileTimer); reconcileTimer = undefined; reconcileRead?.abort(); reconcileRead = undefined; }
 function reconciledInputs(incoming: PluginView[]) {
@@ -113,17 +116,17 @@ function logout(text = '', unloading = false) {
   bootId.value = ''; resetStatusRevision = false; restartLocked.value = false; notifications.setSuspended(false);
   historyScope = undefined;
   busy.value = false; checkingSession.value = false; sessionFailed.value = false; pluginsFailed.value = false; authMode.value = 'token';
-  pluginDirty.value = false; localDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; systemDirty.value = false; systemBusy.value = false; pluginChildBusy.value = false; permissionsReadBusy.value = false; localBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
+  pluginDirty.value = false; localDirty.value = false; settingsDirty.value = false; settingsBusy.value = false; systemDirty.value = false; systemBusy.value = false; backupDirty.value = false; backupBusy.value = false; pluginChildBusy.value = false; permissionsReadBusy.value = false; localBusy.value = false; marketBusy.value = false; marketReconcile.value = false; conflicts.value.clear(); report(text, !!text);
 }
 const mayDiscard = (dirty: boolean) => !dirty || window.confirm('有未保存更改，是否放弃这些更改？');
 const removeGuard = router.beforeEach((to, from) => {
   if (!authenticated.value) return true;
   if (restartLocked.value) return false;
-  if (busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value) { report('操作进行中，请等待完成后再切换页面。'); return false; }
+  if (busy.value || settingsBusy.value || systemBusy.value || backupBusy.value || marketBusy.value || pluginToolsBusy.value) { report('操作进行中，请等待完成后再切换页面。'); return false; }
   if (to.name === from.name && to.params.instanceId === from.params.instanceId) return true;
-  return mayDiscard(pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value);
+  return mayDiscard(pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value || backupDirty.value);
 });
-watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; localDirty.value = false; settingsDirty.value = false; systemDirty.value = false; });
+watch([() => route.name, () => route.params.instanceId], () => { pluginDirty.value = false; localDirty.value = false; settingsDirty.value = false; systemDirty.value = false; backupDirty.value = false; });
 async function perform(task: () => Promise<void>, loading: string) {
   if (busy.value || restartLocked.value) return;
   const current = epoch; busy.value = true; report(loading, false, true);
@@ -164,7 +167,12 @@ function processLock(locked: boolean) {
 }
 function processReady(session: ProcessSession) {
   readSession(session, true, true); plugins.value = []; refreshedAt.value = ''; pluginsFailed.value = false;
-  void perform(async () => { await refreshPlugins(); report('已重新连接管理服务。', false); }, '正在重新读取管理状态…');
+  if (session.restoration) notifications.notify('恢复结果', restoreMessage(session.restoration.status), session.restoration.status === 'applied' ? 'success' : 'error');
+  void perform(async () => { await refreshPlugins(); if (!session.restoration) report('已重新连接管理服务。', false); }, '正在重新读取管理状态…');
+}
+async function restoreBackup(id: string) {
+  await nextTick(); // Child clears its inspection draft before handing off to the existing controller.
+  if (!restartControl.value?.restore(id)) report('恢复尚未提交：请完成当前操作后重新检查归档。');
 }
 function restoreSession() {
   if (busy.value) return;
@@ -177,7 +185,7 @@ function restoreSession() {
   }, '正在恢复登录状态…');
 }
 function signOut() {
-  if (restartLocked.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value || !mayDiscard(pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value)) return;
+  if (restartLocked.value || busy.value || settingsBusy.value || systemBusy.value || backupBusy.value || marketBusy.value || pluginToolsBusy.value || !mayDiscard(pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value || backupDirty.value)) return;
   void perform(async () => { await api.request<Session>('/api/session/logout', {}); logout(); }, '正在退出登录…');
 }
 // A lost response may finish later on the server. Keep reconciling on market
@@ -229,7 +237,7 @@ async function reconcilePermissions() {
   catch { /* Keep the editor's choices and stale block until explicit reread. */ }
   finally { if (current === epoch) permissionsReadBusy.value = false; }
 }
-function beforeUnload(event: BeforeUnloadEvent) { if (restartLocked.value || pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value || pluginToolsBusy.value) { event.preventDefault(); event.returnValue = ''; } }
+function beforeUnload(event: BeforeUnloadEvent) { if (restartLocked.value || pluginDirty.value || localDirty.value || settingsDirty.value || systemDirty.value || backupDirty.value || busy.value || settingsBusy.value || systemBusy.value || backupBusy.value || marketBusy.value || pluginToolsBusy.value) { event.preventDefault(); event.returnValue = ''; } }
 const pageHide = () => { notifications.suspendSession(); logout('', true); };
 const pageShow = (event: PageTransitionEvent) => { if (event.persisted) restoreSession(); };
 onMounted(() => { document.addEventListener('visibilitychange', visibilitySync); window.addEventListener('beforeunload', beforeUnload); window.addEventListener('pagehide', pageHide); window.addEventListener('pageshow', pageShow); restoreSession(); });
@@ -246,8 +254,8 @@ onBeforeUnmount(() => { faultNotices.dispose(); status.dispose(); invalidateRead
       <p class="hint">登录后刷新页面可恢复会话。退出登录、会话过期或服务重启后需重新登录。</p>
     </main><footer class="login-footer">BKMQB — CONTROL PANEL</footer>
   </div>
-  <AppShell v-else :inert="restartLocked || undefined" :busy="restartLocked || busy || settingsBusy || systemBusy || marketBusy || pluginToolsBusy" :auth-mode="authMode" @logout="signOut">
-    <template #process-controls><RestartControl :boot-id="bootId" :busy="busy || settingsBusy || systemBusy || marketBusy || pluginToolsBusy" :dirty="pluginDirty || localDirty || settingsDirty || systemDirty" @lock="processLock" @ready="processReady" @auth-needed="logout('管理服务需要重新登录；配置或 Token 可能已更改，请重新输入管理 Token。')" /></template>
+  <AppShell v-else :inert="restartLocked || undefined" :busy="restartLocked || busy || settingsBusy || systemBusy || backupBusy || marketBusy || pluginToolsBusy" :auth-mode="authMode" @logout="signOut">
+    <template #process-controls><RestartControl ref="restartControl" :boot-id="bootId" :busy="busy || settingsBusy || systemBusy || backupBusy || marketBusy || pluginToolsBusy" :dirty="pluginDirty || localDirty || settingsDirty || systemDirty || backupDirty" @lock="processLock" @ready="processReady" @auth-needed="logout('管理服务需要重新登录；配置或 Token 可能已更改，请重新输入管理 Token。')" /></template>
     <template v-if="!restartLocked">
     <p v-if="status.state.value !== 'open'" role="status" class="hint">{{ status.error.value || '正在同步运行状态…' }}<span v-if="status.snapshot.value"> 保留上次状态。</span> <button type="button" @click="status.refresh">重连状态同步</button></p>
     <p v-if="autoError" role="status" class="notice error">插件自动同步失败：{{ autoError }}；保留上次列表。</p>
@@ -264,7 +272,7 @@ onBeforeUnmount(() => { faultNotices.dispose(); status.dispose(); invalidateRead
       <PluginDetail v-if="plugin" :key="`${plugin.instance_id}:${pluginEditorEpoch}`" :plugin="plugin" :request="api.request" :subscribe-logs="api.subscribeLogs" :tab="detailTab" :busy="busy || pluginToolsBusy" :conflict="conflict" @mutate="mutate" @dirty="pluginDirty = $event" @error="report" @busy="pluginChildBusy = $event" @updated="updatePlugin" @uncertain="reconcilePermissions" />
       <section v-else class="panel empty-state"><h1 tabindex="-1">未找到插件实例</h1><p>该实例不在当前管理列表中，可能已移除或未加载。</p><RouterLink :to="{ name: 'plugins' }" class="button-link">返回已安装插件</RouterLink></section>
     </template>
-    <template v-else-if="route.name === 'settings'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">系统 / SETTINGS</span><h1 tabindex="-1">设置</h1><p class="muted">管理 Bot 的全局行为。</p></div></div><CommandSettings :request="api.request" :locked="systemBusy" @dirty="settingsDirty = $event" @busy="settingsBusy = $event" /><SystemSettings :boot-id="bootId" @saved="faultNotices.settingsSaved($event, 'global')" :request="api.request" :locked="settingsBusy" @dirty="systemDirty = $event" @busy="systemBusy = $event" /></template>
+    <template v-else-if="route.name === 'settings'"><div class="page-heading"><div class="page-heading-copy"><span class="eyebrow">系统 / SETTINGS</span><h1 tabindex="-1">设置</h1><p class="muted">管理 Bot 的全局行为。</p></div></div><CommandSettings :request="api.request" :locked="systemBusy || backupBusy || backupDirty" @dirty="settingsDirty = $event" @busy="settingsBusy = $event" /><SystemSettings :boot-id="bootId" @saved="faultNotices.settingsSaved($event, 'global')" :request="api.request" :locked="settingsBusy || backupBusy || backupDirty" @dirty="systemDirty = $event" @busy="systemBusy = $event" /><BackupRestore :request="api.request" :upload="api.uploadRestore" :discard="api.discardRestore" :boot-id="bootId" :locked="busy || settingsBusy || systemBusy || settingsDirty || systemDirty" @dirty="backupDirty = $event" @busy="backupBusy = $event" @restore="restoreBackup" /></template>
     <MarketplacePage v-else-if="route.name === 'marketplace'" :request="api.request" :reconcile="marketReconcile" @busy="marketBusy = $event" @uncertain="marketReconcile = true" @installed="marketplaceInstalled" />
     <UnavailablePage v-else :kind="String(route.name)" />
     </template>
