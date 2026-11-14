@@ -20,6 +20,7 @@ use crate::plugin_management::{ManagementError, PluginManager};
 pub(super) struct ApiState {
     pub(super) manager: PluginManager,
     pub(super) logs: crate::logging::live::LogBuffer,
+    pub(super) observer: bot_core::RuntimeObserver,
 }
 
 pub(super) fn token_digest(token: &str) -> Result<[u8; 32], super::ManagementError> {
@@ -47,14 +48,32 @@ pub(super) fn router_with_logs(
     router_with_logs_and_shutdown(manager, auth, logs, None)
 }
 
+#[cfg(test)]
 pub(super) fn router_with_logs_and_shutdown(
     manager: PluginManager,
     auth: AuthState,
     logs: crate::logging::live::LogBuffer,
     shutdown: Option<bot_core::ShutdownSignal>,
 ) -> Router {
+    router_with_runtime(
+        manager,
+        auth,
+        logs,
+        shutdown,
+        bot_core::RuntimeObserver::new(),
+    )
+}
+
+pub(super) fn router_with_runtime(
+    manager: PluginManager,
+    auth: AuthState,
+    logs: crate::logging::live::LogBuffer,
+    shutdown: Option<bot_core::ShutdownSignal>,
+    observer: bot_core::RuntimeObserver,
+) -> Router {
     let streams = super::logs_stream::router(logs.clone(), auth.clone(), shutdown);
     Router::new()
+        .route("/api/runtime", get(super::runtime::get))
         .route(
             "/api/marketplace/install",
             post(super::marketplace::install),
@@ -71,7 +90,11 @@ pub(super) fn router_with_logs_and_shutdown(
             "/api/settings/commands",
             get(super::settings::get).post(super::settings::save),
         )
-        .with_state(ApiState { manager, logs })
+        .with_state(ApiState {
+            manager,
+            logs,
+            observer,
+        })
         .route_layer(middleware::from_fn(read_body))
         .route_layer(middleware::from_fn_with_state(
             auth.clone(),

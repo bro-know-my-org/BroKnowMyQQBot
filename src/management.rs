@@ -7,6 +7,7 @@ mod marketplace;
 #[cfg(test)]
 mod message_flow_tests;
 mod plugins;
+mod runtime;
 mod settings;
 
 use std::{net::SocketAddr, sync::Arc, thread, time::Duration};
@@ -187,17 +188,18 @@ fn router_parts(
         )
         .layer(DefaultBodyLimit::max(MAX_CONFIG_CHECK_BYTES))
         .with_state(ManagementState {
-            observer,
+            observer: observer.clone(),
             validation_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CONFIG_CHECKS)),
             validation_jobs,
         });
     let router = if let Some((manager, auth, live_logs, shutdown)) = api {
         router
-            .merge(plugins::router_with_logs_and_shutdown(
+            .merge(plugins::router_with_runtime(
                 manager,
                 auth,
                 live_logs,
                 Some(shutdown),
+                observer,
             ))
             .merge(plugins::assets())
     } else {
