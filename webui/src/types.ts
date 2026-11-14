@@ -1,6 +1,10 @@
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 export type Config = Record<string, Json>;
-export interface PluginView {
+export interface VersionStatus {
+  saved_version: string | null; loaded_version: string | null; restart_required: boolean;
+  runtime_state: 'ready' | 'stopped' | 'disabled' | 'not_loaded' | 'draining';
+}
+export interface PluginView extends VersionStatus {
   instance_id: string; plugin_id: string; name: string; description: string; version: string;
   source: string; trust_level: string; signature_status: string; enabled: boolean;
   runtime_state: 'ready' | 'stopped' | 'disabled' | 'not_loaded' | 'draining';
@@ -8,8 +12,9 @@ export interface PluginView {
   requested_permissions: string[]; granted_permissions: string[];
   updated_at_ms: number; pending: boolean; error: string | null;
 }
-export type PluginAction = 'config' | 'enabled' | 'apply';
-export interface Mutation { action: PluginAction; config?: Config; enabled?: boolean }
+export type PluginAction = 'config' | 'enabled' | 'apply' | 'uninstall' | 'recover';
+export interface Mutation { action: PluginAction; config?: Config; enabled?: boolean; confirm?: boolean }
+export interface FailedDeliveryPage { entries: { attempts: number; error_class: string; updated_at_ms: number }[]; next_before: number | null }
 export interface Commands { prefix: string; revision: string; saved_prefix?: string; pending?: boolean }
 export interface Session { mode: 'token' | 'none'; authenticated: boolean; history_scope?: string | null }
 export type LogCategory = 'runtime' | 'message';
@@ -30,10 +35,11 @@ export interface CatalogueItem {
   commands: string[]; capabilities: string[];
   latest: { version: string; protocol: string; download: string; sha256: string };
   selection: string; instance_id: string; manageable: boolean;
-  installed: { version: string; enabled: boolean; updated_at_ms: number; granted_permissions: string[]; runtime_state: PluginView['runtime_state'] } | null;
+  installed: (VersionStatus & { version: string; enabled: boolean; updated_at_ms: number; granted_permissions: string[] }) | null;
 }
 export interface Catalogue { source: string; total: number; offset: number; plugins: CatalogueItem[] }
 export interface InstallResult {
   instance_id: string; version: string; enabled: boolean; restart_required: boolean;
   missing_permissions: string[]; config_incomplete: boolean; updated_at_ms: number;
+  loaded_version: string | null; runtime_state: PluginView['runtime_state'];
 }

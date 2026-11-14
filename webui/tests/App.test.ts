@@ -7,7 +7,7 @@ import type { Commands, Config, PluginView } from '../src/types';
 import { runtimeFixture } from './runtimeFixture';
 
 const fixture = (overrides: Partial<PluginView> = {}): PluginView => ({
-  instance_id: 'sample', plugin_id: 'dev.bkm.sample', name: '<img src=x onerror=alert(1)>', description: '测试插件', version: '1.0', source: 'local', trust_level: 'local-wasm', signature_status: 'unsigned',
+  instance_id: 'sample', plugin_id: 'dev.bkm.sample', name: '<img src=x onerror=alert(1)>', description: '测试插件', version: '1.0', saved_version: '1.0', loaded_version: '1.0', restart_required: false, source: 'local', trust_level: 'local-wasm', signature_status: 'unsigned',
   editable: true, enabled: true, runtime_state: 'ready', updated_at_ms: 1, pending: false, error: null, requested_permissions: ['message.reply'], granted_permissions: [],
   config: { count: 1, greeting: 'hello', enabled: false, mode: 1, unknown: { keep: ['unchanged'] } },
   schema: { type: 'object', required: ['count'], properties: { count: { type: 'integer', title: '数量' }, greeting: { type: 'string' }, enabled: { type: 'boolean' }, mode: { enum: [1, 2] }, absent: { type: 'string', default: 'example' } } }, ...overrides,
@@ -33,8 +33,11 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
     return new Response(JSON.stringify(commands));
   }
   if (path.startsWith('/api/marketplace')) return new Response(JSON.stringify({ source: 'https://bkmqb-plugins.github.io/marketplace/index.json', total: 0, offset: 0, plugins: [] }));
+  if (path.startsWith('/api/plugins/failures?')) return new Response(JSON.stringify({ entries: [], next_before: null }));
   if (!body) return new Response(JSON.stringify({ plugins }));
   const p = plugins.find(p => p.instance_id === body.instance_id)!; expect(body.expected_updated_at_ms).toBe(p.updated_at_ms);
+  if (path.endsWith('/uninstall')) { plugins = plugins.filter(item => item.instance_id !== p.instance_id); return new Response(JSON.stringify({ removed: true, instance_id: p.instance_id, private_state_retained: true })); }
+  if (path.endsWith('/recover')) { p.runtime_state = 'disabled'; p.restart_required = true; p.updated_at_ms++; return new Response(JSON.stringify({ plugin: p, recovered: 3, restart_required: true })); }
   if (path.endsWith('/config')) p.config = body.config as Config;
   if (path.endsWith('/enabled')) p.enabled = body.enabled as boolean;
   p.pending = !path.endsWith('/apply'); p.updated_at_ms++; if (!p.pending) p.runtime_state = p.enabled ? 'ready' : 'stopped';
@@ -302,6 +305,72 @@ it('市场路由读取真实接口并展示空市场状态', async () => {
   expect(text()).toContain('没有匹配的插件');
   expect(requests.some(r => r.path.startsWith('/api/marketplace?'))).toBe(true);
   expect(posts()).toHaveLength(0);
+});
+
+it('卸载明确确认后携带 CAS，移除实例并将焦点带回插件列表', async () => {
+  await login(pluginRoute('sample'));
+  vi.mocked(window.confirm).mockReturnValue(false);
+  await click('#uninstall-plugin'); expect(posts()).toHaveLength(0);
+  vi.mocked(window.confirm).mockReturnValue(true);
+  await click('#uninstall-plugin'); await flush();
+  expect(posts()).toHaveLength(1);
+  expect(posts()[0]).toMatchObject({ path: '/api/plugins/uninstall', body: { instance_id: 'sample', expected_updated_at_ms: 1, confirm: true } });
+  expect(window.confirm).toHaveBeenLastCalledWith(expect.stringContaining('保留私有数据'));
+  expect(router.currentRoute.value.name).toBe('plugins');
+  expect(document.querySelectorAll('.plugin-item')).toHaveLength(0);
+  expect(document.activeElement).toBe(get('#page-content h1'));
+  expect(text()).toContain('插件已卸载，私有数据已保留');
+});
+
+it('恢复明确准备重启，不宣称运行中或自动应用', async () => {
+  await login(pluginRoute('sample'));
+  await click('#recover-plugin');
+  expect(posts()).toHaveLength(1);
+  expect(posts()[0]).toMatchObject({ path: '/api/plugins/recover', body: { instance_id: 'sample', expected_updated_at_ms: 1, confirm: true } });
+  expect(text()).toContain('已准备恢复 3 条失败投递');
+  expect(text()).toContain('本次没有重放投递');
+  expect(text()).toContain('需要重启 Bot');
+  expect(disabled('#apply')).toBe(true);
+  expect(get('.detail-header').textContent).toContain('已禁用');
+});
+
+it.each([409, 503])('运维失败 %s 后只读取核对并阻止重复写入直到显式刷新', async status => {
+  await login(pluginRoute('sample'));
+  fail = { path: '/api/plugins/uninstall', method: 'POST', status };
+  const reads = requests.filter(r => r.path === '/api/plugins').length;
+  await click('#uninstall-plugin');
+  expect(posts()).toHaveLength(1);
+  expect(requests.filter(r => r.path === '/api/plugins')).toHaveLength(reads + 1);
+  expect(disabled('#uninstall-plugin')).toBe(true);
+  await click('#uninstall-plugin'); expect(posts()).toHaveLength(1);
+  await click('#refresh'); expect(disabled('#uninstall-plugin')).toBe(false);
+  expect(posts()).toHaveLength(1);
+});
+
+it('卸载进行中阻止导航，迟到的确认响应完成后才离开', async () => {
+  await login(pluginRoute('sample'));
+  let finish!: (value: Response) => void;
+  fetcher.mockImplementationOnce(() => new Promise<Response>(resolve => { finish = resolve; }));
+  get<HTMLButtonElement>('#uninstall-plugin').click(); await nextTick();
+  await go({ name: 'plugins' }); expect(router.currentRoute.value.name).toBe('plugin-overview');
+  expect(disabled('#recover-plugin')).toBe(true);
+  finish(new Response(JSON.stringify({ removed: true, instance_id: 'sample', private_state_retained: true })));
+  await flush(); await flush();
+  expect(router.currentRoute.value.name).toBe('plugins');
+  expect(document.activeElement).toBe(get('#page-content h1'));
+});
+
+it('列表和详情独立显示已保存与实际加载版本，不通过版本文本推断加载', async () => {
+  plugins = [fixture({ version: '2.0', saved_version: '2.0', loaded_version: '1.0', restart_required: true, pending: true })];
+  await login({ name: 'plugins' });
+  expect(get('.plugin-item').textContent).toContain('已保存版本：2.0');
+  expect(get('.plugin-item').textContent).toContain('实际加载版本：1.0');
+  await go(pluginRoute('sample'));
+  expect(get('.detail-header').textContent).toContain('实际加载版本：1.0');
+  plugins[0]!.loaded_version = null; plugins[0]!.runtime_state = 'not_loaded';
+  await click('#refresh'); expect(get('.detail-header').textContent).toContain('尚未加载');
+  plugins[0]!.runtime_state = 'ready'; await click('#refresh');
+  expect(get('.detail-header').textContent).toContain('实际加载版本：未知');
 });
 
 it('通知按钮可回看跨页历史，退出登录后清空上一会话的通知', async () => {

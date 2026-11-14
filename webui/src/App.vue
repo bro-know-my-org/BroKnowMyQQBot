@@ -91,17 +91,39 @@ function marketplaceInstalled() {
   void perform(refreshPlugins, '正在读取安装后的插件状态…');
 }
 function refresh() { if (mayDiscard(pluginDirty.value)) void perform(refreshPlugins, '正在刷新插件状态…'); }
-function mutate(change: Mutation) {
+async function mutate(change: Mutation) {
   const p = plugin.value; if (!p?.editable || conflict.value || (pluginDirty.value && change.action !== 'config')) return;
-  void perform(async () => {
+  const operation = change.action === 'uninstall' || change.action === 'recover';
+  if (operation && change.confirm !== true) return;
+  const current = epoch; let removed = false;
+  await perform(async () => {
     try {
       const { action, ...values } = change;
-      const data = await api.request<{ plugin: PluginView }>(`/api/plugins/${action}`, { instance_id: p.instance_id, expected_updated_at_ms: p.updated_at_ms, ...values });
+      const data = await api.request<{ plugin?: PluginView; removed?: boolean; instance_id?: string; private_state_retained?: boolean; recovered?: number; restart_required?: boolean }>(`/api/plugins/${action}`, { instance_id: p.instance_id, expected_updated_at_ms: p.updated_at_ms, ...values });
+      if (action === 'uninstall') {
+        if (data.removed !== true || data.instance_id !== p.instance_id || data.private_state_retained !== true) throw new Error('卸载响应格式异常，正在重新读取状态。');
+        plugins.value = plugins.value.filter(item => item.instance_id !== p.instance_id); removed = true;
+        report('插件已卸载，私有数据已保留。', false); return;
+      }
       if (!data.plugin || data.plugin.instance_id !== p.instance_id) throw new Error('更新响应格式异常，请刷新确认状态。');
-      plugins.value = plugins.value.map(item => item.instance_id === p.instance_id ? data.plugin : item); pluginDirty.value = false;
-      report(data.plugin.error ? `操作已完成，但插件报告错误：${data.plugin.error}` : action === 'apply' ? (data.plugin.pending ? '仍有待应用设置，请检查运行状态。' : '已应用，请查看最新运行状态。') : '已保存；点击“立即应用”后更新运行时。', !!data.plugin.error);
-    } catch (e) { if (e instanceof ApiError && e.status === 409) conflicts.value.add(p.instance_id); throw e; }
-  }, change.action === 'apply' ? '正在应用已保存设置…' : '正在保存设置…');
+      if (action === 'recover' && (data.restart_required !== true || !data.plugin.restart_required || data.plugin.runtime_state === 'ready'
+        || !Number.isSafeInteger(data.recovered) || Number(data.recovered) < 0)) throw new Error('恢复响应格式异常，正在重新读取状态。');
+      const updated = data.plugin;
+      plugins.value = plugins.value.map(item => item.instance_id === p.instance_id ? updated : item); pluginDirty.value = false;
+      report(action === 'recover' ? `已准备恢复 ${data.recovered} 条失败投递。需要重启 Bot；本次没有重放投递。` : updated.error ? `操作已完成，但插件报告错误：${updated.error}` : action === 'apply' ? (updated.pending ? '仍有待应用设置，请检查运行状态。' : '已应用，请查看最新运行状态。') : '已保存；点击“立即应用”后更新运行时。', !!updated.error);
+    } catch (e) {
+      if (current === epoch && authenticated.value && (operation || (e instanceof ApiError && e.status === 409))) conflicts.value.add(p.instance_id);
+      if (operation && current === epoch && authenticated.value) {
+        try {
+          const data = await api.request<{ plugins: PluginView[] }>('/api/plugins');
+          if (!Array.isArray(data.plugins)) throw new Error('插件状态格式异常');
+          plugins.value = data.plugins; removed = !data.plugins.some(item => item.instance_id === p.instance_id);
+        } catch { /* Keep writes blocked until an explicit successful refresh. */ }
+      }
+      throw e;
+    }
+  }, operation ? '正在完成插件运维操作…' : change.action === 'apply' ? '正在应用已保存设置…' : '正在保存设置…');
+  if (removed && current === epoch && authenticated.value && route.params.instanceId === p.instance_id) await router.replace({ name: 'plugins' });
 }
 function beforeUnload(event: BeforeUnloadEvent) { if (pluginDirty.value || settingsDirty.value || systemDirty.value || busy.value || settingsBusy.value || systemBusy.value || marketBusy.value) { event.preventDefault(); event.returnValue = ''; } }
 const pageHide = () => { notifications.suspendSession(); logout('', true); };

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import PluginVersions from './PluginVersions.vue';
 import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue';
 import { RouterLink } from 'vue-router';
 import type { Request } from '../api';
@@ -56,9 +57,9 @@ async function install() {
     });
     if (alive) {
       stale.value = true; confirmed.value = false;
-      const updated: CatalogueItem = { ...item, installed: { version: result.version, enabled: result.enabled,
+      const updated: CatalogueItem = { ...item, installed: { version: result.version, saved_version: result.version, loaded_version: result.loaded_version, restart_required: result.restart_required, enabled: result.enabled,
         updated_at_ms: result.updated_at_ms, granted_permissions: item.capabilities.filter(capability => !result.missing_permissions.includes(capability)),
-        runtime_state: item.installed?.runtime_state ?? 'not_loaded' } };
+        runtime_state: result.runtime_state } };
       selected.value = updated;
       if (catalogue.value) catalogue.value = { ...catalogue.value, plugins: catalogue.value.plugins.map(p => p.plugin_id === item.plugin_id ? updated : p) };
       message.value = `已保存 ${result.instance_id} · ${result.version}。需要重启 Bot 后加载（RESTART REQUIRED）。${result.enabled ? '' : ' 当前保持禁用。'}${result.missing_permissions.length ? ` 缺少权限：${result.missing_permissions.join('、')}。` : ''}${result.config_incomplete ? ' 配置尚未完成，请在已安装插件中补全。' : ''}`;
@@ -81,7 +82,7 @@ onMounted(() => { void load(); });
     <div class="section-heading"><h2 id="market-detail-title" ref="detailTitle" tabindex="-1">{{ selected.name }} · {{ selected.latest.version }}</h2><button type="button" :disabled="installing" @click="closeDetails">← 返回插件列表</button></div>
     <p>{{ selected.summary }}</p><p class="mono">{{ selected.plugin_id }}</p>
     <p v-if="selected.commands.length" class="market-commands"><span class="muted">命令名</span><code v-for="command in selected.commands" :key="command">{{ command }}</code></p>
-    <div class="market-install-state"><template v-if="selected.installed"><p>已保存版本：<span class="mono">{{ selected.installed.version }}</span> · {{ selected.installed.enabled ? '已保存为启用' : '已保存为禁用' }}</p><p class="hint">实例运行状态：{{ runtimeNames[selected.installed.runtime_state] }}。保存新版本后需重启加载。</p></template><p v-else>尚未安装默认实例。</p></div>
+    <div class="market-install-state"><template v-if="selected.installed"><div class="badges"><PluginVersions :status="selected.installed" /></div><p>{{ selected.installed.enabled ? '已保存为启用' : '已保存为禁用' }}</p><p class="hint">实例运行状态：{{ runtimeNames[selected.installed.runtime_state] }}。保存新版本后需重启加载。</p></template><p v-else>尚未安装默认实例。</p></div>
     <details class="market-package"><summary>包信息与兼容性</summary><dl class="market-metadata"><dt>源码</dt><dd><a :href="selected.repository" target="_blank" rel="noopener noreferrer">{{ selected.repository }}</a></dd><dt>协议</dt><dd>BPP {{ selected.latest.protocol }}</dd><dt>包来源</dt><dd>{{ selected.latest.download }}</dd><dt>SHA-256</dt><dd class="mono">{{ selected.latest.sha256 }}</dd><dt>实例</dt><dd>{{ selected.instance_id }}</dd></dl></details>
     <p class="notice">此版本为未签名包（local-wasm / unsigned）。固定哈希用于核对包内容，不代表签名或发布者身份验证。</p>
     <p v-if="!selected.manageable" class="notice">此实例由声明式文件或随包配置管理，请在其来源中修改。</p>
@@ -97,7 +98,7 @@ onMounted(() => { void load(); });
   </section>
   <section v-if="catalogue" v-show="!selected" aria-label="市场插件列表">
     <p v-if="!catalogue.plugins.length" class="panel empty-state">{{ catalogue.total ? '当前页没有条目，请返回上一页。' : '没有匹配的插件。请更换搜索词或刷新市场。' }}</p>
-    <ul v-else class="market-list"><li v-for="item in catalogue.plugins" :key="item.plugin_id" class="panel"><h2>{{ item.name }}</h2><p>{{ item.summary }}</p><p class="mono market-plugin-id">{{ item.plugin_id }}</p><p class="market-versions"><span>市场版本 <strong class="mono">{{ item.latest.version }}</strong></span><span>{{ item.installed ? `已保存 ${item.installed.version}` : '尚未安装默认实例' }}</span></p><p v-if="item.commands.length" class="hint">命令名：{{ item.commands.slice(0, 3).join('、') }}{{ item.commands.length > 3 ? ` 等 ${item.commands.length} 项` : '' }}</p><button type="button" :aria-label="`查看 ${item.name} 的详情与权限`" :disabled="loading || installing" @click="details(item, $event)">{{ loadingItem === item.plugin_id ? '正在读取详情…' : '查看详情与权限' }}</button></li></ul>
+    <ul v-else class="market-list"><li v-for="item in catalogue.plugins" :key="item.plugin_id" class="panel"><h2>{{ item.name }}</h2><p>{{ item.summary }}</p><p class="mono market-plugin-id">{{ item.plugin_id }}</p><p class="market-versions"><span>市场版本 <strong class="mono">{{ item.latest.version }}</strong></span><PluginVersions v-if="item.installed" :status="item.installed" /><span v-else>尚未安装默认实例</span></p><p v-if="item.commands.length" class="hint">命令名：{{ item.commands.slice(0, 3).join('、') }}{{ item.commands.length > 3 ? ` 等 ${item.commands.length} 项` : '' }}</p><button type="button" :aria-label="`查看 ${item.name} 的详情与权限`" :disabled="loading || installing" @click="details(item, $event)">{{ loadingItem === item.plugin_id ? '正在读取详情…' : '查看详情与权限' }}</button></li></ul>
     <nav v-if="catalogue.total > catalogue.plugins.length || offset > 0" class="actions" aria-label="市场分页"><button type="button" :disabled="offset === 0 || loading || installing" @click="load(Math.max(0, offset - 20))">上一页</button><span>{{ offset + 1 }}–{{ offset + catalogue.plugins.length }} / {{ catalogue.total }}</span><button type="button" :disabled="offset + catalogue.plugins.length >= catalogue.total || loading || installing" @click="load(offset + 20)">下一页</button></nav>
   </section>
 </template>

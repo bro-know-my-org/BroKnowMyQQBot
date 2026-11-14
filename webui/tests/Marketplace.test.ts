@@ -15,7 +15,7 @@ const request = vi.fn(async (path: string, body?: unknown) => {
   if (body) {
     posts.push({ path, body });
     if (pending) await new Promise<void>(resolve => { pending = resolve; });
-    return { instance_id: selected.instance_id, version: selected.latest.version, enabled: false, restart_required: true, missing_permissions: ['storage.private'], config_incomplete: true, updated_at_ms: 2 };
+    return { loaded_version: selected.installed?.loaded_version ?? null, runtime_state: selected.installed?.runtime_state ?? 'not_loaded', instance_id: selected.instance_id, version: selected.latest.version, enabled: false, restart_required: true, missing_permissions: ['storage.private'], config_incomplete: true, updated_at_ms: 2 };
   }
   return path.startsWith('/api/marketplace/details') ? { ...page, plugins: [selected] } : page;
 });
@@ -57,13 +57,16 @@ it('真实目录、详情、固定哈希与权限可读；默认不授权且需�
   await click('.market-details .primary'); expect(posts).toHaveLength(1);
 });
 it('更新保留旧授权展示，携带安装版本检查且不默认选新增权限', async () => {
-  selected.installed = { version: '0.9.0', enabled: false, updated_at_ms: 7, granted_permissions: ['message.reply'], runtime_state: 'ready' };
+  selected.installed = { version: '0.9.0', saved_version: '0.9.0', loaded_version: '0.8.0', restart_required: true, enabled: false, updated_at_ms: 7, granted_permissions: ['message.reply'], runtime_state: 'ready' };
   await mount(); await click('.market-list button');
   expect(document.body.textContent).toContain('已授权，更新时保留');
   expect(document.querySelector('input[value="message.reply"]')).toBeNull();
   expect(get<HTMLInputElement>('input[value="storage.private"]').checked).toBe(false);
   await check('.market-confirm input'); await click('.market-details .primary');
   expect(posts[0]).toMatchObject({ path: '/api/marketplace/update', body: { expected_updated_at_ms: 7, grants: [] } });
+  expect(get('.market-install-state').textContent).toContain('已保存版本：1.0.0');
+  expect(get('.market-install-state').textContent).toContain('实际加载版本：0.8.0');
+  expect(get('.market-install-state').textContent).toContain('需要重启 Bot');
 });
 it('错误与空状态可重试，搜索词编码，不生成目录', async () => {
   fail = true; await mount(); expect(document.querySelector('[role="alert"]')?.textContent).toContain('市场暂不可用');
@@ -130,7 +133,7 @@ it('详情请求失败后保持原列表可操作，不展开空详情', async (
   expect(get<HTMLButtonElement>('.market-list button').disabled).toBe(false); expect(get('[role="alert"]').textContent).toContain('市场暂不可用');
 });
 it('已保存版本与实例运行状态分别说明，版本相同仍允许核对新增授权', async () => {
-  selected.installed = { version: '1.0.0', enabled: false, updated_at_ms: 7, granted_permissions: [], runtime_state: 'ready' };
+  selected.installed = { version: '1.0.0', saved_version: '1.0.0', loaded_version: '0.9.0', restart_required: true, enabled: false, updated_at_ms: 7, granted_permissions: [], runtime_state: 'ready' };
   await mount(); await click('.market-list button');
   expect(get('.market-install-state').textContent).toContain('已保存版本：1.0.0');
   expect(get('.market-install-state').textContent).toContain('已保存为禁用'); expect(get('.market-install-state').textContent).toContain('实例运行状态：运行中');

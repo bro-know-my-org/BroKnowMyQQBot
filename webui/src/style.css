@@ -111,6 +111,11 @@ code, time, .mono { font-family: var(--font-mono); font-variant-numeric: tabular
 a.reading-row:hover { background: var(--e-ink-panel); }
 .row-title { display: block; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
 .row-meta { display: block; margin-top: 4px; color: var(--e-ink-muted); font-size: 13px; overflow-wrap: anywhere; }
+.failure-list { list-style: none; padding: 0; }
+.failure-list li { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 12px 0; border-bottom: 1px solid var(--e-ink-rule); }
+.failure-list strong { flex: 1 1 160px; overflow-wrap: anywhere; }
+.failure-list time { font-variant-numeric: tabular-nums; }
+.detail-section > .section-heading { flex-wrap: wrap; }
 .row-end { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; color: var(--e-ink-muted); font-size: 13px; }
 .plugin-toolbar { display: flex; align-items: flex-end; gap: 16px; margin-bottom: 24px; }
 .plugin-toolbar > :first-child { flex: 1; }
