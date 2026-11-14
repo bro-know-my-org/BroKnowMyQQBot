@@ -16,6 +16,8 @@ mod plugin_management;
 mod plugin_marketplace;
 mod plugins;
 mod restart;
+#[allow(dead_code)] // Pure planner is wired into HTTP in the next reviewed stage.
+mod restore;
 mod version;
 
 use std::process::ExitCode;
