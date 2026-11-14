@@ -1,13 +1,15 @@
 import { assertSafeNumbers, parseSafeJson } from './json';
 import { isObject } from './types';
+import { readRestorePlan, opaqueId, MAX_BACKUP_BYTES, type RestorePlan } from './backupRestore';
 import { readLocalInspection, MAX_LOCAL_PACKAGE_BYTES } from './pluginPackages';
 import type { LocalInspection } from './types';
 import type { LogEntry, LogPage, Session, SubscribeLogs } from './types';
-type Path = `/api/logs/trace?${string}` | '/api/plugins/permissions' | `/api/plugins/permissions?${string}` | `/api/plugins/local/${'inspect' | 'commit' | 'discard'}` | '/api/settings/system' | '/api/runtime' | '/api/logs/archives' | `/api/logs/archives/page?${string}` | '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply' | 'uninstall' | 'recover'}` | `/api/plugins/failures?${string}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
+type Path = `/api/logs/trace?${string}` | '/api/backups' | `/api/restores/${string}` | '/api/plugins/permissions' | `/api/plugins/permissions?${string}` | `/api/plugins/local/${'inspect' | 'commit' | 'discard'}` | '/api/settings/system' | '/api/runtime' | '/api/logs/archives' | `/api/logs/archives/page?${string}` | '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply' | 'uninstall' | 'recover'}` | `/api/plugins/failures?${string}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
 const REQUEST_TIMEOUT_MS = 30000;
 const MARKETPLACE_BROWSE_TIMEOUT_MS = 70000;
 const MARKETPLACE_WRITE_TIMEOUT_MS = 240000;
 function requestTimeout(path: Path): number {
+  if (path === '/api/restores/inspect') return MARKETPLACE_WRITE_TIMEOUT_MS;
   if (path === '/api/plugins/local/commit') return MARKETPLACE_WRITE_TIMEOUT_MS;
   if (path === '/api/plugins/local/inspect') return MARKETPLACE_BROWSE_TIMEOUT_MS;
   if (path === '/api/marketplace/install' || path === '/api/marketplace/update') return MARKETPLACE_WRITE_TIMEOUT_MS;
@@ -17,6 +19,8 @@ function requestTimeout(path: Path): number {
 export class ApiError extends Error {
   constructor(message: string, public readonly status = 0) { super(message); }
 }
+export type RestoreUpload = (file: File, signal?: AbortSignal) => Promise<RestorePlan>;
+export type RestoreDiscard = (id: string, signal?: AbortSignal) => Promise<void>;
 export type Upload = (file: File, signal?: AbortSignal) => Promise<LocalInspection>;
 export type Request = <T>(path: Path, body?: unknown, signal?: AbortSignal) => Promise<T>;
 const levels = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
@@ -52,25 +56,26 @@ export function createApi(onUnauthorized: () => void) {
   const streams = new Set<() => void>();
   const clear = () => { generation++; streams.forEach(close => close()); active.forEach(c => c.abort()); active.clear(); };
   const unauthorized = () => { clear(); onUnauthorized(); };
-  const performRequest = async <T>(path: Path, body?: unknown, valid = () => true, owner?: AbortSignal): Promise<T> => {
+  const performRequest = async <T>(path: Path, body?: unknown, valid = () => true, owner?: AbortSignal, method?: 'DELETE'): Promise<T> => {
     const current = generation, controller = new AbortController(); active.add(controller);
     const abort = () => controller.abort();
     owner?.addEventListener('abort', abort, { once: true });
     if (owner?.aborted) controller.abort();
     const timer = setTimeout(() => controller.abort(), requestTimeout(path));
     try {
-      const binary = path === '/api/plugins/local/inspect' && body instanceof Blob;
+      const binary = (path === '/api/plugins/local/inspect' || path === '/api/restores/inspect') && body instanceof Blob;
       if (!binary) assertSafeNumbers(body);
       const contentType = binary ? 'application/octet-stream' : 'application/json';
       const payload = binary ? body as Blob : JSON.stringify(body);
       const response = await fetch(path, {
-        method: body === undefined ? 'GET' : 'POST', mode: 'same-origin', credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal,
+        method: method ?? (body === undefined ? 'GET' : 'POST'), mode: 'same-origin', credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal,
         headers: body === undefined ? {} : { 'Content-Type': contentType },
         ...(body === undefined ? {} : { body: payload }),
       });
       if (current !== generation || !valid() || controller.signal.aborted) throw new ApiError('会话已结束。');
       if (response.status === 401) { unauthorized(); throw new ApiError('登录已失效，请重新输入管理 Token。', 401); }
       if (response.status === 409) throw new ApiError('其他操作已更新设置。请先复制需要保留的编辑，再刷新后重试。', 409);
+      if (method === 'DELETE' && response.status === 204) return undefined as T;
       let data: unknown;
       try { data = parseSafeJson(await response.text()); }
       catch (e) { throw new ApiError(e instanceof SyntaxError ? `响应无法读取（${response.status}），请刷新确认状态。` : (e as Error).message); }
@@ -88,6 +93,14 @@ export function createApi(onUnauthorized: () => void) {
   const upload: Upload = async (file, signal) => {
     if (!file.name.endsWith('.bkm-plugin') || file.size < 1 || file.size > MAX_LOCAL_PACKAGE_BYTES) throw new ApiError('请选择不超过 32 MiB 的 .bkm-plugin 文件。');
     return readLocalInspection(await performRequest('/api/plugins/local/inspect', file, () => true, signal));
+  };
+  const uploadRestore: RestoreUpload = async (file, signal) => {
+    if (!file.name.endsWith('.bkm-backup') || file.size < 1 || file.size > MAX_BACKUP_BYTES) throw new ApiError('请选择不超过 128 MiB 的 .bkm-backup 文件。');
+    return readRestorePlan(await performRequest('/api/restores/inspect', file, () => true, signal));
+  };
+  const discardRestore: RestoreDiscard = async (id, signal) => {
+    if (!opaqueId(id)) throw new ApiError('恢复计划标识无效。');
+    await performRequest(`/api/restores/${id}`, undefined, () => true, signal, 'DELETE');
   };
   const subscribeLogs: SubscribeLogs = (query, handlers) => {
     const limit = query.limit ?? 200;
@@ -137,5 +150,5 @@ export function createApi(onUnauthorized: () => void) {
     };
     return close;
   };
-  return { request, upload, subscribeLogs, clear };
+  return { request, upload, uploadRestore, discardRestore, subscribeLogs, clear };
 }

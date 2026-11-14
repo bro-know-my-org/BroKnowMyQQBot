@@ -1,8 +1,9 @@
 import { shallowRef } from 'vue';
 import { isObject } from './types';
+import { opaqueId, readRestoreResult, restoreMessage, type RestoreResult } from './backupRestore';
 
 export type ProcessAction = 'restart' | 'stop';
-export interface ProcessSession { boot_id: string; mode: 'token' | 'none'; authenticated: boolean; history_scope?: string | null }
+export interface ProcessSession { restoration?: RestoreResult; boot_id: string; mode: 'token' | 'none'; authenticated: boolean; history_scope?: string | null }
 type Phase = 'idle' | 'requesting' | 'waiting' | 'timeout' | 'disconnected' | 'external-start' | 'rejected';
 export interface ProcessState { phase: Phase; action: ProcessAction; message: string }
 interface Options {
@@ -24,7 +25,7 @@ function session(value: unknown): ProcessSession {
 // carry only the browser's same-origin HttpOnly cookie and never replay writes.
 export function createProcessControl(options: Options) {
   const state = shallowRef<ProcessState>({ phase: 'idle', action: 'restart', message: '' });
-  let alive = true, operation: AbortController | undefined, oldBoot = '', accepted = false;
+  let alive = true, operation: AbortController | undefined, oldBoot = '', accepted = false, restoreId = '';
   let deadline = 0;
   const set = (phase: Phase, message: string) => { state.value = { ...state.value, phase, message }; };
   const live = (owner: AbortController) => alive && operation === owner && !owner.signal.aborted;
@@ -74,6 +75,17 @@ export function createProcessControl(options: Options) {
         if (!result.response.ok) throw new Error('服务暂不可用');
         const next = session(result.value);
         if (!next.authenticated) { requireAuth(owner); return; }
+        if (restoreId && next.boot_id === oldBoot) {
+          const outcome = await read(`/api/restores/${restoreId}/outcome`, owner);
+          if (!live(owner)) return;
+          if (outcome.response.status === 401) { requireAuth(owner); return; }
+          if (outcome.response.ok) {
+            const result = readRestoreResult(outcome.value, restoreId);
+            if (['rejected', 'cancelled', 'interrupted', 'rolled_back'].includes(result.status)) {
+              set('rejected', restoreMessage(result.status)); options.lock(false); return;
+            }
+          }
+        }
         if (state.value.action === 'stop' && !manual) {
           if (next.boot_id !== oldBoot) {
             set('external-start', '服务出现新的启动标识，可能已由外部服务管理器启动。请手动重新连接。'); return;
@@ -84,6 +96,14 @@ export function createProcessControl(options: Options) {
           if (runtime.response.status === 401) { requireAuth(owner); return; }
           if (runtime.response.ok && isObject(runtime.value) && runtime.value.boot_id === next.boot_id
             && isObject(runtime.value.health) && runtime.value.health.phase === 'running') {
+            if (restoreId) {
+              const outcome = await read(`/api/restores/${restoreId}/outcome`, owner);
+              if (!live(owner)) return;
+              if (outcome.response.status === 401) { requireAuth(owner); return; }
+              if (!outcome.response.ok && ![404,410].includes(outcome.response.status)) throw new Error('恢复结果暂不可用');
+              try { next.restoration = outcome.response.ok ? readRestoreResult(outcome.value, restoreId) : { operation_id: restoreId, status: 'unknown' }; }
+              catch { next.restoration = { operation_id: restoreId, status: 'unknown' }; }
+            }
             set('idle', ''); options.lock(false); options.ready(next); return;
           }
         }
@@ -99,24 +119,26 @@ export function createProcessControl(options: Options) {
     }
     if (live(owner)) set('timeout', state.value.action === 'restart' ? '连接等待超时，尚未确认新进程已启动。请核对终端状态，再重试连接。' : '尚未确认服务断开。停止可能仍在处理中，请核对终端状态。');
   }
-  async function start(action: ProcessAction, boot: string, blocked: boolean) {
+  async function start(action: ProcessAction, boot: string, blocked: boolean, restoration = '') {
     if (!alive || state.value.phase !== 'idle' || blocked || !bootId(boot)) return;
     operation?.abort(); const owner = new AbortController(); operation = owner;
-    oldBoot = boot; accepted = false; deadline = performance.now() + DEADLINE;
+    oldBoot = boot; accepted = false; restoreId = restoration; deadline = performance.now() + DEADLINE;
     state.value = { phase: 'requesting', action, message: action === 'restart' ? '正在请求优雅重启…' : '正在请求优雅停止…' };
     options.lock(true);
     try {
-      const result = await read(CONTROL_PATHS[action], owner, { expected_boot_id: boot });
+      const result = await read(restoration ? `/api/restores/${restoration}/commit` : CONTROL_PATHS[action], owner, { expected_boot_id: boot, ...(restoration ? { confirm_sensitive_plugin_data: true, confirm_unsigned_disabled: true } : {}) });
       if (!live(owner)) return;
       if (result.response.status >= 400 && result.response.status < 500 && result.response.status !== 408) {
         if (result.response.status === 401) { requireAuth(owner); return; }
         set('rejected', isObject(result.value) && typeof result.value.error === 'string' ? result.value.error.slice(0, 512) : '操作未被接受，请刷新状态后确认。');
         options.lock(false); return;
       }
-      accepted = result.response.status === 202 && isObject(result.value) && result.value.boot_id === boot && result.value.action === action;
+      accepted = result.response.status === 202 && isObject(result.value) && result.value.boot_id === boot && result.value.action === action && (!restoration || result.value.operation_id === restoration);
     } catch { if (!live(owner)) return; }
     if (!live(owner)) return;
-    const progress = action === 'restart' ? '正在重启：等待任务结束并确认新进程…' : '正在停止：等待任务结束和服务断开…';
+    let progress = '正在停止：等待任务结束和服务断开…';
+    if (restoration) progress = '正在恢复：等待任务结束、离线应用并核验新进程与恢复结果…';
+    else if (action === 'restart') progress = '正在重启：等待任务结束并确认新进程…';
     set('waiting', accepted ? progress : '请求结果尚未确认，正在核对服务状态；不会重复发送操作。');
     await probe(owner);
   }
@@ -126,7 +148,8 @@ export function createProcessControl(options: Options) {
     set('waiting', '正在重新连接；仅查询状态，不会启动进程或重复发送操作。');
     await probe(owner, state.value.action === 'stop');
   }
+  async function startRestore(id: string, boot: string, blocked: boolean) { if (opaqueId(id)) await start('restart', boot, blocked, id); }
   function dismissRejection() { if (state.value.phase === 'rejected') set('idle', ''); }
   function dispose() { alive = false; operation?.abort(); }
-  return { state, start, reconnect, dismissRejection, dispose };
+  return { state, start, startRestore, reconnect, dismissRejection, dispose };
 }

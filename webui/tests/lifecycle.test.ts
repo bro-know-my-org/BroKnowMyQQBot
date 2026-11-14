@@ -136,3 +136,49 @@ it.each(['restart', 'stop'] as const)('same-boot authentication loss during %s d
   await control.start(action, OLD, false); await tick(90_001);
   expect(fetcher).toHaveBeenCalledTimes(2); expect(ready).not.toHaveBeenCalled();
 });
+
+it('restore sends one confirmed commit, reads pending outcome, and completes only after NEW boot and running runtime', async () => {
+  const id='33333333-3333-4333-8333-333333333333'; let boot=OLD;
+  const fetcher=vi.fn(async (path:string,init:RequestInit) => {
+    if(init.method==='POST') { expect(path).toBe(`/api/restores/${id}/commit`); expect(JSON.parse(String(init.body))).toEqual({expected_boot_id:OLD,confirm_sensitive_plugin_data:true,confirm_unsigned_disabled:true}); throw new TypeError('lost acceptance'); }
+    return response(path==='/api/session' ? session(boot) : path==='/api/runtime' ? runtime() : {operation_id:id,status:boot===OLD?'pending':'applied'});
+  });vi.stubGlobal('fetch',fetcher);void control.startRestore(id,OLD,false);await tick();expect(ready).not.toHaveBeenCalled();expect(fetcher.mock.calls.some(([path])=>path.endsWith('/outcome'))).toBe(true);
+  boot=NEW;await tick(250);expect(ready).toHaveBeenCalledExactlyOnceWith({...session(NEW),restoration:{operation_id:id,status:'applied'}});expect(fetcher.mock.calls.filter(([,init])=>init.method==='POST')).toHaveLength(1);
+});
+it.each(['rolled_back','interrupted','cancelled','applied_restart_failed'])('restore preserves truthful %s status on a verified new process', async status => {
+  const id='33333333-3333-4333-8333-333333333333';
+  vi.stubGlobal('fetch',vi.fn(async (path:string,init:RequestInit)=>response(init.method==='POST'?{boot_id:OLD,action:'restart',operation_id:id}:path==='/api/session'?session(NEW):path==='/api/runtime'?runtime():{operation_id:id,status},init.method==='POST'?202:200)));
+  await control.startRestore(id,OLD,false);expect(ready.mock.calls[0]![0].restoration).toEqual({operation_id:id,status});
+});
+it.each([null,{operation_id:'wrong',status:'applied'},{operation_id:'33333333-3333-4333-8333-333333333333',status:'invented'}])('restore cannot claim success for missing or invalid outcome %s', async value => {
+  const id='33333333-3333-4333-8333-333333333333';const fetcher=vi.fn(async (path:string,init:RequestInit)=>response(init.method==='POST'?{}:path==='/api/session'?session(NEW):path==='/api/runtime'?runtime():value,path.endsWith('/outcome') && value===null?410:200));vi.stubGlobal('fetch',fetcher);
+  await control.startRestore(id,OLD,false);expect(ready.mock.calls[0]![0].restoration?.status).toBe('unknown');expect(fetcher.mock.calls.filter(([,init])=>init.method==='POST')).toHaveLength(1);
+});
+it('restore busy and invalid ticket guard, rejected stale CAS, timeout and reconnect never resubmit writes', async () => {
+  const id='33333333-3333-4333-8333-333333333333';const fetcher=vi.fn(async ()=>response({error:'reinspect'},409));vi.stubGlobal('fetch',fetcher);
+  await control.startRestore('../escape',OLD,false);await control.startRestore(id,OLD,true);expect(fetcher).not.toHaveBeenCalled();await control.startRestore(id,OLD,false);expect(control.state.value.phase).toBe('rejected');expect(fetcher).toHaveBeenCalledOnce();
+  control.dismissRejection();let boot=OLD;fetcher.mockImplementation(async ()=>response(session(boot)));void control.startRestore(id,OLD,false);await tick(90_001);expect(control.state.value.phase).toBe('timeout');
+  boot=NEW;fetcher.mockImplementation(async ()=>response(session(NEW)));void control.reconnect();await tick(90_001);expect(control.state.value.phase).toBe('timeout');expect(ready).not.toHaveBeenCalled();
+});
+
+
+it('lost restore refusal reconciles its terminal outcome on the unchanged boot without replaying a write', async () => {
+  const id = '33333333-3333-4333-8333-333333333333';
+  const fetcher = vi.fn(async (path: string, init: RequestInit) => {
+    if (init.method === 'POST') throw new TypeError('lost refusal');
+    return response(path.endsWith('/outcome') ? { operation_id: id, status: 'rejected' } : session());
+  });
+  vi.stubGlobal('fetch', fetcher); await control.startRestore(id, OLD, false);
+  expect(control.state.value.phase).toBe('rejected'); expect(control.state.value.message).toContain('未应用');
+  expect(lock).toHaveBeenLastCalledWith(false); expect(ready).not.toHaveBeenCalled();
+  expect(fetcher.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
+  control.dismissRejection(); expect(control.state.value.phase).toBe('idle');
+});
+
+it('same-boot applied outcome still cannot claim a completed restore or unlock restart reconciliation', async () => {
+  const id = '33333333-3333-4333-8333-333333333333';
+  const fetcher = vi.fn(async (path: string, init: RequestInit) => response(init.method === 'POST' ? { boot_id: OLD, action: 'restart', operation_id: id } : path.endsWith('/outcome') ? { operation_id: id, status: 'applied' } : session(), init.method === 'POST' ? 202 : 200));
+  vi.stubGlobal('fetch', fetcher); void control.startRestore(id, OLD, false); await tick(90_001);
+  expect(control.state.value.phase).toBe('timeout'); expect(ready).not.toHaveBeenCalled();
+  expect(fetcher.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
+});
