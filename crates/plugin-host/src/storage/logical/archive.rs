@@ -143,7 +143,7 @@ impl LogicalArchive {
         {
             return Err(LogicalArchiveError::Invalid);
         }
-        encode(&self.configuration, 32 * 1024)?;
+        encode(&self.configuration, 1024 * 1024)?;
         let required: BTreeSet<_> = self
             .snapshot
             .installations

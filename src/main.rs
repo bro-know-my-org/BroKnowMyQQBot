@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod backup;
 mod bootstrap;
 mod browser;
 mod cli;

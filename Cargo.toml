@@ -66,7 +66,7 @@ signal-hook = "0.3"
 subtle.workspace = true
 tar.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "process"] }
+tokio = { workspace = true, features = ["io-util", "process", "fs"] }
 toml.workspace = true
 toml_edit.workspace = true
 tower.workspace = true

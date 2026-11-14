@@ -118,6 +118,50 @@ pub(crate) fn is_reserved_bundled_instance_id(instance_id: &str) -> bool {
         .any(|(_, bundled_instance_id)| *bundled_instance_id == instance_id)
 }
 
+/// Export declaration-owned records for inspection; restore must not overwrite them.
+pub(crate) fn backup_declarations(
+    path: Option<&Path>,
+) -> Result<Vec<plugin_host::PluginInstallation>, Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(vec![]);
+    };
+    let bytes = crate::backup::read(path, MAX_INSTALLATION_FILE_BYTES)?;
+    let declarations: PluginInstallations = toml::from_str(std::str::from_utf8(&bytes)?)?;
+    if declarations.wasm.len() > 256 {
+        return Err("too many declared plugins".into());
+    }
+    declarations
+        .wasm
+        .into_iter()
+        .map(|item| {
+            let package_path = item.resolved_package(path);
+            let bytes = crate::backup::read(&package_path, plugin_host::MAX_PLUGIN_PACKAGE_BYTES)?;
+            let package = ValidatedPluginPackage::from_bytes(&bytes)?;
+            Ok(plugin_host::PluginInstallation {
+                plugin_id: package.manifest().id.to_string(),
+                metadata: package.manifest().metadata.clone(),
+                instance_id: item.instance_id,
+                version: package.manifest().version.clone(),
+                package_path: package_path.display().to_string(),
+                package_sha256: package.package_sha256().into(),
+                source: "declaration".into(),
+                trust_level: "local-wasm".into(),
+                signature_status: "unsigned".into(),
+                requested_permissions: package
+                    .manifest()
+                    .requested_capabilities()
+                    .into_iter()
+                    .collect(),
+                granted_permissions: item.grants.into_iter().collect(),
+                config: item.config,
+                enabled: item.enabled,
+                installed_at_ms: 0,
+                updated_at_ms: 0,
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn is_declared_instance_id(
     installation_file: Option<&Path>,
     instance_id: &str,
@@ -192,6 +236,7 @@ pub(crate) async fn load_plugins(
         .iter()
         .map(|item| item.instance_id.clone())
         .collect();
+    let mut loaded_packages = BTreeMap::new();
     for installation in installations.wasm {
         if !installation.enabled {
             info!(
@@ -225,6 +270,7 @@ pub(crate) async fn load_plugins(
                 installation.grants,
             )
             .await?;
+        loaded_packages.insert(installation.instance_id.clone(), package_sha256.clone());
         info!(
             plugin_id,
             instance_id = installation.instance_id,
@@ -236,7 +282,6 @@ pub(crate) async fn load_plugins(
     let installation_store = store.clone();
     let managed_installations =
         tokio::task::spawn_blocking(move || installation_store.enabled_installations()).await??;
-    let mut loaded_packages = BTreeMap::new();
     for installation in managed_installations {
         if is_reserved_bundled_instance_id(&installation.instance_id) {
             return Err(Box::new(PluginConfigError::ReservedInstance(

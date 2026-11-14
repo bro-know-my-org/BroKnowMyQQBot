@@ -1,5 +1,6 @@
 //! Shared management operations for the CLI and authenticated Web interface.
 
+mod backup;
 pub(crate) mod local_packages;
 pub(crate) mod marketplace;
 pub(crate) mod marketplace_install;
@@ -32,6 +33,8 @@ use tokio::{
 
 #[derive(Debug, Error)]
 pub(crate) enum ManagementError {
+    #[error("逻辑备份不可用：文件、包或数据超限/不一致，请检查配置和待重启插件")]
+    Backup,
     #[error("市场暂不可用，请稍后重试或检查配置的索引")]
     MarketplaceUnavailable,
     #[error("市场条目已改变，请刷新详情并重新确认")]

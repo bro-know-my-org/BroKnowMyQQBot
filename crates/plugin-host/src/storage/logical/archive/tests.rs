@@ -195,6 +195,6 @@ fn preflight_rejects_oversized_central_metadata_before_zip_parsing() {
     let mut archive = fixture();
     archive
         .configuration
-        .insert("oversized".into(), json!("x".repeat(33 * 1024)));
+        .insert("oversized".into(), json!("x".repeat(1024 * 1024 + 1)));
     assert!(archive.to_bytes().is_err());
 }
