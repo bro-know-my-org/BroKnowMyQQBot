@@ -165,3 +165,34 @@ it("向上阅读并换行时，异步插件名称和原始日志切换均保留�
   expect(position).toBe(300); expect(anchor.getBoundingClientRect().top).toBe(0);
   expect(controls[0]!.getAttribute("aria-pressed")).toBe("false");
 });
+
+it('常见运行日志默认中文摘要，保留级别并完整恢复安全原文，追加保持旧节点', async () => {
+  const host = document.createElement('div'); document.body.append(host);
+  const entries = ref<LogEntry[]>([
+    { ...entry(1), target: 'bkmqb::browser', level: 'WARN', message: 'using private Browser Runtime fallback directory', fields: { path: '/private/browser', reason: '<img src=x>' } },
+    { ...entry(2), target: 'bkmqb::bootstrap', message: 'optional Browser Runtime is not installed', fields: {} },
+    { ...entry(3), target: 'bkmqb::management', message: 'management server listening', fields: { listen: '127.0.0.1:9090', auth: 'None' } },
+    { ...entry(4), target: 'adapter_qqbot::websocket', message: 'QQ message action failed', fields: { adapter_id: 'qq-official', error: '<script>failure</script>' } },
+  ]);
+  app = createApp(defineComponent(() => () => h(TerminalOutput, { entries: entries.value, emptyMessage: '等待输出' }))); app.mount(host);
+  const rows = [...host.querySelectorAll('.terminal-line')], raw = [...host.querySelectorAll('button')].find(button => button.textContent === '原始日志：关')!;
+  expect(rows[0]?.textContent).toContain('[目录回退] 浏览器运行时: 浏览器运行时改用私有备用目录 [WARN]');
+  expect(rows[0]?.textContent).not.toMatch(/private|reason|img/u);
+  expect(rows[1]?.textContent).toContain('可选浏览器运行时未安装，浏览器能力不可用 [INFO]');
+  expect(rows[2]?.textContent).toContain('管理服务正在监听 · 地址 127.0.0.1:9090 [INFO]');
+  expect(rows[2]?.textContent).not.toContain('auth');
+  expect(rows[3]?.textContent).toContain('[执行失败] QQ 网关 · qq-official: QQ 消息操作失败 [INFO]');
+  const text = rows[0]?.querySelector('.terminal-message')?.firstChild;
+  entries.value = [...entries.value, entry(5)]; await flush();
+  expect(host.querySelector('.terminal-line')).toBe(rows[0]);
+  expect(rows[0]?.querySelector('.terminal-message')?.firstChild).toBe(text);
+  raw.click(); await flush();
+  expect(host.querySelector('.terminal-line')).toBe(rows[0]);
+  expect(rows[0]?.textContent).toContain('WARN  bkmqb::browser: using private Browser Runtime fallback directory path=/private/browser reason="<img src=x>"');
+  expect(rows[2]?.textContent).toContain('INFO  bkmqb::management: management server listening listen=127.0.0.1:9090 auth=None');
+  expect(rows[3]?.textContent).toContain('error=<script>failure</script>');
+  expect(host.querySelector('img,script')).toBeNull();
+  expect(host.querySelector('.terminal-body')).toBeNull();
+  raw.click(); await flush();
+  expect(rows[0]?.textContent).toContain('浏览器运行时改用私有备用目录 [WARN]');
+});

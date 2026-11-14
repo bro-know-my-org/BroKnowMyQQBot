@@ -1,6 +1,7 @@
 import type { LogEntry, PluginView } from './types';
+import { readRuntimeLog } from './runtimeLogPresentation';
 
-interface Reading { summary: string; status: string; detail?: string }
+interface Reading { summary: string; status: string; detail?: string; source?: string }
 const scopes: Record<string, string> = { private: '私聊', group: '群聊', channel: '频道' };
 const actionStatuses: Record<string, string> = {
   succeeded: '已执行', failed: '执行失败', denied: '权限拒绝', timed_out: '执行超时',
@@ -16,7 +17,7 @@ function known(table: Record<string, string>, key: string | undefined): string |
   return key !== undefined && Object.hasOwn(table, key) ? table[key] : undefined;
 }
 
-// Only stable metadata describes an outcome. Never infer one from English text or IDs.
+// Record kinds take precedence; legacy runtime events use exact producer templates.
 export function readLog(entry: LogEntry): Reading | undefined {
   const f = entry.fields, kind = f.record_kind;
   const scope = known(scopes, f.message_scope) ?? '';
@@ -45,7 +46,7 @@ export function readLog(entry: LogEntry): Reading | undefined {
       if (!status) return undefined;
       return { summary: '插件动作执行结果', status, detail: known(actionNames, f.action_type) ?? f.action_type };
     }
-    default: return undefined;
+    default: return kind === undefined ? readRuntimeLog(entry) : undefined;
   }
 }
 
@@ -53,6 +54,8 @@ export function logSource(entry: LogEntry, plugins: ReadonlyMap<string, PluginVi
   const instance = entry.instance_id, plugin = instance ? plugins.get(instance) : undefined;
   const label = plugin && (!entry.fields.plugin_id || entry.fields.plugin_id === plugin.plugin_id)
     ? plugin.name || plugin.plugin_id : entry.fields.plugin_id;
+  const runtime = readRuntimeLog(entry);
+  if (runtime) return [runtime.source, label || instance, entry.fields.adapter_id].filter(Boolean).join(' · ');
   return [label, instance, entry.fields.adapter_id].filter(Boolean).join(' · ') || entry.target;
 }
 
