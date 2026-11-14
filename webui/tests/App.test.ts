@@ -35,11 +35,16 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
     return new Response(JSON.stringify(commands));
   }
   if (path.startsWith('/api/marketplace')) return new Response(JSON.stringify({ source: 'https://bkmqb-plugins.github.io/marketplace/index.json', total: 0, offset: 0, plugins: [] }));
+  if (path.startsWith('/api/plugins/permissions?')) {
+    const id = new URLSearchParams(path.split('?')[1]).get('instance_id'), p = plugins.find(p => p.instance_id === id)!;
+    return new Response(JSON.stringify({ instance_id: id, expected_updated_at_ms: p.updated_at_ms, version: p.version, sha256: 'a'.repeat(64), requested_permissions: p.requested_permissions, granted_permissions: p.granted_permissions }));
+  }
   if (path.startsWith('/api/plugins/failures?')) return new Response(JSON.stringify({ entries: [], next_before: null }));
   if (!body) return new Response(JSON.stringify({ plugins }));
   const p = plugins.find(p => p.instance_id === body.instance_id)!; expect(body.expected_updated_at_ms).toBe(p.updated_at_ms);
   if (path.endsWith('/uninstall')) { plugins = plugins.filter(item => item.instance_id !== p.instance_id); return new Response(JSON.stringify({ removed: true, instance_id: p.instance_id, private_state_retained: true })); }
   if (path.endsWith('/recover')) { p.runtime_state = 'disabled'; p.restart_required = true; p.updated_at_ms++; return new Response(JSON.stringify({ plugin: p, recovered: 3, restart_required: true })); }
+  if (path.endsWith('/permissions')) { p.granted_permissions = body.grants as string[]; p.restart_required = true; }
   if (path.endsWith('/config')) p.config = body.config as Config;
   if (path.endsWith('/enabled')) p.enabled = body.enabled as boolean;
   p.pending = !path.endsWith('/apply'); p.updated_at_ms++; if (!p.pending) p.runtime_state = p.enabled ? 'ready' : 'stopped';
@@ -627,4 +632,42 @@ describe('Bot 进程控制', () => {
     vi.stubGlobal('fetch', pending); await click('#stop-bot'); app.unmount(); await flush();
     expect(signal.aborted).toBe(true); expect(pending).toHaveBeenCalledOnce();
   });
+});
+
+it('权限草稿与进行中的写入接入根导航、退出和刷新保护', async () => {
+  await login(pluginRoute('sample'));
+  await click('#edit-permissions'); await input('input[value="message.reply"]', true);
+  vi.mocked(window.confirm).mockReturnValue(false);
+  await go({ name: 'logs' }); expect(router.currentRoute.value.name).toBe('plugin-overview');
+  await click('#save-permissions'); expect(posts()).toHaveLength(0);
+  vi.mocked(window.confirm).mockReturnValue(true);
+  let finish!: (value: Response) => void;
+  fetcher.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await click('#save-permissions'); expect(disabled('#logout')).toBe(true); expect(disabled('#refresh')).toBe(true);
+  await go({ name: 'logs' }); expect(router.currentRoute.value.name).toBe('plugin-overview');
+  const saved = { ...plugins[0]!, updated_at_ms: 2, granted_permissions: ['message.reply'], restart_required: true };
+  finish(new Response(JSON.stringify({ plugin: saved }))); await flush();
+  expect(disabled('#logout')).toBe(false);
+  expect(get('.detail-header').textContent).toContain('需要重启 Bot');
+});
+
+it('确认刷新重挂权限编辑器，取消刷新与后续导航都继续保护草稿', async () => {
+  await login(pluginRoute('sample')); await click('#edit-permissions'); await input('input[value="message.reply"]', true);
+  vi.mocked(window.confirm).mockReturnValue(false); await click('#refresh');
+  expect(get<HTMLInputElement>('input[value="message.reply"]').checked).toBe(true);
+  await go({ name: 'logs' }); expect(router.currentRoute.value.name).toBe('plugin-overview');
+  vi.mocked(window.confirm).mockReturnValue(true); await click('#refresh');
+  expect(document.querySelector('#save-permissions')).toBeNull();
+  vi.mocked(window.confirm).mockReturnValue(false); await go({ name: 'logs' }); expect(router.currentRoute.value.name).toBe('logs');
+});
+it('权限未知结果的重新读取保持根忙碌直到响应，避免覆盖新的配置草稿', async () => {
+  await login(pluginRoute('sample')); await click('#edit-permissions'); await input('input[value="message.reply"]', true);
+  fail = { path: '/api/plugins/permissions', method: 'POST', status: 503 };
+  let finish!: (value: Response) => void;
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init: RequestInit = {}) => String(input) === '/api/plugins' ? new Promise<Response>(resolve => { finish = resolve; }) : fetcher(input, init));
+  await click('#save-permissions'); expect(disabled('#logout')).toBe(true);
+  await go(pluginRoute('sample', 'config')); expect(router.currentRoute.value.name).toBe('plugin-overview');
+  finish(new Response(JSON.stringify({ plugins }))); await flush();
+  expect(disabled('#logout')).toBe(false); expect(disabled('#save-permissions')).toBe(true);
+  vi.mocked(window.confirm).mockReturnValue(false); await go(pluginRoute('sample', 'config')); expect(router.currentRoute.value.name).toBe('plugin-overview');
 });

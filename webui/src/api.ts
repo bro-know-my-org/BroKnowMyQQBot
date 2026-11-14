@@ -1,11 +1,15 @@
 import { assertSafeNumbers, parseSafeJson } from './json';
 import { isObject } from './types';
+import { readLocalInspection, MAX_LOCAL_PACKAGE_BYTES } from './pluginPackages';
+import type { LocalInspection } from './types';
 import type { LogEntry, LogPage, Session, SubscribeLogs } from './types';
-type Path = '/api/settings/system' | '/api/runtime' | '/api/logs/archives' | `/api/logs/archives/page?${string}` | '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply' | 'uninstall' | 'recover'}` | `/api/plugins/failures?${string}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
+type Path = '/api/plugins/permissions' | `/api/plugins/permissions?${string}` | `/api/plugins/local/${'inspect' | 'commit' | 'discard'}` | '/api/settings/system' | '/api/runtime' | '/api/logs/archives' | `/api/logs/archives/page?${string}` | '/api/marketplace' | `/api/marketplace?${string}` | `/api/marketplace/details?${string}` | `/api/marketplace/${'install' | 'update'}` | '/api/plugins' | `/api/plugins/${'config' | 'enabled' | 'apply' | 'uninstall' | 'recover'}` | `/api/plugins/failures?${string}` | '/api/settings/commands' | '/api/session' | `/api/session/${'login' | 'logout'}` | '/api/logs' | `/api/logs?${string}`;
 const REQUEST_TIMEOUT_MS = 30000;
 const MARKETPLACE_BROWSE_TIMEOUT_MS = 70000;
 const MARKETPLACE_WRITE_TIMEOUT_MS = 240000;
 function requestTimeout(path: Path): number {
+  if (path === '/api/plugins/local/commit') return MARKETPLACE_WRITE_TIMEOUT_MS;
+  if (path === '/api/plugins/local/inspect') return MARKETPLACE_BROWSE_TIMEOUT_MS;
   if (path === '/api/marketplace/install' || path === '/api/marketplace/update') return MARKETPLACE_WRITE_TIMEOUT_MS;
   if (path.startsWith('/api/marketplace')) return MARKETPLACE_BROWSE_TIMEOUT_MS;
   return REQUEST_TIMEOUT_MS;
@@ -13,6 +17,7 @@ function requestTimeout(path: Path): number {
 export class ApiError extends Error {
   constructor(message: string, public readonly status = 0) { super(message); }
 }
+export type Upload = (file: File, signal?: AbortSignal) => Promise<LocalInspection>;
 export type Request = <T>(path: Path, body?: unknown, signal?: AbortSignal) => Promise<T>;
 const levels = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'];
 const integer = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0;
@@ -54,11 +59,14 @@ export function createApi(onUnauthorized: () => void) {
     if (owner?.aborted) controller.abort();
     const timer = setTimeout(() => controller.abort(), requestTimeout(path));
     try {
-      assertSafeNumbers(body);
+      const binary = path === '/api/plugins/local/inspect' && body instanceof Blob;
+      if (!binary) assertSafeNumbers(body);
+      const contentType = binary ? 'application/octet-stream' : 'application/json';
+      const payload = binary ? body as Blob : JSON.stringify(body);
       const response = await fetch(path, {
         method: body === undefined ? 'GET' : 'POST', mode: 'same-origin', credentials: 'same-origin', cache: 'no-store', redirect: 'error', signal: controller.signal,
-        headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        headers: body === undefined ? {} : { 'Content-Type': contentType },
+        ...(body === undefined ? {} : { body: payload }),
       });
       if (current !== generation || !valid() || controller.signal.aborted) throw new ApiError('会话已结束。');
       if (response.status === 401) { unauthorized(); throw new ApiError('登录已失效，请重新输入管理 Token。', 401); }
@@ -77,6 +85,10 @@ export function createApi(onUnauthorized: () => void) {
     } finally { clearTimeout(timer); active.delete(controller); owner?.removeEventListener('abort', abort); }
   };
   const request: Request = (path, body, signal) => performRequest(path, body, () => true, signal);
+  const upload: Upload = async (file, signal) => {
+    if (!file.name.endsWith('.bkm-plugin') || file.size < 1 || file.size > MAX_LOCAL_PACKAGE_BYTES) throw new ApiError('请选择不超过 32 MiB 的 .bkm-plugin 文件。');
+    return readLocalInspection(await performRequest('/api/plugins/local/inspect', file, () => true, signal));
+  };
   const subscribeLogs: SubscribeLogs = (query, handlers) => {
     const limit = query.limit ?? 200;
     if (!levels.includes(query.level) || !integer(limit) || limit < 1 || limit > 200
@@ -125,5 +137,5 @@ export function createApi(onUnauthorized: () => void) {
     };
     return close;
   };
-  return { request, subscribeLogs, clear };
+  return { request, upload, subscribeLogs, clear };
 }

@@ -1,20 +1,22 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import SchemaEditor from "./SchemaEditor.vue";
 import LogsPage from "./LogsPage.vue";
 import PluginVersions from './PluginVersions.vue';
 import FailedDeliveries from './FailedDeliveries.vue';
+import PluginPermissions from './PluginPermissions.vue';
 import type { Request } from "../api";
 import { pluginRoute } from "../navigation";
 import { json, runtimeNames } from "../types";
 import type { Mutation, PluginView, SubscribeLogs } from "../types";
 const props = defineProps<{ plugin: PluginView; request: Request; subscribeLogs: SubscribeLogs; tab: "overview" | "config" | "logs"; busy: boolean; conflict: boolean }>();
-const emit = defineEmits<{ mutate: [change: Mutation]; dirty: [value: boolean]; error: [message: string] }>();
-const editor = ref<InstanceType<typeof SchemaEditor>>(), dirty = ref(false);
-watch(dirty, value => emit("dirty", value));
-watch(() => props.plugin, () => { dirty.value = false; });
-watch(() => props.tab, () => { dirty.value = false; });
+const emit = defineEmits<{ mutate: [change: Mutation]; dirty: [value: boolean]; error: [message: string]; busy: [value: boolean]; updated: [plugin: PluginView]; uncertain: [] }>();
+const editor = ref<InstanceType<typeof SchemaEditor>>(), configDirty = ref(false), permissionsDirty = ref(false);
+const dirty = computed(() => configDirty.value || permissionsDirty.value);
+watch(dirty, value => emit("dirty", value), { flush: "sync" });
+watch(() => props.plugin, () => { configDirty.value = false; emit("dirty", dirty.value); });
+watch(() => props.tab, () => { configDirty.value = false; });
 function save() { if (props.busy || !props.plugin.editable || props.conflict || !dirty.value) return; try { const config = editor.value!.read(); emit("mutate", { action: "config", config }); } catch (e) { emit("error", (e as Error).message); } }
 function discard() { if (window.confirm("有未保存更改，是否放弃这些更改？")) editor.value?.reset(); }
 function operate(action: 'uninstall' | 'recover') {
@@ -37,7 +39,7 @@ function operate(action: 'uninstall' | 'recover') {
         <p v-if="plugin.restart_required" class="notice">已保存状态需要重启 Bot 后才能加载；实际加载版本和运行状态以上方快照为准。</p>
         <p class="hint">{{ plugin.pending ? "已保存的设置尚未应用到运行时。" : "没有待应用的设置更改。" }}</p>
         <section class="detail-section"><h2>插件信息</h2><dl><dt>插件 ID</dt><dd>{{ plugin.plugin_id }}</dd><dt>实例 ID</dt><dd>{{ plugin.instance_id }}</dd><dt>来源</dt><dd>{{ plugin.source }}</dd><dt>信任级别</dt><dd>{{ plugin.trust_level }}</dd><dt>签名</dt><dd>{{ plugin.signature_status === "unsigned" ? "未签名" : plugin.signature_status === "n/a" ? "不适用" : plugin.signature_status || "未知" }}</dd><dt>更新时间</dt><dd>{{ plugin.updated_at_ms > 0 ? new Date(plugin.updated_at_ms).toLocaleString("zh-CN") : "未提供" }}</dd></dl></section>
-        <section class="detail-section"><h2>能力授权</h2><div class="permissions"><div v-for="(values, title) in { '请求能力': plugin.requested_permissions, '已授予能力': plugin.granted_permissions }" :key="title"><h3>{{ title }}</h3><ul v-if="values.length"><li v-for="value in values" :key="value">{{ value }}</li></ul><p v-else class="muted">无</p></div></div></section>
+        <PluginPermissions :plugin="plugin" :request="request" :busy="busy || conflict" @dirty="permissionsDirty = $event" @busy="$emit('busy', $event)" @updated="$emit('updated', $event)" @uncertain="$emit('uncertain')" />
         <FailedDeliveries :request="request" :instance-id="plugin.instance_id" :revision="plugin.updated_at_ms" :busy="busy" />
         <section v-if="plugin.editable" class="detail-section"><h2>实例运维</h2><p class="hint">卸载默认保留私有数据。恢复只准备下次重启重试，不会立即重放投递。</p><div class="actions"><button id="recover-plugin" type="button" :disabled="busy || conflict || dirty" @click="operate('recover')">显式恢复并等待重启</button><button id="uninstall-plugin" type="button" :disabled="busy || conflict || dirty" @click="operate('uninstall')">卸载插件（保留数据）</button></div></section>
         <p v-if="!plugin.editable" class="notice">此插件由声明式文件或随包配置管理。配置页仅供查看。</p>
@@ -45,7 +47,7 @@ function operate(action: 'uninstall' | 'recover') {
       <section v-else-if="tab === 'config'" aria-label="插件配置">
         <h2>插件配置</h2><p class="muted">先保存设置，再应用到运行中的插件。已保存状态：{{ plugin.enabled ? '已启用' : '已停用' }}。</p>
         <p v-if="!plugin.editable" class="notice">此插件由声明式文件或随包配置管理。请修改对应配置文件；此处仅供查看。</p>
-        <form @submit.prevent="save"><SchemaEditor ref="editor" :config="plugin.config" :schema="plugin.schema" :disabled="busy || !plugin.editable" @dirty="dirty = $event" />
+        <form @submit.prevent="save"><SchemaEditor ref="editor" :config="plugin.config" :schema="plugin.schema" :disabled="busy || !plugin.editable" @dirty="configDirty = $event" />
           <p class="hint" aria-live="polite">{{ conflict ? "状态已变化，请刷新后重新编辑。当前编辑仍保留，可先复制。" : dirty ? "有未保存更改。请先保存，再启停或立即应用。" : plugin.pending ? "已保存，等待应用到运行时。" : "当前没有未保存更改。" }}</p>
           <div class="actions"><button id="save" class="primary" :disabled="busy || !plugin.editable || conflict || !dirty">保存配置</button><button id="discard" type="button" :disabled="busy || !dirty" @click="discard">放弃编辑</button></div>
         </form>

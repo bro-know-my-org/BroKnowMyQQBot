@@ -10,6 +10,8 @@ use crate::plugin_configuration::checked_package;
 pub(crate) struct PermissionView {
     instance_id: String,
     expected_updated_at_ms: i64,
+    version: String,
+    sha256: String,
     requested_permissions: BTreeSet<String>,
     granted_permissions: Vec<String>,
 }
@@ -33,6 +35,8 @@ impl PluginManager {
         Ok(PermissionView {
             instance_id: id.to_owned(),
             expected_updated_at_ms: item.updated_at_ms,
+            version: item.version,
+            sha256: item.package_sha256,
             requested_permissions: package.manifest().requested_capabilities(),
             granted_permissions: item.granted_permissions,
         })

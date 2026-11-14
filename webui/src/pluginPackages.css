@@ -1,0 +1,6 @@
+.package-choice { display: flex; align-items: center; gap: .75rem; min-height: 44px; overflow-wrap: anywhere; }
+.package-choice input { flex: 0 0 auto; }
+.plugin-permissions fieldset, .local-package fieldset { min-width: 0; margin-block: 1rem; }
+.local-package { margin-bottom: 1.5rem; }
+.local-package dd, .local-package code { overflow-wrap: anywhere; }
+.local-package input[type="file"] { max-width: 100%; min-height: 44px; }

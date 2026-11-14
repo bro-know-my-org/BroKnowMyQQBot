@@ -43,3 +43,13 @@ export interface InstallResult {
   missing_permissions: string[]; config_incomplete: boolean; updated_at_ms: number;
   loaded_version: string | null; runtime_state: PluginView['runtime_state'];
 }
+
+export interface PermissionView {
+  instance_id: string; expected_updated_at_ms: number; version: string; sha256: string;
+  requested_permissions: string[]; granted_permissions: string[];
+}
+export interface LocalInspection {
+  selection: string; expires_in_seconds: number; plugin_id: string; name: string; description: string;
+  version: string; sha256: string; signature_status: 'unsigned'; commands: string[];
+  requested_permissions: string[]; default_instance_id: string;
+}
