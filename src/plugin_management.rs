@@ -6,8 +6,8 @@ pub(crate) mod marketplace;
 pub(crate) mod marketplace_install;
 mod operations;
 pub(crate) mod permissions;
-pub(crate) mod status;
 mod restore;
+pub(crate) mod status;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
