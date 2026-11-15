@@ -390,12 +390,7 @@ impl RuntimeObserver {
     }
 
     pub(crate) fn record_event_completed(&self) {
-        let _ =
-            self.inner
-                .active_events
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    Some(value.saturating_sub(1))
-                });
+        update_usize(&self.inner.active_events, |value| value.saturating_sub(1));
         saturating_fetch_add_u64(&self.inner.events_completed, 1);
     }
 
@@ -459,15 +454,39 @@ impl RuntimeObserver {
 }
 
 fn saturating_fetch_add_u64(value: &AtomicU64, increment: u64) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(increment))
-    });
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        match value.compare_exchange_weak(
+            current,
+            current.saturating_add(increment),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 fn saturating_fetch_add_usize(value: &AtomicUsize, increment: usize) {
-    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_add(increment))
-    });
+    update_usize(value, |current| current.saturating_add(increment));
+}
+
+// Use CAS directly: fetch_update is deprecated on new Rust, while its replacement
+// try_update is unavailable on our Rust 1.85 minimum supported version.
+fn update_usize(value: &AtomicUsize, update: impl Fn(usize) -> usize) {
+    let mut current = value.load(Ordering::Relaxed);
+    loop {
+        match value.compare_exchange_weak(
+            current,
+            update(current),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -488,6 +507,37 @@ fn prometheus_label(value: &str) -> String {
 mod tests {
     use super::{HealthStatus, RuntimeObserver, RuntimePhase};
     use crate::AdapterId;
+
+    #[test]
+    fn atomic_metrics_saturate_and_preserve_concurrent_increments() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        let wide = AtomicU64::new(u64::MAX - 1);
+        super::saturating_fetch_add_u64(&wide, 2);
+        assert_eq!(wide.load(Ordering::Relaxed), u64::MAX);
+        let count = AtomicUsize::new(usize::MAX - 1);
+        super::saturating_fetch_add_usize(&count, 2);
+        assert_eq!(count.load(Ordering::Relaxed), usize::MAX);
+
+        let observer = RuntimeObserver::new();
+        observer.record_event_completed();
+        assert_eq!(observer.snapshot().active_events, 0);
+
+        let wide = AtomicU64::new(0);
+        let count = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for _ in 0..1_000 {
+                        super::saturating_fetch_add_u64(&wide, 1);
+                        super::saturating_fetch_add_usize(&count, 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(wide.load(Ordering::Relaxed), 4_000);
+        assert_eq!(count.load(Ordering::Relaxed), 4_000);
+    }
 
     #[test]
     fn observer_exposes_health_and_prometheus_metrics() {
