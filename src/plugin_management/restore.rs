@@ -16,7 +16,7 @@ impl PluginManager {
         self.operation(async move {
             let _permit = permit;
             let _write = manager.writes.lock().await;
-            let context = manager.marketplace_context()?.clone();
+            let context = manager.marketplace_context()?;
             let runtime = manager
                 .snapshot()?
                 .host
@@ -77,7 +77,7 @@ impl PluginManager {
             let _permit = permit;
             let prepared = selection()?;
             let _write = manager.writes.lock().await;
-            let context = manager.marketplace_context()?.clone();
+            let context = manager.marketplace_context()?;
             let accepted = tokio::task::spawn_blocking(move || {
                 crate::restore::offline::stage(
                     repository,

@@ -2,6 +2,8 @@
 
 mod backup;
 pub(crate) mod bundled;
+mod bundled_projection;
+mod bundled_source;
 pub(crate) mod local_packages;
 pub(crate) mod marketplace;
 pub(crate) mod marketplace_install;
@@ -147,6 +149,8 @@ pub(crate) struct PluginManager {
     shutdown_worker: Arc<Mutex<Option<ShutdownTask>>>,
     file_instances: Arc<BTreeSet<String>>,
     marketplace: Option<marketplace::MarketplaceContext>,
+    declarations_override: Arc<RwLock<Option<std::path::PathBuf>>>,
+    bundled_config_path: Option<std::path::PathBuf>,
     local_packages: Arc<local_packages::Staging>,
 }
 
@@ -204,6 +208,8 @@ impl PluginManager {
     ) -> Self {
         Self {
             marketplace: None,
+            declarations_override: Arc::default(),
+            bundled_config_path: None,
             local_packages: Arc::default(),
             status_revision: Arc::default(),
             store,
@@ -294,10 +300,25 @@ impl PluginManager {
             let view = managed_view(&installation, snapshot, &runtime, &self.file_instances).await;
             views.insert(installation.instance_id, view);
         }
+        if self.marketplace.is_some() {
+            for view in self.bundled_plugin_views().await? {
+                views.insert(view.instance_id.clone(), view);
+            }
+        }
         Ok(views.into_values().collect())
     }
 
     pub(crate) async fn view(&self, instance_id: &str) -> Result<PluginView, ManagementError> {
+        if self.marketplace.is_some()
+            && crate::plugins::is_reserved_bundled_instance_id(instance_id)
+        {
+            return self
+                .bundled_plugin_views()
+                .await?
+                .into_iter()
+                .find(|view| view.instance_id == instance_id)
+                .ok_or(ManagementError::NotManaged);
+        }
         let runtime = self.snapshot()?;
         let snapshot = runtime
             .host

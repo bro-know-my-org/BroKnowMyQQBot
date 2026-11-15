@@ -38,7 +38,7 @@ impl PluginManager {
             let _permit = permit;
             let _write = manager.writes.lock().await;
             let runtime = manager.snapshot()?;
-            let context = manager.marketplace_context()?.clone(); let store = manager.store.clone();
+            let context = manager.marketplace_context()?; let store = manager.store.clone();
             tokio::task::spawn_blocking(move || {
                 // Shared order: manager writes -> config -> packages -> SQLite.
                 let _config = config::ConfigFileLock::acquire(&repository.config).map_err(invalid)?;

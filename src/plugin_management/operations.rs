@@ -39,7 +39,7 @@ impl PluginManager {
     }
 
     pub(super) async fn operation_lock(&self, id: &str) -> Result<std::fs::File, ManagementError> {
-        let context = self.marketplace_context()?.clone();
+        let context = self.marketplace_context()?;
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
             let lock = lock_managed_package_lifecycle(&context.database).map_err(|error| {

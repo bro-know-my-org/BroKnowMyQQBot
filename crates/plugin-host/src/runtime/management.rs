@@ -87,6 +87,16 @@ pub struct PluginInstanceStatus {
     pub(crate) grants: BTreeSet<String>,
 }
 
+impl PluginInstanceStatus {
+    /// Compare saved configuration without exposing it in the status response.
+    pub fn config_matches(
+        &self,
+        config: &BTreeMap<String, Value>,
+    ) -> Result<bool, crate::StoreError> {
+        Ok(self.config_json == bounded_config(config)?)
+    }
+}
+
 impl std::fmt::Debug for PluginInstanceStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginInstanceStatus")

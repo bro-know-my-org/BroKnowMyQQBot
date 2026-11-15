@@ -9,20 +9,22 @@ pub(crate) const MAX_PLUGINS: usize = 256;
 #[derive(Serialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct PluginStatus {
-    instance_id: String,
-    plugin_id: String,
-    name: String,
-    version: String,
-    loaded_version: Option<String>,
-    enabled: bool,
-    runtime_state: &'static str,
-    pending: bool,
-    restart_required: bool,
-    updated_at_ms: i64,
+    pub(super) instance_id: String,
+    pub(super) plugin_id: String,
+    pub(super) name: String,
+    pub(super) version: String,
+    pub(super) loaded_version: Option<String>,
+    pub(super) enabled: bool,
+    pub(super) runtime_state: &'static str,
+    pub(super) pending: bool,
+    pub(super) restart_required: bool,
+    pub(super) updated_at_ms: i64,
 }
 
+pub(crate) type Sample = (Vec<PluginStatus>, bool, Option<String>);
+
 impl PluginManager {
-    pub(crate) async fn status(&self) -> Result<(Vec<PluginStatus>, bool), ManagementError> {
+    pub(crate) async fn status(&self) -> Result<Sample, ManagementError> {
         let manager = self.clone();
         let (send, receive) = tokio::sync::oneshot::channel();
         let worker = std::thread::Builder::new()
@@ -87,8 +89,16 @@ impl PluginManager {
                             },
                         );
                     }
+                    let (bundled, revision) = manager.bundled_statuses(&loaded)?;
+                    for item in bundled {
+                        views.insert(item.instance_id.clone(), item);
+                    }
                     let truncated = views.len() > MAX_PLUGINS || loaded.len() > MAX_PLUGINS;
-                    Ok((views.into_values().take(MAX_PLUGINS).collect(), truncated))
+                    Ok((
+                        views.into_values().take(MAX_PLUGINS).collect(),
+                        truncated,
+                        revision,
+                    ))
                 })();
                 let _ = send.send(result);
             })

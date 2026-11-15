@@ -83,10 +83,31 @@ impl PluginManager {
         );
     }
 
-    pub(crate) fn marketplace_context(&self) -> Result<&MarketplaceContext, ManagementError> {
-        self.marketplace
+    pub(crate) fn with_bundled_config(mut self, path: PathBuf) -> Self {
+        self.bundled_config_path = Some(path);
+        self
+    }
+
+    pub(super) fn declaration_path(&self) -> Result<Option<PathBuf>, ManagementError> {
+        let override_path = self
+            .declarations_override
+            .read()
+            .map_err(|_| ManagementError::Store)?;
+        Ok(override_path.clone().or_else(|| {
+            self.marketplace
+                .as_ref()
+                .and_then(|c| c.declarations.clone())
+        }))
+    }
+
+    pub(crate) fn marketplace_context(&self) -> Result<MarketplaceContext, ManagementError> {
+        let mut context = self
+            .marketplace
             .as_ref()
-            .ok_or(ManagementError::MarketplaceUnavailable)
+            .ok_or(ManagementError::MarketplaceUnavailable)?
+            .clone();
+        context.declarations = self.declaration_path()?;
+        Ok(context)
     }
 
     pub(crate) async fn catalogue(

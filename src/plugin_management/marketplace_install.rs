@@ -72,7 +72,7 @@ impl PluginManager {
         existing: Option<PluginInstallation>,
     ) -> Result<InstallResult, ManagementError> {
         let _write = self.writes.lock().await;
-        let context = self.marketplace_context()?.clone();
+        let context = self.marketplace_context()?;
         let store = self.store.clone();
         let id = pending.instance_id.clone();
         let missing_permissions = pending

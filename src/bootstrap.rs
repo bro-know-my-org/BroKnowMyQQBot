@@ -131,7 +131,8 @@ async fn start(
         config.plugins.database.clone(),
         config.plugins.installations.clone(),
         config.plugins.marketplace_url.clone(),
-    )?;
+    )?
+    .with_bundled_config(config::application_config_path());
     let plugins = Arc::new(manager.clone());
     let observer = RuntimeObserver::new();
     let shutdown_timeout = Duration::from_secs(config.runtime.shutdown_timeout_seconds);

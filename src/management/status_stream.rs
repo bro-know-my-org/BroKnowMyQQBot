@@ -32,7 +32,7 @@ type Sample = std::pin::Pin<
     Box<
         dyn std::future::Future<
                 Output = Result<
-                    (Vec<crate::plugin_management::status::PluginStatus>, bool),
+                    crate::plugin_management::status::Sample,
                     crate::plugin_management::ManagementError,
                 >,
             > + Send,
@@ -68,8 +68,8 @@ impl Worker {
                 }} => {
                 sample = None;
                 match result {
-                    Ok((rows, truncated)) => {
-                        plugins = json!({"plugins": rows, "plugins_truncated": truncated});
+                    Ok((rows, truncated, bundled_revision)) => {
+                        plugins = json!({"plugins": rows, "plugins_truncated": truncated, "bundled_revision": bundled_revision});
                         failed = false;
                     }
                     Err(_) => {

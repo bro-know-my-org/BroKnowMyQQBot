@@ -1,7 +1,7 @@
 //! File-owned settings: saving never starts, stops or replays a plugin.
 use super::{ManagementError, PluginManager, state_name};
 use crate::{
-    config::{self, ConfigFileLock},
+    config,
     plugins::bundled::{self, Settings},
 };
 use plugin_host::validate_plugin_config;
@@ -11,28 +11,28 @@ use std::{collections::BTreeMap, fs, io::Read as _, path::Path};
 
 #[derive(Serialize)]
 pub(crate) struct Catalogue {
-    revision: String,
-    plugins: Vec<BundledView>,
+    pub(super) revision: String,
+    pub(super) plugins: Vec<BundledView>,
 }
 
 #[derive(Serialize)]
 #[allow(clippy::struct_excessive_bools)]
-struct BundledView {
-    key: &'static str,
-    instance_id: &'static str,
-    plugin_id: String,
-    name: String,
-    description: String,
-    version: String,
-    diagnostic: bool,
-    enabled: bool,
-    config: BTreeMap<String, Value>,
-    schema: Option<Value>,
-    requested_permissions: Vec<String>,
-    loaded: bool,
-    runtime_state: &'static str,
-    pending: bool,
-    restart_required: bool,
+pub(super) struct BundledView {
+    pub(super) key: &'static str,
+    pub(super) instance_id: &'static str,
+    pub(super) plugin_id: String,
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) version: String,
+    pub(super) diagnostic: bool,
+    pub(super) enabled: bool,
+    pub(super) config: BTreeMap<String, Value>,
+    pub(super) schema: Option<Value>,
+    pub(super) requested_permissions: Vec<String>,
+    pub(super) loaded: bool,
+    pub(super) runtime_state: &'static str,
+    pub(super) pending: bool,
+    pub(super) restart_required: bool,
 }
 
 #[derive(Deserialize)]
@@ -47,16 +47,13 @@ pub(crate) struct Change {
 
 impl PluginManager {
     pub(crate) async fn bundled_catalogue(&self) -> Result<Catalogue, ManagementError> {
-        let path = self
-            .marketplace
-            .as_ref()
-            .and_then(|context| context.declarations.clone());
-        let source = tokio::task::spawn_blocking(move || {
-            path.map_or_else(|| Ok(String::new()), |path| read_source(&path))
-        })
-        .await
-        .map_err(|_| ManagementError::BundledUnavailable)??;
-        self.bundled_view(&source)
+        let manager = self.clone();
+        let source = tokio::task::spawn_blocking(move || manager.read_bundled_source(false))
+            .await
+            .map_err(|_| ManagementError::BundledUnavailable)??;
+        let mut catalogue = self.bundled_view(&source.text)?;
+        catalogue.revision = source.revision;
+        Ok(catalogue)
     }
 
     fn bundled_view(&self, source: &str) -> Result<Catalogue, ManagementError> {
@@ -127,23 +124,16 @@ impl PluginManager {
 
     async fn save_bundled_inner(&self, change: Change) -> Result<Catalogue, ManagementError> {
         let _write = self.writes.lock().await;
-        let path = self
-            .marketplace
-            .as_ref()
-            .and_then(|context| context.declarations.clone())
-            .ok_or(ManagementError::BundledUnavailable)?;
-        let reading = path.clone();
-        let (lock, source) = tokio::task::spawn_blocking(move || {
-            let lock = ConfigFileLock::acquire(&reading).map_err(|e| file_error(&e))?;
-            Ok::<_, ManagementError>((lock, read_source(&reading)?))
-        })
-        .await
-        .map_err(|_| ManagementError::BundledUnavailable)??;
-        if config::config_revision(source.as_bytes()) != change.expected_revision {
+        let manager = self.clone();
+        let target = tokio::task::spawn_blocking(move || manager.read_bundled_source(true))
+            .await
+            .map_err(|_| ManagementError::BundledUnavailable)??;
+        if target.revision != change.expected_revision {
             return Err(ManagementError::Conflict);
         }
+        let source = &target.text;
         let mut settings =
-            Settings::parse(&source).map_err(|()| ManagementError::BundledUnavailable)?;
+            Settings::parse(source).map_err(|()| ManagementError::BundledUnavailable)?;
         if let Some(enabled) = change.enabled {
             let selected = settings.selected.iter().any(|name| name == &change.name);
             if enabled && !selected {
@@ -199,26 +189,22 @@ impl PluginManager {
                 .map_err(|_| ManagementError::InvalidConfig)?;
             }
         }
-        bundled::validate_commands(&updated, &path, &self.store)
+        bundled::validate_commands(&updated, &target.path, &self.store)
             .await
             .map_err(|()| ManagementError::InvalidConfig)?;
         if updated.len() > 1024 * 1024 {
             return Err(ManagementError::InvalidConfig);
         }
         let saved = updated.clone();
-        tokio::task::spawn_blocking(move || {
-            let result =
-                config::atomic_write(&path, saved.as_bytes(), 0o600).map_err(|e| file_error(&e));
-            drop(lock);
-            result
-        })
-        .await
-        .map_err(|_| ManagementError::BundledUnavailable)??;
+        let manager = self.clone();
+        tokio::task::spawn_blocking(move || target.persist(&manager, &saved))
+            .await
+            .map_err(|_| ManagementError::BundledUnavailable)??;
         self.bundled_view(&updated)
     }
 }
 
-fn file_error(error: &config::ConfigError) -> ManagementError {
+pub(super) fn file_error(error: &config::ConfigError) -> ManagementError {
     if matches!(error, config::ConfigError::Conflict(_)) {
         ManagementError::Conflict
     } else {

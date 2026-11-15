@@ -66,6 +66,36 @@ fn data(frame: &str) -> Value {
     )
     .unwrap()
 }
+
+#[tokio::test]
+async fn disabled_bundled_configuration_changes_push_only_a_safe_revision() {
+    let directory = std::env::temp_dir().join(format!("bundled-status-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("plugins.toml");
+    std::fs::write(&path, "bundled = []\n").unwrap();
+    let manager = manager()
+        .with_marketplace(
+            directory.join("db"),
+            Some(path.clone()),
+            "https://example.test/index.json".into(),
+        )
+        .unwrap();
+    let (app, task, stop) = fixture(manager, RuntimeObserver::new(), auth(), None);
+    let mut stream = open(&app).await.into_body().into_data_stream();
+    let first = data(&frame(&mut stream).await);
+    std::fs::write(
+        &path,
+        "bundled = []\n[bundled_config.admin]\nowners = ['not-in-safe-stream']\n",
+    )
+    .unwrap();
+    let next = data(&frame(&mut stream).await);
+    assert_ne!(next["bundled_revision"], first["bundled_revision"]);
+    assert_eq!(next["plugins"], first["plugins"]);
+    assert!(!next.to_string().contains("not-in-safe-stream"));
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
 #[tokio::test]
 async fn full_snapshots_are_shared_idle_is_quiet_and_observer_updates_are_real() {
     let observer = RuntimeObserver::new();
@@ -245,7 +275,7 @@ async fn status_truncation_is_explicit_and_does_not_read_plugin_packages() {
         fixture.store.upsert_installation(&row).unwrap();
     }
     std::fs::remove_file(&fixture.installation.package_path).unwrap();
-    let (plugins, truncated) = manager.status().await.unwrap();
+    let (plugins, truncated, _) = manager.status().await.unwrap();
     assert!(truncated);
     assert_eq!(plugins.len(), 256);
     let encoded = serde_json::to_value(plugins).unwrap();

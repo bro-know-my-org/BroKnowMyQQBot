@@ -92,7 +92,14 @@ async fn uninstall_stops_active_host_retains_private_state_and_survives_request_
             .value,
         b"keep"
     );
-    assert!(manager.list().await.unwrap().is_empty());
+    assert!(
+        manager
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|view| &view.instance_id != id)
+    );
     assert_eq!(
         old_host.instance_snapshots().unwrap()[0].state,
         PluginInstanceState::Disabled
