@@ -38,7 +38,7 @@ async fn verified_contents_do_not_copy_archived_trust_grants_or_enabled_state() 
     plan.validate_guests().await.unwrap();
     let item = &plan.imported.installations[0];
     assert!(!item.enabled);
-    assert!(item.granted_permissions.is_empty());
+    assert_eq!(item.granted_permissions, [] as [String; 0]);
     assert_eq!(item.trust_level, "local-wasm");
     assert_eq!(item.signature_status, "unsigned");
     let saved: config::BotConfig = toml::from_str(&plan.new_config).unwrap();
@@ -77,7 +77,7 @@ fn declarations_preserve_current_metadata_and_require_exact_package_identity() {
     declared.config = BTreeMap::from([("current-owned".into(), true.into())]);
     declared.source = "declaration".into();
     let plan = Prepared::new(archive, String::new(), vec![], vec![declared.clone()], &[]).unwrap();
-    assert!(plan.imported.installations.is_empty());
+    assert_eq!(plan.imported.installations, []);
     assert!(plan.inspection.plugins[0].declaration_owned);
     declared.package_sha256 = "0".repeat(64);
     assert!(
