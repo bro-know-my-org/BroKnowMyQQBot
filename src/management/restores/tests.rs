@@ -149,7 +149,10 @@ async fn inspection_is_authenticated_read_only_boot_bound_expiring_and_discardab
         StatusCode::OK
     );
     assert_eq!(before, std::fs::read(f.root.join("bot.toml")).unwrap());
-    assert!(f.store.logical_snapshot().unwrap().installations.is_empty());
+    assert_eq!(
+        f.store.logical_snapshot().unwrap().installations,
+        [] as [plugin_host::PluginInstallation; 0]
+    );
     assert!(!f.state.repository.as_ref().unwrap().root.exists());
     f.state.tickets.lock().unwrap().as_mut().unwrap().expires = Instant::now();
     assert_eq!(
@@ -270,13 +273,17 @@ async fn valid_large_archive_uses_dedicated_binary_route_and_never_installs_a_gu
         serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
             .unwrap();
     assert_eq!(result["plugins"].as_array().unwrap().len(), 1);
-    assert!(
+    assert_eq!(
         result["plugins"][0]["retained_grants"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
-    assert!(f.store.installations().unwrap().is_empty());
+    assert_eq!(
+        f.store.installations().unwrap(),
+        [] as [plugin_host::PluginInstallation; 0]
+    );
     f.shutdown.shutdown();
     f.state.manager.shutdown().await.unwrap();
 }
@@ -416,7 +423,10 @@ async fn final_confirmation_only_stages_retained_work_and_selects_one_graceful_r
     );
     assert!(f.state.controller.cancelled().await == crate::restart::Action::Restart);
     assert_eq!(before, std::fs::read(f.root.join("bot.toml")).unwrap());
-    assert!(f.store.logical_snapshot().unwrap().installations.is_empty());
+    assert_eq!(
+        f.store.logical_snapshot().unwrap().installations,
+        [] as [plugin_host::PluginInstallation; 0]
+    );
     let response = f
         .call(
             &format!("/api/restores/{id}/outcome"),

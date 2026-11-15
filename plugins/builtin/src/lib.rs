@@ -363,7 +363,7 @@ mod tests {
                     "{} accepted old prefix",
                     plugin.manifest().id
                 );
-                assert!(output.state_ops.is_empty());
+                assert_eq!(output.state_ops, []);
             }
         }
     }
@@ -1056,6 +1056,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(retained.state_ops.is_empty());
+        assert_eq!(retained.state_ops, []);
     }
 }

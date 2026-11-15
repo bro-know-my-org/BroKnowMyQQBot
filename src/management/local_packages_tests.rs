@@ -130,11 +130,12 @@ async fn local_commit_is_fixed_confirmed_cas_protected_and_preserves_disabled_up
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(installed["enabled"], false);
-    assert!(
-        !installed["missing_permissions"]
+    assert_ne!(
+        installed["missing_permissions"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
     manager.shutdown().await.unwrap();
 }

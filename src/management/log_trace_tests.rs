@@ -193,7 +193,7 @@ async fn trace_keeps_instances_commands_outcomes_and_async_order_without_guessin
         request(&app, &invocation, "localhost").await.1["entries"],
         page["entries"]
     );
-    assert!(
+    assert_eq!(
         request(
             &app,
             &query.replace("event_id=e", "event_id=missing"),
@@ -203,7 +203,8 @@ async fn trace_keeps_instances_commands_outcomes_and_async_order_without_guessin
         .1["entries"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
 }
 #[tokio::test]

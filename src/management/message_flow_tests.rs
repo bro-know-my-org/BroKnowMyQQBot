@@ -275,7 +275,7 @@ fn assert_flow(data: &Value, bytes: &[u8], fail: bool, instance: &str) {
         action["fields"]["invocation_id"],
         outgoing["fields"]["invocation_id"]
     );
-    assert!(!action["fields"]["command_id"].as_str().unwrap().is_empty());
+    assert_ne!(action["fields"]["command_id"].as_str().unwrap(), "");
     assert!(
         !String::from_utf8(bytes.to_vec())
             .unwrap()

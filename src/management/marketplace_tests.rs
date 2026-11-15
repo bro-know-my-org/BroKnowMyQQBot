@@ -165,7 +165,7 @@ async fn marketplace_install_is_explicit_disabled_without_grants_and_restart_onl
         ),
         ("local-wasm", "unsigned")
     );
-    assert!(record.granted_permissions.is_empty());
+    assert_eq!(record.granted_permissions, [] as [std::string::String; 0]);
     assert_eq!(
         ValidatedPluginPackage::from_path(std::path::Path::new(&record.package_path))
             .unwrap()

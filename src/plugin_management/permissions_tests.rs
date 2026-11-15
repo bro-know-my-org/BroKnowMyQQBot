@@ -101,7 +101,7 @@ async fn accepted_revocation_survives_request_cancellation_and_preserves_private
     drop(write);
     manager.shutdown().await.unwrap();
     let saved = fixture.store.installation(id).unwrap().unwrap();
-    assert!(saved.granted_permissions.is_empty());
+    assert_eq!(saved.granted_permissions, [] as [std::string::String; 0]);
     assert!(!saved.enabled);
     assert_eq!(saved.config, fixture.installation.config);
     assert_eq!(

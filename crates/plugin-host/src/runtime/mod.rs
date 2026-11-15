@@ -3543,7 +3543,10 @@ mod tests {
         );
 
         host.shutdown().await.unwrap();
-        assert!(host.command_declarations().unwrap().is_empty());
+        assert_eq!(
+            host.command_declarations().unwrap(),
+            [] as [plugin_api::CommandDeclaration; 0]
+        );
     }
 
     #[tokio::test]

@@ -1199,11 +1199,9 @@ async fn transient_delivery_retries_with_new_attempts_and_succeeds() {
         panic!("retrying plugin should eventually reply");
     };
     assert_eq!(reply.content, "pong");
-    assert!(
-        store
-            .dead_letters(Some("dev.bkm.ping/retry-test"))
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        store.dead_letters(Some("dev.bkm.ping/retry-test")).unwrap(),
+        [] as [plugin_host::DeadLetter; 0]
     );
 }
 
@@ -1300,11 +1298,11 @@ async fn dead_letter_recovery_replays_after_host_restart() {
     assert_eq!(reply.content, "pong");
     assert_eq!(calls.load(Ordering::SeqCst), 4);
     assert_unique_attempt_ids(&attempt_ids, 4);
-    assert!(
+    assert_eq!(
         store
             .dead_letters(Some("dev.bkm.ping/recovery-test"))
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [plugin_host::DeadLetter; 0]
     );
 }
 

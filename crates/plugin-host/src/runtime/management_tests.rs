@@ -297,7 +297,10 @@ async fn due_and_queued_schedules_survive_stop_and_resume_without_requeuing_othe
     .await
     .unwrap();
     host.shutdown().await.unwrap();
-    assert!(host.store.recover_schedules("fixture").unwrap().is_empty());
+    assert_eq!(
+        host.store.recover_schedules("fixture").unwrap(),
+        [] as [crate::storage::ScheduledTask; 0]
+    );
     assert_eq!(probe.schedules.load(Ordering::SeqCst), 2);
 }
 
@@ -613,7 +616,10 @@ async fn recovered_immediate_schedule_waits_for_ready_before_starting_a_worker()
         .unwrap();
     host.shutdown().await.unwrap();
     assert_eq!(probe.schedules.load(Ordering::SeqCst), 1);
-    assert!(host.store.recover_schedules("fixture").unwrap().is_empty());
+    assert_eq!(
+        host.store.recover_schedules("fixture").unwrap(),
+        [] as [crate::storage::ScheduledTask; 0]
+    );
 }
 
 #[tokio::test]
@@ -700,7 +706,10 @@ async fn schedule_storage_failures_retire_without_respawning_and_allow_explicit_
             .unwrap();
         host.shutdown().await.unwrap();
         assert_eq!(probe.schedules.load(Ordering::SeqCst), 1);
-        assert!(host.store.recover_schedules("fixture").unwrap().is_empty());
+        assert_eq!(
+            host.store.recover_schedules("fixture").unwrap(),
+            [] as [crate::storage::ScheduledTask; 0]
+        );
     }
 }
 
@@ -803,7 +812,10 @@ async fn cancelled_management_rearms_workers_retiring_before_or_after_rollback()
             .unwrap();
             host.shutdown().await.unwrap();
             assert_eq!(probe.schedules.load(Ordering::SeqCst), 2);
-            assert!(host.store.recover_schedules("fixture").unwrap().is_empty());
+            assert_eq!(
+                host.store.recover_schedules("fixture").unwrap(),
+                [] as [crate::storage::ScheduledTask; 0]
+            );
         }
     }
 }

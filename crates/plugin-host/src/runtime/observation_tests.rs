@@ -229,7 +229,7 @@ async fn ping_reply_inherits_declared_command_and_each_instance_identity() {
         let action = capture.records("plugin.action.completed");
         assert_eq!(action[0].0["status"], "succeeded");
         assert_eq!(action[0].0["action_type"], "message.reply");
-        assert!(!action[0].0["command_id"].is_empty());
+        assert_ne!(action[0].0["command_id"], "");
         assert_eq!(capture.records("plugin.invoked")[0].0["level"], "DEBUG");
         assert!(
             !capture.records("message.received")[0]

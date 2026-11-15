@@ -264,7 +264,7 @@ async fn direct_exec_preserves_pid_ports_overrides_and_reloads_config_then_sigte
         .to_owned();
     let pid = fixture.child.id();
     let old_logs = fixture.log_handles();
-    assert!(!old_logs.is_empty());
+    assert_ne!(old_logs, [] as [std::path::PathBuf; 0]);
     assert_eq!(
         fixture.control("restart", "stale-boot").await.status(),
         StatusCode::CONFLICT
@@ -579,7 +579,10 @@ async fn logical_backup_restore_preserves_target_history_and_host() {
         .iter()
         .find(|p| p["instance_id"] == "dev.bkm.wasm-ping/offline")
         .unwrap();
-    assert!(imported["retained_grants"].as_array().unwrap().is_empty());
+    assert_eq!(
+        imported["retained_grants"].as_array().unwrap().as_slice(),
+        [] as [serde_json::Value; 0]
+    );
     let response=f.client.post(format!("{}/api/restores/{id}/commit",f.base)).header("Cookie",&cookie).json(&json!({"expected_boot_id":boot,"confirm_sensitive_plugin_data":true,"confirm_unsigned_disabled":true})).send().await.unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let next = f.ready(Some(&boot)).await;
@@ -628,7 +631,7 @@ async fn logical_backup_restore_preserves_target_history_and_host() {
         .unwrap()
         .unwrap();
     assert!(!imported.enabled);
-    assert!(imported.granted_permissions.is_empty());
+    assert_eq!(imported.granted_permissions, [] as [std::string::String; 0]);
     assert_eq!(imported.signature_status, "unsigned");
     assert!(std::path::Path::new(&imported.package_path).is_file());
     assert_ne!(std::path::Path::new(&imported.package_path), path);

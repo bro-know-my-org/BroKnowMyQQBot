@@ -251,7 +251,7 @@ async fn executes_all_panel_endpoints_with_typed_responses() {
     assert_eq!(detail.record.panel.version, Some(6));
     assert_eq!(detail.record.version, 7);
     assert_eq!(detail.group_openids, ["group-1"]);
-    assert!(detail.user_openids.is_empty());
+    assert_eq!(detail.user_openids, Vec::<String>::new());
     assert_eq!(
         detail.record.created_at.unwrap().to_rfc3339(),
         "2026-08-12T10:00:00+08:00"

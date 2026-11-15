@@ -2239,7 +2239,10 @@ mod tests {
                 .remove_installation(&installation.instance_id)
                 .unwrap()
         );
-        assert!(store.installations().unwrap().is_empty());
+        assert_eq!(
+            store.installations().unwrap(),
+            [] as [crate::storage::PluginInstallation; 0]
+        );
     }
 
     #[test]
@@ -2273,7 +2276,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store.enabled_installations().unwrap().is_empty());
+        assert_eq!(
+            store.enabled_installations().unwrap(),
+            [] as [crate::storage::PluginInstallation; 0]
+        );
         assert!(store.installations().is_err());
     }
 
@@ -2518,7 +2524,7 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
+        assert_eq!(
             store
                 .commit(
                     "instance",
@@ -2527,8 +2533,8 @@ mod tests {
                     &[command],
                     CommitOptions::new(0).with_origin(&origin()),
                 )
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            [] as [plugin_api::PluginCommand; 0]
         );
     }
 
