@@ -387,5 +387,5 @@ fn fault(point: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

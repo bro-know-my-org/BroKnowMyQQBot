@@ -214,7 +214,7 @@ impl Controller {
                 }
                 return std::process::ExitCode::SUCCESS;
             }
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             if std::env::var_os("BKMQB_TEST_EXEC_TRANSITION_SIGNAL").is_some() {
                 rustix::process::kill_process(
                     rustix::process::getpid(),

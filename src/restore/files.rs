@@ -3,7 +3,7 @@ use crate::backup::{self, Repository, Result, invalid};
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read as _, Write as _},
     path::PathBuf,
 };
@@ -65,20 +65,13 @@ impl Files {
         write: impl FnOnce(&mut Bounded) -> Result<()>,
         limit: usize,
     ) -> Result<String> {
-        use std::os::unix::fs::OpenOptionsExt as _;
         let path = self.path(name)?;
         if self.exists(name)? {
             drop(backup::regular(&path, limit)?);
         }
         let temporary = self.root.join(format!(".{}", uuid::Uuid::new_v4()));
         let result = (|| {
-            let file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&temporary)
-                .map_err(invalid)?;
+            let file = backup::create_private(&temporary).map_err(invalid)?;
             let mut writer = Bounded {
                 file,
                 remaining: limit,
@@ -172,7 +165,7 @@ impl std::io::Write for Bounded {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     struct Fixture(PathBuf);
@@ -248,5 +241,26 @@ mod tests {
             fs::write(files.root.join(format!("unknown{i}")), b"").unwrap();
         }
         assert!(files.cleanup_temporaries().is_err());
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_journal_never_creates_directories_or_invokes_serialization() {
+        let root = std::env::temp_dir().join(format!("bkm-journal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let repository = Repository::new(&root.join("plugins.db"), root.join("bot.toml"));
+        assert!(Files::new(&repository).is_err());
+        let files = Files { root: root.clone() };
+        assert!(
+            files
+                .atomic("outcome.json", |_| panic!("must not write"), 32)
+                .is_err()
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(root).unwrap();
     }
 }

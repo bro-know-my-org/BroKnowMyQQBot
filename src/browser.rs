@@ -1744,7 +1744,8 @@ fn browser_home_selection() -> Result<BrowserHomeSelection, Box<dyn std::error::
         }
         let path = PathBuf::from(path);
         #[cfg(windows)]
-        validate_windows_browser_home_override(&path)?;
+        validate_windows_browser_home_override(&path)
+            .map_err(|error| error as Box<dyn std::error::Error>)?;
         inspect_directory_chain(&path, true)?;
         return Ok(BrowserHomeSelection {
             path,

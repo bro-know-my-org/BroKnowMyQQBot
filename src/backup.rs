@@ -2,8 +2,10 @@
 use crate::{config::BotConfig, plugin_management::ManagementError};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
 };
@@ -43,6 +45,7 @@ impl Repository {
             config,
         }
     }
+    #[cfg(unix)]
     pub(crate) fn directory(&self) -> Result<()> {
         use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
         match fs::DirBuilder::new().mode(0o700).create(&self.root) {
@@ -68,6 +71,11 @@ impl Repository {
         .sync_all()
         .map_err(invalid)?;
         Ok(())
+    }
+    #[cfg(not(unix))]
+    pub(crate) fn directory(&self) -> Result<()> {
+        // Sensitive artifacts require verified ownership and private permissions.
+        Err(ManagementError::Backup)
     }
     pub(crate) fn path(&self, id: &str) -> Result<PathBuf> {
         if uuid::Uuid::parse_str(id).is_err() || id.len() != 36 {
@@ -117,7 +125,6 @@ impl Repository {
         Ok(result)
     }
     pub(crate) fn save(&self, bytes: &[u8]) -> Result<Artifact> {
-        use std::os::unix::fs::OpenOptionsExt as _;
         if bytes.len() > LIMIT || self.list()?.len() >= 4 {
             return Err(ManagementError::Backup);
         }
@@ -125,12 +132,7 @@ impl Repository {
         let path = self.path(&id)?;
         let mut created = false;
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&path)?;
+            let mut file = create_private(&path)?;
             created = true;
             file.write_all(bytes)?;
             file.sync_all()?;
@@ -159,6 +161,26 @@ impl Repository {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn create_private(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn create_private(_: &Path) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "private backup files are unsupported on this platform",
+    ))
+}
+
+#[cfg(unix)]
 pub(crate) fn regular(path: &Path, limit: usize) -> Result<File> {
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     let file = OpenOptions::new()
@@ -171,6 +193,11 @@ pub(crate) fn regular(path: &Path, limit: usize) -> Result<File> {
         return Err(ManagementError::Backup);
     }
     Ok(file)
+}
+#[cfg(not(unix))]
+pub(crate) fn regular(_: &Path, _: usize) -> Result<File> {
+    // A plain file open cannot replace no-follow and hard-link checks.
+    Err(ManagementError::Backup)
 }
 pub(crate) fn read(path: &Path, limit: usize) -> Result<Vec<u8>> {
     let mut file = regular(path, limit)?;
@@ -208,5 +235,30 @@ pub(crate) fn selected(config: &BotConfig) -> serde_json::Value {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_operations_fail_without_creating_or_reading_files() {
+        let root = std::env::temp_dir().join(format!("bkm-unsupported-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let config = root.join("bot.toml");
+        fs::write(&config, b"sensitive").unwrap();
+        let repository = Repository::new(&root.join("plugins.db"), config.clone());
+        assert!(repository.directory().is_err());
+        assert!(repository.list().is_err());
+        assert!(repository.save(b"sensitive").is_err());
+        assert!(repository.open(&uuid::Uuid::new_v4().to_string()).is_err());
+        assert!(regular(&config, LIMIT).is_err());
+        assert!(read(&config, LIMIT).is_err());
+        assert!(create_private(&root.join("new")).is_err());
+        assert!(create_private(&config).is_err());
+        assert_eq!(fs::read(&config).unwrap(), b"sensitive");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+}
