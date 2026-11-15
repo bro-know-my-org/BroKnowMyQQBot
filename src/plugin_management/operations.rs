@@ -95,6 +95,9 @@ impl PluginManager {
         let store = self.store.clone();
         let database = self.marketplace_context()?.database.clone();
         let retained = tokio::task::spawn_blocking(move || {
+            // Closing this File releases the package lifecycle lock. Clippy 1.85
+            // incorrectly treats moving the guard into this scope as no effect.
+            #[allow(clippy::no_effect_underscore_binding)]
             let _lock = lock;
             if !store.remove_installation_if_updated(&installation.instance_id, expected)? {
                 return Err(ManagementError::Conflict);
@@ -160,12 +163,13 @@ impl PluginManager {
         let store = self.store.clone();
         let instance_id = id.to_owned();
         let recovered = tokio::task::spawn_blocking(move || {
-            let _lock = lock;
-            store.recover_dead_letters_if_updated(
+            let result = store.recover_dead_letters_if_updated(
                 &instance_id,
                 expected,
                 chrono::Utc::now().timestamp_millis(),
-            )
+            );
+            drop(lock);
+            result
         })
         .await
         .map_err(|_| ManagementError::Store)??;

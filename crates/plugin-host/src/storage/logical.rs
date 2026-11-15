@@ -97,7 +97,7 @@ impl LogicalSnapshot {
 }
 
 impl PluginStore {
-    /// One real SQLite read transaction covers both tables, including other connections'
+    /// One real `SQLite` read transaction covers both tables, including other connections'
     /// writes. The connection mutex also excludes in-process commits until it completes.
     pub fn logical_snapshot(&self) -> Result<LogicalSnapshot, StoreError> {
         self.logical_snapshot_inner(|| {})

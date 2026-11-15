@@ -1,4 +1,4 @@
-//! Bounded metadata queries. Config is compared in SQLite, never read into a status response.
+//! Bounded metadata queries. Config is compared in `SQLite`, never read into a status response.
 use super::{PluginStore, StoreError};
 use crate::PluginInstanceStatus;
 use plugin_api::PluginMetadata;

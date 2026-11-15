@@ -104,8 +104,9 @@ impl PluginManager {
         );
         let store = self.store.clone();
         tokio::task::spawn_blocking(move || {
-            let _lock = lock;
-            store.write_installation(&item, Some(request.expected_updated_at_ms))
+            let result = store.write_installation(&item, Some(request.expected_updated_at_ms));
+            drop(lock);
+            result
         })
         .await
         .map_err(|_| ManagementError::Store)??;
