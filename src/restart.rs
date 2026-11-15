@@ -564,6 +564,9 @@ mod tests {
             watch.finished.store(true, Ordering::SeqCst);
             rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
                 .unwrap();
+            // Process-directed signals may run on another test-harness thread.
+            // kill returning does not mean that its handler has executed yet.
+            std::thread::sleep(std::time::Duration::from_secs(5));
             panic!("final teardown signal must terminate before exec");
         }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -577,7 +580,7 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
-        assert!(status.success());
+        assert!(status.success(), "signal fixture exited with {status:?}");
     }
 
     #[tokio::test]
