@@ -2,6 +2,7 @@
 
 mod auth;
 mod backups;
+mod bundled;
 mod listener;
 mod local_packages;
 mod log_archives;

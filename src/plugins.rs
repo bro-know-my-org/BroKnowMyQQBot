@@ -1,5 +1,7 @@
 //! Administrator-controlled WASM plugin installation declarations.
 
+pub(crate) mod bundled;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -22,10 +24,7 @@ use builtin_plugins::{
 };
 #[cfg(feature = "coverage-probes")]
 use plugin_host::TrustedPlatformQuery;
-use plugin_host::{
-    PluginStore, StaticPluginHost, TrustedAuthorityProvider, TrustedPluginCapabilities,
-    ValidatedPluginPackage, WasmPlugin,
-};
+use plugin_host::{PluginStore, StaticPluginHost, ValidatedPluginPackage, WasmPlugin};
 
 const MAX_INSTALLATION_FILE_BYTES: usize = 1024 * 1024;
 pub(crate) const DEFAULT_BUNDLED_PLUGINS: &[&str] =
@@ -116,6 +115,10 @@ pub(crate) fn is_reserved_bundled_instance_id(instance_id: &str) -> bool {
     BUNDLED_PLUGIN_INSTANCES
         .iter()
         .any(|(_, bundled_instance_id)| *bundled_instance_id == instance_id)
+}
+
+pub(crate) fn is_diagnostic_bundled(name: &str) -> bool {
+    COVERAGE_PROBE_NAMES.contains(&name)
 }
 
 /// Export declaration-owned records for inspection; restore must not overwrite them.
@@ -312,7 +315,7 @@ pub(crate) async fn load_plugins(
         loaded_packages.insert(loaded_id, loaded_hash);
     }
     if include_help {
-        register_help_plugin(plugins).await?;
+        register_help_plugin_with_config(plugins, &installations.bundled_config).await?;
     }
     Ok(LoadedPlugins {
         packages: loaded_packages,
@@ -350,16 +353,21 @@ async fn load_validated_package(
     )
 }
 
+#[cfg(test)]
 async fn register_help_plugin(
     plugins: &mut StaticPluginHost,
 ) -> Result<(), plugin_host::PluginHostError> {
+    register_help_plugin_with_config(plugins, &BTreeMap::new()).await
+}
+
+async fn register_help_plugin_with_config(
+    plugins: &mut StaticPluginHost,
+    configs: &BTreeMap<String, BTreeMap<String, Value>>,
+) -> Result<(), plugin_host::PluginHostError> {
     let help = HelpPlugin::with_commands(plugins.command_declarations()?);
+    let config = configs.get("help").cloned().unwrap_or_default();
     plugins
-        .register_trusted(
-            std::sync::Arc::new(help),
-            "dev.bkm.help/default",
-            BTreeMap::new(),
-        )
+        .register_trusted(std::sync::Arc::new(help), "dev.bkm.help/default", config)
         .await
 }
 
@@ -405,44 +413,13 @@ async fn register_bundled_plugins(
             instance_ids.insert(instance_id.to_owned());
             continue;
         }
-        let plugin: std::sync::Arc<dyn plugin_api::StaticPlugin> = match name.as_str() {
-            "ping" => std::sync::Arc::new(PingPlugin::default()),
-            "echo" => std::sync::Arc::new(EchoPlugin::default()),
-            "counter" => std::sync::Arc::new(CounterPlugin::default()),
-            "admin" => std::sync::Arc::new(AdminPlugin::default()),
-            "reminder" => std::sync::Arc::new(ReminderPlugin::default()),
-            #[cfg(feature = "coverage-probes")]
-            "http-probe" => std::sync::Arc::new(HttpProbePlugin::default()),
-            #[cfg(feature = "coverage-probes")]
-            "browser-probe" => std::sync::Arc::new(BrowserProbePlugin::default()),
-            #[cfg(feature = "coverage-probes")]
-            "scheduler-probe" => std::sync::Arc::new(SchedulerProbePlugin::default()),
-            #[cfg(feature = "coverage-probes")]
-            "qq-extension-probe" => std::sync::Arc::new(QqExtensionProbePlugin::default()),
-            #[cfg(feature = "coverage-probes")]
-            "active-send-probe" => std::sync::Arc::new(ActiveSendProbePlugin::default()),
-            #[cfg(feature = "coverage-probes")]
-            "devtools" => std::sync::Arc::new(DevToolsPlugin::default()),
-            #[cfg(not(feature = "coverage-probes"))]
-            _ if COVERAGE_PROBE_NAMES.contains(&name.as_str()) => {
-                return Err(Box::new(PluginConfigError::CoverageProbeUnavailable(name)));
-            }
-            _ => return Err(Box::new(PluginConfigError::UnknownBundled(name))),
-        };
-        let trusted_capabilities = match name.as_str() {
-            "admin" => TrustedPluginCapabilities::default()
-                .with_authority_provider(TrustedAuthorityProvider::Administration),
-            #[cfg(feature = "coverage-probes")]
-            "devtools" => TrustedPluginCapabilities::default()
-                .with_platform_query(TrustedPlatformQuery::QqGuildApiPermissionList),
-            _ => TrustedPluginCapabilities::default(),
-        };
+        let definition = bundled::definition(&name)?;
         plugins
             .register_trusted_with_capabilities(
-                plugin,
+                definition.plugin,
                 instance_id,
                 configs.get(&name).cloned().unwrap_or_default(),
-                trusted_capabilities,
+                definition.capabilities,
             )
             .await?;
         instance_ids.insert(instance_id.to_owned());

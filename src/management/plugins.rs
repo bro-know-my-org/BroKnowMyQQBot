@@ -86,6 +86,10 @@ pub(super) fn router_with_runtime(
         .route("/api/marketplace/details", get(super::marketplace::details))
         .route("/api/plugins", get(list))
         .route(
+            "/api/plugins/bundled",
+            get(super::bundled::get).post(super::bundled::save),
+        )
+        .route(
             "/api/plugins/local/commit",
             post(super::local_packages::commit),
         )

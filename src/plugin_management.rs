@@ -1,6 +1,7 @@
 //! Shared management operations for the CLI and authenticated Web interface.
 
 mod backup;
+pub(crate) mod bundled;
 pub(crate) mod local_packages;
 pub(crate) mod marketplace;
 pub(crate) mod marketplace_install;
@@ -74,6 +75,8 @@ pub(crate) enum ManagementError {
     InvalidSystemSettings,
     #[error("Bot 配置文件不可写或校验失败，请检查文件权限与配置内容")]
     SettingsUnavailable,
+    #[error("内置插件清单不可读写或无效，请检查文件权限、配置内容及启动时指定的清单")]
+    BundledUnavailable,
     #[error("插件管理操作繁忙或正在关闭，请稍后重试")]
     Busy,
     #[error("插件包不得超过 32 MiB")]
