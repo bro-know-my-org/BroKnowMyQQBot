@@ -13,6 +13,7 @@ export function createManagementRouter(memory = false) {
     routes: [
       { path: '/', name: 'overview', meta: { title: '概览', section: 'overview' } },
       { path: '/plugins', name: 'plugins', meta: { title: '已安装', section: 'plugins' } },
+      { path: '/plugins/bundled', name: 'bundled-plugins', meta: { title: '内置插件', section: 'plugins' } },
       { path: '/plugins/:instanceId', name: 'plugin-overview', meta: { title: '插件总览', section: 'plugins' } },
       { path: '/plugins/:instanceId/config', name: 'plugin-config', meta: { title: '插件配置', section: 'plugins' } },
       { path: '/plugins/:instanceId/logs', name: 'plugin-logs', meta: { title: '插件日志', section: 'plugins' } },

@@ -6,7 +6,7 @@ export const BOOT = '11111111-1111-4111-8111-111111111111';
 export const plugin = (overrides: Partial<PluginStatus> = {}): PluginStatus => ({ instance_id: 'instance/one', plugin_id: 'dev.bkm.one', name: '问候', version: '1', loaded_version: '1', enabled: true, runtime_state: 'ready', pending: false, restart_required: false, updated_at_ms: 1, ...overrides });
 export function snapshot(revision: number | string = 1, plugins: PluginStatus[] = []): ManagementSnapshot {
   const runtime = runtimeFixture(); runtime.snapshot.adapters['qq-fixture'] = { online: true, failures: '0', events_received: '0', events_rejected: '0' };
-  return { boot_id: BOOT, revision: String(revision), runtime, plugins, plugins_truncated: false, settings_restart_required: null };
+  return { boot_id: BOOT, revision: String(revision), runtime, plugins, plugins_truncated: false, settings_restart_required: null, bundled_revision: null };
 }
 const offline = (s: ManagementSnapshot, failures = '1') => {
   s.runtime.snapshot.adapters['qq-fixture'] = { online: false, failures, events_received: '0', events_rejected: '0', last_failure: 'transport' }; return s;

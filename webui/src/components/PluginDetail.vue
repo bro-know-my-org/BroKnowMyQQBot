@@ -42,11 +42,11 @@ function operate(action: 'uninstall' | 'recover') {
         <PluginPermissions :plugin="plugin" :request="request" :busy="busy || conflict" @dirty="permissionsDirty = $event" @busy="$emit('busy', $event)" @updated="$emit('updated', $event)" @uncertain="$emit('uncertain')" />
         <FailedDeliveries :request="request" :instance-id="plugin.instance_id" :revision="plugin.updated_at_ms" :busy="busy" />
         <section v-if="plugin.editable" class="detail-section"><h2>实例运维</h2><p class="hint">卸载默认保留私有数据。恢复只准备下次重启重试，不会立即重放投递。</p><div class="actions"><button id="recover-plugin" type="button" :disabled="busy || conflict || dirty" @click="operate('recover')">显式恢复并等待重启</button><button id="uninstall-plugin" type="button" :disabled="busy || conflict || dirty" @click="operate('uninstall')">卸载插件（保留数据）</button></div></section>
-        <p v-if="!plugin.editable" class="notice">此插件由声明式文件或随包配置管理。配置页仅供查看。</p>
+        <p v-if="!plugin.editable" class="notice">此插件由声明式文件或随包配置管理。<RouterLink :to="{ name: 'bundled-plugins', query: { instance_id: plugin.instance_id } }">管理内置插件</RouterLink>，其他声明式插件请修改对应配置文件。</p>
       </template>
       <section v-else-if="tab === 'config'" aria-label="插件配置">
         <h2>插件配置</h2><p class="muted">先保存设置，再应用到运行中的插件。已保存状态：{{ plugin.enabled ? '已启用' : '已停用' }}。</p>
-        <p v-if="!plugin.editable" class="notice">此插件由声明式文件或随包配置管理。请修改对应配置文件；此处仅供查看。</p>
+        <p v-if="!plugin.editable" class="notice">此插件由声明式文件或随包配置管理。随包插件可前往<RouterLink :to="{ name: 'bundled-plugins', query: { instance_id: plugin.instance_id } }">内置插件管理</RouterLink>编辑；其他声明式插件请修改对应配置文件。</p>
         <form @submit.prevent="save"><SchemaEditor ref="editor" :config="plugin.config" :schema="plugin.schema" :disabled="busy || !plugin.editable" @dirty="configDirty = $event" />
           <p class="hint" aria-live="polite">{{ conflict ? "状态已变化，请刷新后重新编辑。当前编辑仍保留，可先复制。" : dirty ? "有未保存更改。请先保存，再启停或立即应用。" : plugin.pending ? "已保存，等待应用到运行时。" : "当前没有未保存更改。" }}</p>
           <div class="actions"><button id="save" class="primary" :disabled="busy || !plugin.editable || conflict || !dirty">保存配置</button><button id="discard" type="button" :disabled="busy || !dirty" @click="discard">放弃编辑</button></div>

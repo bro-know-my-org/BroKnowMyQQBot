@@ -73,6 +73,15 @@ it('malformed frames preserve visible old data and expose a stale error until ex
 it.each(['18446744073709551616', '-1', '01', 1])('rejects invalid u64 revision %s', revision => {
   expect(() => readManagementSnapshot({ ...snapshot(), revision })).toThrow();
 });
+it('accepts a lowercase bundled revision and normalizes a missing channel to null', () => {
+  const revision = '0123456789abcdef'.repeat(4);
+  expect(readManagementSnapshot({ ...snapshot(), bundled_revision: revision }).bundled_revision).toBe(revision);
+  expect(readManagementSnapshot({ ...snapshot(), bundled_revision: null }).bundled_revision).toBeNull();
+  expect(readManagementSnapshot(snapshot()).bundled_revision).toBeNull();
+});
+it.each([undefined, '', 'a'.repeat(63), 'a'.repeat(65), 'A'.repeat(64), 'g'.repeat(64), 'a'.repeat(64) + '\n', 0, false, {}, []])('rejects invalid bundled revision %j', bundled_revision => {
+  expect(() => readManagementSnapshot({ ...snapshot(), bundled_revision })).toThrow();
+});
 it('rejects duplicate plugin IDs, unsafe timestamps and excessive arrays', () => {
   const plugin = { instance_id: 'one', plugin_id: 'dev.bkm.one', name: 'One', version: '1', loaded_version: null,
     enabled: false, runtime_state: 'not_loaded', pending: false, restart_required: false, updated_at_ms: 1 };

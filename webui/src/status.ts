@@ -12,7 +12,7 @@ export type StatusState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 's
 export type PluginStatus = Pick<PluginView, 'instance_id' | 'plugin_id' | 'name' | 'version' | 'loaded_version' | 'enabled' | 'runtime_state' | 'pending' | 'restart_required' | 'updated_at_ms'>;
 export interface ManagementSnapshot {
   boot_id: string; revision: string; runtime: RuntimeStatus; plugins: PluginStatus[];
-  plugins_truncated: boolean; settings_restart_required: boolean | null;
+  plugins_truncated: boolean; settings_restart_required: boolean | null; bundled_revision: string | null;
 }
 export const managementStatusKey: InjectionKey<ManagementStatus> = Symbol('management-status');
 const text = (v: unknown, max: number): v is string => typeof v === 'string' && v.length > 0 && v.length <= max;
@@ -22,6 +22,7 @@ export function readManagementSnapshot(raw: unknown): ManagementSnapshot {
   const invalid = () => new ApiError('状态响应格式异常，保留上次快照，请重试。');
   if (!isObject(raw) || !boot(raw.boot_id) || !counter(raw.revision) || !Array.isArray(raw.plugins) || raw.plugins.length > 256
     || typeof raw.plugins_truncated !== 'boolean' || !(raw.settings_restart_required === null || typeof raw.settings_restart_required === 'boolean')
+    || !(!Object.hasOwn(raw, 'bundled_revision') || raw.bundled_revision === null || (typeof raw.bundled_revision === 'string' && raw.bundled_revision.length === 64 && /^[0-9a-f]{64}$/.test(raw.bundled_revision)))
     || !isObject(raw.runtime) || raw.runtime.boot_id !== raw.boot_id) throw invalid();
   const ids = new Set<string>();
   const plugins = raw.plugins.map((p: unknown): PluginStatus => {
@@ -36,7 +37,7 @@ export function readManagementSnapshot(raw: unknown): ManagementSnapshot {
       restart_required: p.restart_required, updated_at_ms: Number(p.updated_at_ms) };
   });
   return { boot_id: raw.boot_id, revision: raw.revision, runtime: readRuntime(raw.runtime), plugins,
-    plugins_truncated: raw.plugins_truncated, settings_restart_required: raw.settings_restart_required };
+    plugins_truncated: raw.plugins_truncated, settings_restart_required: raw.settings_restart_required, bundled_revision: typeof raw.bundled_revision === 'string' ? raw.bundled_revision : null };
 }
 
 export function createManagementStatus(request: Request, onUnauthorized: () => void) {

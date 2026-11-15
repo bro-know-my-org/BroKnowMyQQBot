@@ -7,7 +7,7 @@ import { runtimeFixture } from './runtimeFixture';
 const BOOT = '11111111-1111-4111-8111-111111111111', NEXT = '22222222-2222-4222-8222-222222222222';
 const data = (revision: number, online: boolean, boot = BOOT): ManagementSnapshot => {
   const runtime = runtimeFixture(); runtime.snapshot.adapters['qq-fixture']!.online = online;
-  return { boot_id: boot, revision: String(revision), runtime, plugins: [], plugins_truncated: false, settings_restart_required: null };
+  return { boot_id: boot, revision: String(revision), runtime, plugins: [], plugins_truncated: false, settings_restart_required: null, bundled_revision: null };
 };
 const active = ref(true), boot = ref(BOOT), snapshot = shallowRef<ManagementSnapshot | null>(null), state = ref<StatusState>('open');
 let center = createNotifications(), engine: ReturnType<typeof createFaultNotices>;
