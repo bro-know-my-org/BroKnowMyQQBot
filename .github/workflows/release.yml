@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      RELEASE_TAG: ${{ github.ref_name }}
+      BKMQB_GIT_REV: ${{ github.sha }}
+      BKMQB_GIT_REPOSITORY: https://github.com/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a stable version tag on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          test "$(git rev-parse HEAD)" = "$BKMQB_GIT_REV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-linux-x86_64-gnu
+      - name: Match the Cargo version to the tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          python3 - "$RUNNER_TEMP/metadata.json" <<'PY'
+          import json, os, sys
+          data = json.load(open(sys.argv[1]))
+          root = next(p for p in data['packages'] if p['manifest_path'] == data['workspace_root'] + '/Cargo.toml')
+          if os.environ['RELEASE_TAG'] != 'v' + root['version']:
+              raise SystemExit('tag must match the root Cargo package version')
+          PY
+      - name: Verify release publishing failure recovery
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - name: Verify and build the embedded WebUI
+        run: |
+          npm ci --prefix webui
+          npm test --prefix webui
+          npm run build --prefix webui
+          git diff --exit-code -- src/webui
+          test -z "$(git ls-files --others --exclude-standard -- src/webui)"
+      - name: Verify Rust
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-features --locked -- --test-threads=2
+      - name: Build and package Linux x86_64 (glibc <= 2.36)
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          cargo build --release --locked --bin bkmqb
+          bash .github/scripts/package-linux.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-x86_64-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      SOURCE_REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux-x86_64-release
+          path: dist
+      - name: Publish verified release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check SHA256SUMS)
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          Linux x86_64 GNU build; requires glibc 2.36 or newer.
+          The archive contains bkmqb (including the WebUI and bundled plugins) and license texts.
+          Verify the archive with SHA256SUMS before installing.
+
+          Configuration, credentials, databases and external plugins are not included.
+          Back up existing configuration and data before upgrading. Existing GitHub Issue plugin
+          administrator settings require an explicit migration when upgrading that plugin to 0.4.
+          Browser Runtime, where used, is installed separately.
+          NOTES
+          python3 .github/scripts/publish-release.py dist "$RUNNER_TEMP/release-notes.md"

@@ -6,6 +6,8 @@
 !/.gitignore
 !/Cargo.lock
 !/Cargo.toml
+!/LICENSE-MIT
+!/LICENSE-APACHE
 !/build.rs
 !/rustfmt.toml
 !/config/
@@ -28,6 +30,7 @@
 *.swp
 *.swo
 .DS_Store
+__pycache__/
 
 # Local configuration and secrets.
 .env
