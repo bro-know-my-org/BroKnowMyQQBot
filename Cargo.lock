@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-onebot11"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bot-core",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-qqbot"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -265,7 +265,7 @@ checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
 
 [[package]]
 name = "bot-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "bro-know-my-bot"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "adapter-onebot11",
  "adapter-qqbot",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "builtin-plugins"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "plugin-api",
@@ -1768,7 +1768,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "onebot-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "serde",
@@ -1845,7 +1845,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plugin-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "language-tags",
@@ -1860,7 +1860,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-fixtures"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "plugin-api",
@@ -1870,7 +1870,7 @@ dependencies = [
 
 [[package]]
 name = "plugin-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "qqbot-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
