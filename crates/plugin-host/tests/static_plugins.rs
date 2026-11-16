@@ -42,6 +42,9 @@ use plugin_host::{
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
+#[path = "support/media_create.rs"]
+mod media_create;
+
 #[derive(Debug)]
 #[cfg(feature = "coverage-probes")]
 struct MockHttpExecutor;
