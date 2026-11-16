@@ -47,6 +47,42 @@ fn fixture() -> (Fixture, PluginManager, MarketplaceFixture) {
     manager.use_marketplace_fixture(data.clone());
     (fixture, manager, data)
 }
+
+fn versioned_package(bytes: &[u8], version: &str) -> Vec<u8> {
+    use std::io::{Cursor, Write as _};
+    use zip::{ZipWriter, write::SimpleFileOptions};
+    let package = ValidatedPluginPackage::from_bytes(bytes).unwrap();
+    let mut manifest = package.manifest().clone();
+    manifest.version = version.to_owned();
+    let manifest = toml::to_string(&manifest).unwrap();
+    let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+    for (name, content) in package.files() {
+        archive
+            .start_file(name, SimpleFileOptions::default())
+            .unwrap();
+        archive
+            .write_all(if name == "plugin.toml" {
+                manifest.as_bytes()
+            } else {
+                content
+            })
+            .unwrap();
+    }
+    archive.finish().unwrap().into_inner()
+}
+
+fn set_market_version(data: &MarketplaceFixture, version: &str) {
+    let mut data = data.lock().unwrap();
+    let bytes = versioned_package(&data.1, version);
+    let package = ValidatedPluginPackage::from_bytes(&bytes).unwrap();
+    let mut index: Value = serde_json::from_slice(&data.0).unwrap();
+    index["plugins"][0]["latest"]["version"] = json!(version);
+    index["plugins"][0]["latest"]["download"] = json!(format!(
+        "https://github.com/example/ping/releases/download/v{version}/ping.bkm-plugin"
+    ));
+    index["plugins"][0]["latest"]["sha256"] = json!(package.package_sha256());
+    *data = (serde_json::to_vec(&index).unwrap(), bytes);
+}
 fn app(manager: PluginManager) -> Router {
     router(manager, token_digest(TOKEN).unwrap())
 }
@@ -182,17 +218,8 @@ async fn marketplace_install_is_explicit_disabled_without_grants_and_restart_onl
     let mut approved = intent(app.clone()).await;
     approved["grants"] = json!(["message.reply"]);
     let (status, _) = send(app, "/api/marketplace/update", Some(approved)).await;
-    assert_eq!(status, StatusCode::OK);
-    let updated = fixture.store.installation(id).unwrap().unwrap();
-    manager
-        .save_enabled(id, updated.updated_at_ms, true)
-        .await
-        .unwrap();
-    let updated = fixture.store.installation(id).unwrap().unwrap();
-    assert!(matches!(
-        manager.apply(id, updated.updated_at_ms).await,
-        Err(crate::plugin_management::ManagementError::RestartRequired)
-    ));
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(fixture.store.installation(id).unwrap().unwrap(), record);
     assert_eq!(
         serde_json::to_value(manager.view(id).await.unwrap()).unwrap()["runtime_state"],
         "not_loaded"
@@ -202,7 +229,8 @@ async fn marketplace_install_is_explicit_disabled_without_grants_and_restart_onl
 
 #[tokio::test]
 async fn marketplace_update_preserves_config_grants_and_disabled_state_and_rejects_stale() {
-    let (fixture, manager, _) = fixture();
+    let (fixture, manager, data) = fixture();
+    set_market_version(&data, "1.0.0");
     let mut record = fixture.installation.clone();
     record.instance_id = "dev.bkm.wasm-ping/default".into();
     record.enabled = false;
@@ -235,6 +263,7 @@ async fn marketplace_update_preserves_config_grants_and_disabled_state_and_rejec
             .0,
         StatusCode::CONFLICT
     );
+    set_market_version(&data, "2.0.0");
     let mut grants = intent(app.clone()).await;
     grants["grants"] = json!(["unrequested.capability"]);
     assert_eq!(
@@ -256,6 +285,7 @@ async fn marketplace_update_preserves_config_grants_and_disabled_state_and_rejec
 #[tokio::test]
 async fn marketplace_changed_index_hash_manifest_and_identity_never_overwrite() {
     let (fixture, manager, data) = fixture();
+    set_market_version(&data, "1.0.0");
     let mut record = fixture.installation.clone();
     record.instance_id = "dev.bkm.wasm-ping/default".into();
     fixture.store.upsert_installation(&record).unwrap();
@@ -310,7 +340,8 @@ async fn marketplace_changed_index_hash_manifest_and_identity_never_overwrite() 
 
 #[tokio::test]
 async fn marketplace_concurrent_updates_use_cas_and_keep_referenced_package() {
-    let (fixture, manager, _) = fixture();
+    let (fixture, manager, data) = fixture();
+    set_market_version(&data, "1.0.0");
     let mut record = fixture.installation.clone();
     record.instance_id = "dev.bkm.wasm-ping/default".into();
     fixture.store.upsert_installation(&record).unwrap();
@@ -332,6 +363,9 @@ async fn marketplace_concurrent_updates_use_cas_and_keep_referenced_package() {
     assert!(saved.updated_at_ms > record.updated_at_ms);
     manager.shutdown().await.unwrap();
 }
+
+#[path = "marketplace_version_tests.rs"]
+mod version_tests;
 
 #[tokio::test]
 async fn marketplace_mutations_auth_source_and_declarative_boundaries() {
@@ -425,6 +459,7 @@ async fn marketplace_incomplete_config_disabled_and_bad_component_has_no_record(
     let id = "dev.bkm.wasm-ping/default";
     let saved = fixture.store.installation(id).unwrap().unwrap();
     assert_eq!(saved.granted_permissions, vec!["message.reply"]);
+    set_market_version(&data, "1.0.0");
     replace_package_file(&data, "component.wasm", b"\0asm\x01\0\0\0");
     let body = intent(app.clone()).await;
     assert_eq!(
@@ -494,6 +529,7 @@ async fn marketplace_storage_failure_is_safe_and_request_cancellation_is_supervi
 #[tokio::test]
 async fn marketplace_updated_running_instance_can_still_be_stopped() {
     let (fixture, _, data) = fixture();
+    set_market_version(&data, "1.0.0");
     let mut record = fixture.installation.clone();
     record.instance_id = "dev.bkm.wasm-ping/default".into();
     fixture.store.upsert_installation(&record).unwrap();

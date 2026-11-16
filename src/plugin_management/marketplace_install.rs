@@ -7,6 +7,11 @@ use plugin_host::{PluginInstallation, ValidatedPluginPackage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+pub(super) enum InstallOrigin {
+    Marketplace,
+    Local,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InstallRequest {
@@ -63,15 +68,24 @@ impl PluginManager {
         // Keep the slot until blocking validation and persistence finish. Network
         // requests have individual deadlines; HTTP cancellation drops only the receiver.
         let (pending, existing) = self.prepare_marketplace(request, update).await?;
-        self.commit_package(pending, existing).await
+        self.commit_package(pending, existing, InstallOrigin::Marketplace)
+            .await
     }
 
     pub(super) async fn commit_package(
         &self,
         pending: PendingInstallation,
         existing: Option<PluginInstallation>,
+        origin: InstallOrigin,
     ) -> Result<InstallResult, ManagementError> {
         let _write = self.writes.lock().await;
+        if matches!(origin, InstallOrigin::Marketplace) {
+            self.check_marketplace_version(
+                &pending.manifest.version,
+                existing.as_ref(),
+                &pending.instance_id,
+            )?;
+        }
         let context = self.marketplace_context()?;
         let store = self.store.clone();
         let id = pending.instance_id.clone();
@@ -285,6 +299,7 @@ impl PluginManager {
         {
             return Err(ManagementError::NotManaged);
         }
+        self.check_marketplace_version(&plugin.latest.version, existing.as_ref(), &instance_id)?;
         Ok((instance_id, existing))
     }
 }

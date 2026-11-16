@@ -7,6 +7,7 @@ mod bundled_source;
 pub(crate) mod local_packages;
 pub(crate) mod marketplace;
 pub(crate) mod marketplace_install;
+mod marketplace_version;
 mod operations;
 pub(crate) mod permissions;
 mod restore;
@@ -49,6 +50,8 @@ pub(crate) enum ManagementError {
     MarketplaceUnavailable,
     #[error("市场条目已改变，请刷新详情并重新确认")]
     StaleMarketplace,
+    #[error("市场版本无效、未高于已保存版本或低于已加载版本，已拒绝更新；请刷新并核对版本")]
+    MarketplaceVersion,
     #[error("市场请求无效，请重新选择插件")]
     InvalidMarketRequest,
     #[error("插件操作无效，请重新确认操作与当前实例")]

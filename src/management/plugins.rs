@@ -268,7 +268,9 @@ impl IntoResponse for ApiError {
             ManagementError::InvalidMarketRequest | ManagementError::InvalidOperation => {
                 StatusCode::BAD_REQUEST
             }
-            ManagementError::Conflict | ManagementError::StaleMarketplace => StatusCode::CONFLICT,
+            ManagementError::Conflict
+            | ManagementError::StaleMarketplace
+            | ManagementError::MarketplaceVersion => StatusCode::CONFLICT,
             ManagementError::Busy => StatusCode::TOO_MANY_REQUESTS,
             ManagementError::UploadTooLarge | ManagementError::RestoreTooLarge => {
                 StatusCode::PAYLOAD_TOO_LARGE

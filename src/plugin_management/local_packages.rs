@@ -185,7 +185,12 @@ impl PluginManager {
             config_error,
             update: existing.is_some(),
         };
-        self.commit_package(pending, existing).await
+        self.commit_package(
+            pending,
+            existing,
+            super::marketplace_install::InstallOrigin::Local,
+        )
+        .await
     }
     pub(crate) fn discard_local_selection(&self, selection: &str) -> Result<(), ManagementError> {
         self.local_packages
