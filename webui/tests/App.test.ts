@@ -497,7 +497,7 @@ it('写入响应丢失后离开并重进市场仍同步已安装实例，不重�
     const path = String(input);
     if (path === '/api/marketplace/install') {
       writes++; plugins.push(fixture({ instance_id: item.instance_id, plugin_id: item.plugin_id, name: 'Market Ping' }));
-      item.installed = { version: '1.0.0', enabled: true, updated_at_ms: 1, granted_permissions: [], runtime_state: 'not_loaded' };
+      item.installed = { version: '1.0.0', saved_version: '1.0.0', loaded_version: null, restart_required: true, enabled: true, updated_at_ms: 1, granted_permissions: [], runtime_state: 'not_loaded' };
       throw new TypeError('response lost after commit');
     }
     if (path.startsWith('/api/marketplace')) return new Response(JSON.stringify({ source: 'https://example.com/index.json', total: 1, offset: 0, plugins: [item] }));
@@ -508,6 +508,8 @@ it('写入响应丢失后离开并重进市场仍同步已安装实例，不重�
   expect(text()).toContain('无法连接管理服务'); expect(writes).toBe(1);
   await go({ name: 'overview' }); await go({ name: 'marketplace' });
   await click('.market-list button'); await flush();
+  expect(get('.market-details .primary').textContent).toContain('已保存');
+  expect(get<HTMLFieldSetElement>('.market-details fieldset').disabled).toBe(true);
   await go(pluginRoute(item.instance_id));
   expect(text()).toContain('Market Ping'); expect(text()).not.toContain('未找到插件实例'); expect(writes).toBe(1);
 });

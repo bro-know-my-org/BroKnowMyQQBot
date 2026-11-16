@@ -132,14 +132,75 @@ it('详情请求失败后保持原列表可操作，不展开空详情', async (
   expect(document.querySelector('.market-details')).toBeNull(); expect(get('[aria-label="市场插件列表"]').style.display).toBe('');
   expect(get<HTMLButtonElement>('.market-list button').disabled).toBe(false); expect(get('[role="alert"]').textContent).toContain('市场暂不可用');
 });
-it('已保存版本与实例运行状态分别说明，版本相同仍允许核对新增授权', async () => {
+it('已保存版本与实例运行状态分别说明，同版本不重复更新并保留重启提示', async () => {
   selected.installed = { version: '1.0.0', saved_version: '1.0.0', loaded_version: '0.9.0', restart_required: true, enabled: false, updated_at_ms: 7, granted_permissions: [], runtime_state: 'ready' };
   await mount(); await click('.market-list button');
   expect(get('.market-install-state').textContent).toContain('已保存版本：1.0.0');
   expect(get('.market-install-state').textContent).toContain('已保存为禁用'); expect(get('.market-install-state').textContent).toContain('实例运行状态：运行中');
   expect(get('.market-install-state').textContent).toContain('需重启加载');
   await check('.market-permission input[value="message.reply"]'); await check('.market-confirm input'); await click('.market-details .primary');
-  expect(posts[0]).toMatchObject({ path: '/api/marketplace/update', body: { expected_updated_at_ms: 7, grants: ['message.reply'] } });
+  expect(get<HTMLFieldSetElement>('fieldset').disabled).toBe(true);
+  expect(get('.market-details .primary').textContent).toContain('已保存');
+  expect(posts).toHaveLength(0); expect(window.confirm).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['0.4.0', '0.4.0', '0.2.6', '市场版本较旧'],
+  ['0.4.0', '0.4.0', '0.4.0', '已安装'],
+  ['0.4.0+saved', '0.4.0+loaded', '0.4.0+market', '已安装'],
+  ['0.2.6', '0.4.0', '0.3.0', '低于实际加载版本'],
+  ['0.2.6', '0.4.0', '0.2.6', '低于实际加载版本'],
+  ['0.4.0', null, 'v0.5.0', '无法比较'],
+  ['broken', null, '0.5.0', '无法比较'],
+  ['0.4.0', 'broken', '0.5.0', '无法比较'],
+])('DOM 更新入口拒绝 saved=%s loaded=%s candidate=%s', async (saved, loaded, candidate, reason) => {
+  selected.latest.version = candidate!;
+  selected.installed = { version: saved!, saved_version: saved!, loaded_version: loaded, restart_required: saved !== loaded,
+    enabled: true, updated_at_ms: 7, granted_permissions: [], runtime_state: 'ready' };
+  await mount();
+  expect(get('.market-list').textContent).toContain(reason);
+  await click('.market-list button');
+  expect(get('.market-version-policy').textContent).toContain(reason);
+  expect(get<HTMLFieldSetElement>('fieldset').disabled).toBe(true);
+  expect(get('.market-details .primary').textContent).not.toContain('确认更新');
+  // Bypass native disabled behavior to exercise the real click handler's own guard.
+  await check('.market-confirm input');
+  get<HTMLFieldSetElement>('fieldset').disabled = false;
+  get<HTMLButtonElement>('.market-details .primary').disabled = false;
+  await click('.market-details .primary');
+  expect(posts).toHaveLength(0); expect(window.confirm).not.toHaveBeenCalled();
+  expect(busy).not.toHaveBeenCalledWith(true); expect(installed).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['0.9.0', '0.9.0', '0.10.0'],
+  ['0.4.0-rc.1', '0.4.0-rc.1', '0.4.0'],
+  ['0.2.6', '0.4.0', '0.4.0'],
+  ['0.2.6', '0.4.0', '0.5.0'],
+])('DOM 更新入口允许 saved=%s loaded=%s candidate=%s', async (saved, loaded, candidate) => {
+  selected.latest.version = candidate;
+  selected.installed = { version: saved, saved_version: saved, loaded_version: loaded, restart_required: saved !== loaded,
+    enabled: false, updated_at_ms: 7, granted_permissions: ['message.reply'], runtime_state: 'ready' };
+  await mount(); await click('.market-list button');
+  expect(get<HTMLFieldSetElement>('fieldset').disabled).toBe(false);
+  await check('input[value="storage.private"]'); await check('.market-confirm input'); await click('.market-details .primary');
+  expect(posts).toEqual([{ path: '/api/marketplace/update', body: { selector: 'ping', selection: 'b'.repeat(64), version: candidate,
+    sha256: 'a'.repeat(64), expected_updated_at_ms: 7, grants: ['storage.private'], confirm_unsigned: true } }]);
+  expect(get('.market-install-state').textContent).toContain(`已保存版本：${candidate}`);
+  expect(get('.market-install-state').textContent).toContain(`实际加载版本：${loaded}`);
+  expect(get('.market-install-state').textContent).toContain('需要重启 Bot');
+});
+
+it('提交函数重新比较当前版本，不依赖此前渲染的可更新状态', async () => {
+  selected.installed = { version: '0.4.0', saved_version: '0.4.0', loaded_version: '0.4.0', restart_required: false,
+    enabled: true, updated_at_ms: 7, granted_permissions: [], runtime_state: 'ready' };
+  await mount(); await click('.market-list button'); await check('.market-confirm input');
+  expect(get<HTMLButtonElement>('.market-details .primary').disabled).toBe(false);
+  // The catalogue is a shallow snapshot: mutate it without a render to detect a stale eligibility cache.
+  selected.latest.version = '0.2.6';
+  await click('.market-details .primary');
+  expect(posts).toHaveLength(0); expect(window.confirm).not.toHaveBeenCalled();
+  expect(get('[role="alert"]').textContent).toContain('不降级');
 });
 
 it.each([false, true])('取消最终%s安装/更新确认不写入且保留逐项授权与未签名选择', async update => {
