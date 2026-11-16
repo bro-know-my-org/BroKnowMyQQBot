@@ -240,6 +240,13 @@ pub struct AssetReference {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MediaCreate {
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaReply {
     pub asset_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -10,6 +10,26 @@ use super::{
 
 const MAX_ENCODED_VALUE_BYTES: usize = 1024 * 1024;
 
+#[cfg(test)]
+#[test]
+fn media_create_variant_preserves_shared_json_payload() {
+    let command = plugin_command(types::Command {
+        command_id: "create".to_owned(),
+        idempotency_key: None,
+        deadline_ms: None,
+        payload: types::CommandPayload::MediaCreate(types::MediaCreateCommand {
+            mime_type: "image/png".to_owned(),
+            data_base64: "AA==".to_owned(),
+        }),
+    })
+    .unwrap();
+    assert_eq!(command.kind, "media.create");
+    assert_eq!(
+        command.payload,
+        json!({"mime_type":"image/png","data_base64":"AA=="})
+    );
+}
+
 pub(super) fn config_entries(config: &BTreeMap<String, Value>) -> Vec<types::ConfigEntry> {
     config
         .iter()
@@ -240,6 +260,10 @@ fn json_string_upper_bound(value: &str) -> usize {
 #[allow(clippy::too_many_lines)]
 pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, PluginError> {
     let (kind, payload) = match command.payload {
+        types::CommandPayload::MediaCreate(create) => (
+            "media.create".to_owned(),
+            json!({"mime_type": create.mime_type, "data_base64": create.data_base64}),
+        ),
         types::CommandPayload::MessageReply(reply) => (
             "message.reply".to_owned(),
             json!({"content": reply.content}),

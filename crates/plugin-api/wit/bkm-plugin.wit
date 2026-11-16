@@ -1,4 +1,4 @@
-package bkm:plugin@1.4.0;
+package bkm:plugin@1.5.0;
 
 interface types {
     record command-context {
@@ -257,6 +257,11 @@ interface types {
         task-id: string,
     }
 
+    record media-create-command {
+        mime-type: string,
+        data-base64: string,
+    }
+
     variant command-payload {
         message-reply(message-reply-command),
         message-send(message-send-command),
@@ -266,6 +271,7 @@ interface types {
         browser-run(browser-run-command),
         schedule-create(schedule-create-command),
         schedule-cancel(schedule-cancel-command),
+        media-create(media-create-command),
     }
 
     record command {

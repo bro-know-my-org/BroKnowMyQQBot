@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod compat;
 mod conversion;
 
 use conversion::{
@@ -197,7 +198,7 @@ impl queries::Host for StoreData {
 
 struct WasmInstance {
     store: Store<StoreData>,
-    bindings: Plugin,
+    bindings: compat::Bindings,
 }
 
 pub struct WasmPlugin {
@@ -281,9 +282,12 @@ impl WasmPlugin {
         store
             .fuel_async_yield_interval(Some(10_000))
             .map_err(WasmPluginError::Wasmtime)?;
-        let bindings = Plugin::instantiate_async(&mut store, &component, &linker)
+        let instance = linker
+            .instantiate_async(&mut store, &component)
             .await
             .map_err(WasmPluginError::Wasmtime)?;
+        let bindings =
+            compat::Bindings::new(&mut store, &instance).map_err(WasmPluginError::Wasmtime)?;
         Ok(Self {
             fuel: manifest.runtime.fuel,
             timeout: manifest.timeout(),

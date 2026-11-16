@@ -77,6 +77,7 @@ fn formal_wit_contract_parses_with_expected_identity() {
         ("browser-run", "browser-run-command"),
         ("schedule-create", "schedule-create-command"),
         ("schedule-cancel", "schedule-cancel-command"),
+        ("media-create", "media-create-command"),
     ];
     assert_eq!(command_payload.cases.len(), expected.len());
     for (case, (expected_case, expected_payload)) in command_payload.cases.iter().zip(expected) {

@@ -90,6 +90,11 @@ impl PluginManifest {
         if uses_bpp_1_1 && requirement_matches_bpp_1_0(&requirement) {
             return Err(ManifestError::FeatureRequiresProtocol11);
         }
+        if self.permissions.actions.contains("media.create")
+            && (0..5).any(|minor| requirement_matches_bpp_minor(&requirement, minor))
+        {
+            return Err(ManifestError::FeatureRequiresProtocol15);
+        }
         if self.runtime.max_concurrency == 0 {
             return Err(ManifestError::ZeroConcurrency);
         }
@@ -115,7 +120,7 @@ impl PluginManifest {
         for action in &self.permissions.actions {
             if !matches!(
                 action.as_str(),
-                "message.reply" | "message.send" | "media.reply" | "media.send"
+                "message.reply" | "message.send" | "media.reply" | "media.send" | "media.create"
             ) {
                 return Err(ManifestError::UnsupportedAction(action.clone()));
             }
@@ -221,9 +226,13 @@ fn validate_commands(commands: &[CommandDeclaration]) -> Result<(), ManifestErro
 }
 
 fn requirement_matches_bpp_1_0(requirement: &VersionReq) -> bool {
+    requirement_matches_bpp_minor(requirement, 0)
+}
+
+fn requirement_matches_bpp_minor(requirement: &VersionReq, minor: u64) -> bool {
     let mut candidate_patches = BTreeSet::from([0, u64::MAX]);
     for comparator in &requirement.comparators {
-        if comparator.major == 1 && comparator.minor.is_none_or(|minor| minor == 0) {
+        if comparator.major == 1 && comparator.minor.is_none_or(|value| value == minor) {
             if let Some(patch) = comparator.patch {
                 candidate_patches.insert(patch);
                 candidate_patches.insert(patch.saturating_sub(1));
@@ -233,7 +242,7 @@ fn requirement_matches_bpp_1_0(requirement: &VersionReq) -> bool {
     }
     candidate_patches
         .into_iter()
-        .any(|patch| requirement.matches(&Version::new(1, 0, patch)))
+        .any(|patch| requirement.matches(&Version::new(1, minor, patch)))
 }
 
 fn validate_http_permissions(permissions: &[HttpPermission]) -> Result<(), ManifestError> {
@@ -785,6 +794,8 @@ pub enum StoragePermission {
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
+    #[error("media.create requires a protocol range that excludes BPP versions before 1.5")]
+    FeatureRequiresProtocol15,
     #[error("plugin manifest TOML is invalid")]
     Toml(#[source] toml::de::Error),
     #[error("unsupported plugin manifest version {0}")]
@@ -881,6 +892,37 @@ mod tests {
 
         assert_eq!(manifest.id.as_str(), "dev.bkm.ping");
         assert_eq!(manifest.subscriptions.len(), 1);
+    }
+
+    #[test]
+    fn media_create_requires_protocol_15_but_old_manifests_remain_valid() {
+        let source = include_str!("../../../test-support/wasm-plugins/ping/plugin.toml");
+        let mut manifest = PluginManifest::from_toml(source).unwrap();
+        for minor in 0..=4 {
+            manifest.protocol = format!(">=1.{minor},<2.0");
+            manifest.validate().unwrap();
+            manifest
+                .permissions
+                .actions
+                .insert("media.create".to_owned());
+            assert!(matches!(
+                manifest.validate(),
+                Err(ManifestError::FeatureRequiresProtocol15)
+            ));
+            manifest.permissions.actions.remove("media.create");
+        }
+        manifest
+            .permissions
+            .actions
+            .insert("media.create".to_owned());
+        manifest.protocol = ">=1.4.99,<2.0".to_owned();
+        assert!(matches!(
+            manifest.validate(),
+            Err(ManifestError::FeatureRequiresProtocol15)
+        ));
+        manifest.protocol = ">=1.5,<2.0".to_owned();
+        manifest.validate().unwrap();
+        assert!(manifest.requested_capabilities().contains("media.create"));
     }
 
     #[test]

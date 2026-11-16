@@ -22,9 +22,9 @@ pub use protocol::{
     ActionCompleted, ActionStatus, AssetReference, BrowserColorScheme, BrowserRun,
     BrowserRunResult, BrowserScreenshotFormat, BrowserStep, BrowserViewport, BrowserWaitUntil,
     CallerAuthority, CallerRole, Disposition, ExtensionPayload, HandlerOutput, HealthStatus,
-    HostQueries, HttpRequest, HttpResponse, InitContext, MediaReply, MediaSend, PluginCommand,
-    PluginDiagnostic, PluginError, PluginEventEnvelope, PluginMessageTarget, ScheduleCancel,
-    ScheduleCreate, ScheduleTriggered, StateOp, StateValue, StaticPlugin,
+    HostQueries, HttpRequest, HttpResponse, InitContext, MediaCreate, MediaReply, MediaSend,
+    PluginCommand, PluginDiagnostic, PluginError, PluginEventEnvelope, PluginMessageTarget,
+    ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 
-pub const BPP_VERSION: &str = "1.4.0";
+pub const BPP_VERSION: &str = "1.5.0";
