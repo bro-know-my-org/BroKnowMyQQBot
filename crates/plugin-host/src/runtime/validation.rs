@@ -208,6 +208,12 @@ pub(super) fn validate_output(
     if output.commands.len() > MAX_COMMANDS {
         return Err(invalid("too many commands".to_owned()));
     }
+    let output_size = serde_json::to_vec(output)
+        .map_err(|error| invalid(error.to_string()))?
+        .len();
+    if output_size > MAX_OUTPUT_BYTES {
+        return Err(invalid("output exceeds one MiB".to_owned()));
+    }
     let mut command_ids = HashSet::new();
     for command in &output.commands {
         let trusted_platform_query = plugin
@@ -220,6 +226,7 @@ pub(super) fn validate_output(
                 | "message.send"
                 | "media.reply"
                 | "media.send"
+                | "media.create"
                 | "http.request"
                 | "browser.run"
                 | "schedule.create"
@@ -256,12 +263,6 @@ pub(super) fn validate_output(
                 super::MAX_COMMAND_DEADLINE_MS
             )));
         }
-    }
-    let output_size = serde_json::to_vec(output)
-        .map_err(|error| invalid(error.to_string()))?
-        .len();
-    if output_size > MAX_OUTPUT_BYTES {
-        return Err(invalid("output exceeds one MiB".to_owned()));
     }
     Ok(())
 }

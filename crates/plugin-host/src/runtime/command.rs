@@ -24,6 +24,7 @@ pub(super) async fn execute_context_command(
     granted_capabilities: &BTreeSet<String>,
     trusted_platform_queries: &BTreeSet<TrustedPlatformQuery>,
     adapters: &BTreeMap<String, Arc<dyn Adapter>>,
+    validated_image: Option<super::media::ValidatedImage>,
 ) -> Result<Value, PluginError> {
     if let Some(query) = trusted_platform_queries
         .iter()
@@ -197,6 +198,27 @@ pub(super) async fn execute_context_command(
                 .await
                 .map_err(browser_plugin_error)?;
             store_browser_execution(assets, instance_id, execution).await
+        }
+        "media.create" => {
+            if !manifest.permissions.actions.contains("media.create")
+                || !granted_capabilities.contains("media.create")
+            {
+                return Err(PluginError::PermissionDenied(
+                    "media.create is not granted".to_owned(),
+                ));
+            }
+            // Only reuse an invocation-local receipt for this exact persisted payload.
+            let data = match validated_image.filter(|image| image.payload == command.payload) {
+                Some(image) => image.data,
+                None => super::media::decode_create_async(command.payload.clone()).await?,
+            };
+            let request: plugin_api::MediaCreate = serde_json::from_value(command.payload.clone())
+                .map_err(|_| PluginError::Permanent("invalid media.create payload".to_owned()))?;
+            let reference = assets
+                .insert(instance_id, request.mime_type, data)
+                .map_err(|error| PluginError::ResourceExhausted(error.to_string()))?;
+            serde_json::to_value(reference)
+                .map_err(|error| PluginError::Permanent(error.to_string()))
         }
         "media.reply" => {
             let request: MediaReply = serde_json::from_value(command.payload.clone())
@@ -748,6 +770,113 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn media_creation_checks_grants_and_shares_instance_asset_quotas() {
+        use base64::Engine as _;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut manifest = platform_query_manifest();
+        manifest.protocol = ">=1.5,<2.0".to_owned();
+        manifest
+            .permissions
+            .actions
+            .insert("media.create".to_owned());
+        let assets = AssetStore::default();
+        let payload = json!({"mime_type":"image/png", "data_base64":base64::engine::general_purpose::STANDARD.encode(png.get_ref())});
+        let command = PluginCommand {
+            command_id: "image".to_owned(),
+            kind: "media.create".to_owned(),
+            payload,
+            idempotency_key: None,
+            deadline_ms: None,
+        };
+        let execute = |instance: &'static str, granted: bool, validated_image| {
+            let manifest = &manifest;
+            let command = &command;
+            let assets = &assets;
+            async move {
+                execute_context_command(
+                    ExecutionOrigin::Scheduled {
+                        adapter_id: "unused",
+                    },
+                    "event",
+                    command,
+                    &SecureHttpExecutor::default(),
+                    &UnavailableBrowserExecutor,
+                    assets,
+                    instance,
+                    manifest,
+                    &if granted {
+                        manifest.requested_capabilities()
+                    } else {
+                        BTreeSet::new()
+                    },
+                    &BTreeSet::new(),
+                    &BTreeMap::new(),
+                    validated_image,
+                )
+                .await
+            }
+        };
+        assert!(matches!(
+            execute("card/a", false, None).await,
+            Err(PluginError::PermissionDenied(_))
+        ));
+        let reference: plugin_api::AssetReference =
+            serde_json::from_value(execute("card/a", true, None).await.unwrap()).unwrap();
+        assert!(assets.get("card/b", &reference.asset_id).is_err());
+        assert!(assets.remove("card/b", &reference.asset_id).is_err());
+        assert_eq!(
+            assets
+                .get("card/a", &reference.asset_id)
+                .unwrap()
+                .data
+                .as_ref(),
+            png.get_ref()
+        );
+        for _ in 1..32 {
+            execute("card/a", true, None).await.unwrap();
+        }
+        assert!(matches!(
+            execute("card/a", true, None).await,
+            Err(PluginError::ResourceExhausted(_))
+        ));
+        execute("card/b", true, None).await.unwrap();
+        assets.remove("card/a", &reference.asset_id).unwrap();
+        execute("card/a", true, None).await.unwrap();
+
+        let receipt = super::super::media::validate_create_async(command.payload.clone())
+            .await
+            .unwrap();
+        let mut mismatch = super::super::media::validate_create_async(command.payload.clone())
+            .await
+            .unwrap();
+        mismatch.payload["mime_type"] = json!("image/jpeg");
+        let slot = super::super::media::decoder_slots()
+            .acquire()
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            execute("card/cached", true, Some(receipt)),
+        )
+        .await
+        .expect("matching receipt must not decode twice")
+        .unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                execute("card/mismatch", true, Some(mismatch)),
+            )
+            .await
+            .is_err()
+        );
+        drop(slot);
+    }
+
     async fn execute_recovered_query(
         trusted_queries: BTreeSet<TrustedPlatformQuery>,
         platform: &'static str,
@@ -778,6 +907,7 @@ mod tests {
             &BTreeSet::new(),
             &trusted_queries,
             &adapters,
+            None,
         )
         .await;
         (result, calls.load(Ordering::SeqCst))
@@ -859,6 +989,7 @@ mod tests {
             &BTreeSet::new(),
             &allowed,
             &BTreeMap::new(),
+            None,
         )
         .await;
         assert!(

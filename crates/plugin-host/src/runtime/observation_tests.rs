@@ -476,6 +476,7 @@ async fn scheduled_and_recovered_direct_sends_keep_source_event_and_action_ident
             "background-event",
             invocation,
             command,
+            None,
         )
         .await
         .unwrap();

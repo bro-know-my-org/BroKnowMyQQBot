@@ -4,6 +4,7 @@ mod command;
 mod management;
 #[cfg(test)]
 mod management_tests;
+mod media;
 mod observation;
 #[cfg(test)]
 mod observation_tests;
@@ -984,7 +985,7 @@ impl StaticPluginHost {
             let started = std::time::Instant::now();
             let result = async {
                 let result = async {
-                    let (output, declared_command) = self
+                    let (output, declared_command, validated_images) = self
                         .invoke_envelope(plugin, &envelope, caller_authority)
                         .await?;
                     let observation =
@@ -998,6 +999,7 @@ impl StaticPluginHost {
                             &envelope.delivery_id,
                             &envelope.invocation_id,
                             output,
+                            validated_images,
                         )
                         .await?;
                     observation.completed(started.elapsed());
@@ -1308,7 +1310,9 @@ impl StaticPluginHost {
         plugin: &RegisteredPlugin,
         envelope: &PluginEventEnvelope,
         caller_authority: &CallerAuthority,
-    ) -> Result<(HandlerOutput, bool), PluginHostError> {
+    ) -> Result<(HandlerOutput, bool, BTreeMap<String, media::ValidatedImage>), PluginHostError>
+    {
+        let deadline = tokio::time::Instant::now() + plugin.manifest.timeout();
         let state = self.store.snapshot(&plugin.instance_id)?;
         let config = plugin.config_snapshot()?;
         let command_prefix = self.command_prefix();
@@ -1348,7 +1352,7 @@ impl StaticPluginHost {
             status = "invoked",
             "plugin invoked"
         );
-        let output = timeout(plugin.manifest.timeout(), invocation)
+        let output = tokio::time::timeout_at(deadline, invocation)
             .await
             .map_err(|_| PluginHostError::Timeout {
                 plugin_id: plugin.manifest.id.to_string(),
@@ -1377,9 +1381,34 @@ impl StaticPluginHost {
                 },
             })?;
         validate_output(plugin, &output)?;
-        Ok((output, declared_command))
+        let validated_images = tokio::time::timeout_at(deadline, async {
+            let mut images = BTreeMap::new();
+            for command in &output.commands {
+                if command.kind == "media.create" {
+                    let image = media::validate_create_async(command.payload.clone())
+                        .await
+                        .map_err(|error| PluginHostError::InvalidOutput {
+                            plugin_id: plugin.manifest.id.to_string(),
+                            message: error.to_string(),
+                        })?;
+                    images.insert(command.command_id.clone(), image);
+                }
+            }
+            Ok::<_, PluginHostError>(images)
+        })
+        .await
+        .map_err(|_| PluginHostError::Timeout {
+            plugin_id: plugin.manifest.id.to_string(),
+        })??;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(PluginHostError::Timeout {
+                plugin_id: plugin.manifest.id.to_string(),
+            });
+        }
+        Ok((output, declared_command, validated_images))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn commit_and_execute(
         &self,
         plugin: &Arc<RegisteredPlugin>,
@@ -1388,6 +1417,7 @@ impl StaticPluginHost {
         delivery_id: &str,
         invocation_id: &str,
         output: HandlerOutput,
+        mut validated_images: BTreeMap<String, media::ValidatedImage>,
     ) -> Result<VecDeque<ActionCompleted>, PluginHostError> {
         let outbox_origin = origin.outbox_origin(source_event_id);
         let commands = self.store.commit(
@@ -1401,9 +1431,17 @@ impl StaticPluginHost {
         )?;
         let mut completions = VecDeque::new();
         for command in commands {
+            let image = validated_images.remove(&command.command_id);
             completions.push_back(
-                self.execute_command(plugin, origin, source_event_id, invocation_id, command)
-                    .await?,
+                self.execute_command(
+                    plugin,
+                    origin,
+                    source_event_id,
+                    invocation_id,
+                    command,
+                    image,
+                )
+                .await?,
             );
         }
         Ok(completions)
@@ -1416,11 +1454,19 @@ impl StaticPluginHost {
         source_event_id: &str,
         invocation_id: &str,
         command: PluginCommand,
+        validated_image: Option<media::ValidatedImage>,
     ) -> Result<ActionCompleted, PluginHostError> {
         let span = observation::action_span(plugin, source_event_id, invocation_id, &command);
-        self.execute_command_observed(plugin, origin, source_event_id, invocation_id, command)
-            .instrument(span)
-            .await
+        self.execute_command_observed(
+            plugin,
+            origin,
+            source_event_id,
+            invocation_id,
+            command,
+            validated_image,
+        )
+        .instrument(span)
+        .await
     }
 
     async fn execute_command_observed(
@@ -1430,6 +1476,7 @@ impl StaticPluginHost {
         source_event_id: &str,
         invocation_id: &str,
         command: PluginCommand,
+        validated_image: Option<media::ValidatedImage>,
     ) -> Result<ActionCompleted, PluginHostError> {
         let started = std::time::Instant::now();
         let execution = async {
@@ -1450,6 +1497,7 @@ impl StaticPluginHost {
                         &plugin.granted_capabilities,
                         &plugin.trusted_platform_queries,
                         &self.adapters,
+                        validated_image,
                     )
                     .await
                 }
@@ -2778,6 +2826,88 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn image_validation_shares_the_handler_deadline_when_decoder_is_busy() {
+        use super::media;
+        use std::time::Duration;
+        use tokio::time::sleep;
+        struct SlowImage(PluginManifest, bool);
+        #[async_trait::async_trait]
+        impl StaticPlugin for SlowImage {
+            fn manifest(&self) -> &PluginManifest {
+                &self.0
+            }
+            async fn on_event(
+                &self,
+                _: &PluginEventEnvelope,
+                _: &dyn HostQueries,
+            ) -> Result<HandlerOutput, PluginError> {
+                use base64::Engine as _;
+                if self.1 {
+                    std::thread::sleep(Duration::from_millis(20));
+                    return Ok(HandlerOutput::default());
+                }
+                sleep(Duration::from_millis(80)).await;
+                let mut png = std::io::Cursor::new(Vec::new());
+                image::DynamicImage::new_rgb8(1, 1)
+                    .write_to(&mut png, image::ImageFormat::Png)
+                    .unwrap();
+                Ok(HandlerOutput {
+                    commands: vec![PluginCommand {
+                        command_id: "image".into(),
+                        kind: "media.create".into(),
+                        idempotency_key: None,
+                        deadline_ms: None,
+                        payload: json!({"mime_type":"image/png","data_base64":base64::engine::general_purpose::STANDARD.encode(png.into_inner())}),
+                    }],
+                    ..HandlerOutput::default()
+                })
+            }
+        }
+        let _slot = media::decoder_slots()
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut plugin = plugin_without_grants();
+        plugin.manifest.protocol = ">=1.5,<2.0".into();
+        plugin.manifest.runtime.timeout_ms = 100;
+        plugin
+            .manifest
+            .permissions
+            .actions
+            .insert("media.create".into());
+        plugin.granted_capabilities = plugin.manifest.requested_capabilities();
+        plugin.plugin = Arc::new(SlowImage(plugin.manifest.clone(), false));
+        let host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+        let envelope = PluginEventEnvelope {
+            protocol_version: plugin_api::BPP_VERSION.into(),
+            event_id: "deadline".into(),
+            delivery_id: "deadline".into(),
+            invocation_id: "deadline".into(),
+            occurred_at_ms: None,
+            received_at_ms: 0,
+            adapter_id: "mock".into(),
+            event_type: "message.created".into(),
+            trace_id: None,
+            payload: Value::Null,
+            extensions: vec![],
+        };
+        let started = tokio::time::Instant::now();
+        let result = host
+            .invoke_envelope(&plugin, &envelope, &CallerAuthority::default())
+            .await;
+        assert!(matches!(result, Err(PluginHostError::Timeout { .. })));
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        tokio::time::resume();
+        plugin.manifest.runtime.timeout_ms = 1;
+        plugin.plugin = Arc::new(SlowImage(plugin.manifest.clone(), true));
+        let result = host
+            .invoke_envelope(&plugin, &envelope, &CallerAuthority::default())
+            .await;
+        assert!(matches!(result, Err(PluginHostError::Timeout { .. })));
+    }
+
     #[tokio::test]
     async fn command_queries_keep_raw_messages_and_snapshot_shared_prefix() {
         struct Probe {
@@ -2914,7 +3044,7 @@ mod tests {
                 .unwrap(),
                 extensions: Vec::new(),
             };
-            let (output, _) = host
+            let (output, _, _) = host
                 .invoke_envelope(&host.plugins[0], &envelope, &CallerAuthority::default())
                 .await
                 .unwrap();
@@ -2954,7 +3084,7 @@ mod tests {
         };
         for enabled in [true, false, true] {
             host.set_instance_enabled("ping", enabled).await.unwrap();
-            let (output, _) = host
+            let (output, _, _) = host
                 .invoke_envelope(&host.plugins[0], &envelope, &CallerAuthority::default())
                 .await
                 .unwrap();
