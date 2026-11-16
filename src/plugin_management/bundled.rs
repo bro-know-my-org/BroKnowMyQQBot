@@ -149,9 +149,13 @@ impl PluginManager {
         let mut document = source
             .parse::<toml_edit::DocumentMut>()
             .map_err(|_| ManagementError::BundledUnavailable)?;
-        document["bundled"] = toml_edit::value(toml_edit::Array::from_iter(
-            settings.selected.iter().map(String::as_str),
-        ));
+        document["bundled"] = toml_edit::value(
+            settings
+                .selected
+                .iter()
+                .map(String::as_str)
+                .collect::<toml_edit::Array>(),
+        );
         if let Some(value) = change.config.as_ref() {
             // Replace the whole target config so deleted optional fields do not survive.
             let encoded = toml::to_string(value).map_err(|_| ManagementError::InvalidConfig)?;
