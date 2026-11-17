@@ -1,5 +1,6 @@
 //! SQLite-backed BPP private state, command ledger, and outbox.
 
+mod management;
 mod status;
 pub use status::PluginInstallationStatus;
 
@@ -346,6 +347,7 @@ impl PluginStore {
              ON plugin_deliveries(instance_id, status);",
         )?;
         migrate_installation_metadata(&connection)?;
+        management::initialize(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -461,7 +463,7 @@ impl PluginStore {
             apply_state_op(&transaction, instance_id, operation)?;
         }
         let (entries, used): (u64, u64) = transaction.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(length(key) + length(value)), 0)
+            "SELECT COUNT(*), COALESCE(SUM(length(CAST(key AS BLOB)) + length(value)), 0)
              FROM plugin_state WHERE instance_id = ?",
             [instance_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
