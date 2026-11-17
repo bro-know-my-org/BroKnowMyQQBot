@@ -10,6 +10,7 @@ pub(crate) mod marketplace_install;
 mod marketplace_version;
 mod operations;
 pub(crate) mod permissions;
+pub(crate) mod resources;
 mod restore;
 pub(crate) mod status;
 
@@ -38,6 +39,12 @@ use tokio::{
 
 #[derive(Debug, Error)]
 pub(crate) enum ManagementError {
+    #[error("插件未提供此数据管理能力")]
+    ResourcesUnsupported,
+    #[error("插件数据校验失败，请检查字段、记录是否存在及插件约束")]
+    InvalidResourceData,
+    #[error("插件数据管理执行失败，未确认保存；请重新读取并检查插件状态")]
+    ResourceFailed,
     #[error(
         "存在无法验证插件身份的孤立私有数据，无法生成可验证恢复包；数据已保留，请核对已卸载实例"
     )]
@@ -92,7 +99,10 @@ pub(crate) enum ManagementError {
 
 impl From<StoreError> for ManagementError {
     fn from(error: StoreError) -> Self {
-        if matches!(error, StoreError::InstallationConflict) {
+        if matches!(
+            error,
+            StoreError::InstallationConflict | StoreError::CasConflict(_)
+        ) {
             Self::Conflict
         } else {
             Self::Store

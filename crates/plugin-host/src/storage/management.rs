@@ -305,4 +305,26 @@ mod tests {
         assert_eq!(snapshot_revision, revision);
         assert_eq!(state["large"].value, large);
     }
+
+    #[test]
+    fn externally_overfull_snapshot_is_rejected_instead_of_truncated() {
+        let store = PluginStore::in_memory().unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for index in 0..=MAX_STATE_ENTRIES {
+                transaction
+                    .execute(
+                        "INSERT INTO plugin_state VALUES ('a', ?, x'61', 1)",
+                        [format!("row/{index}")],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert!(matches!(
+            store.management_snapshot("a"),
+            Err(StoreError::StateEntryLimit(4097))
+        ));
+    }
 }

@@ -14,6 +14,7 @@ mod marketplace;
 mod message_flow_tests;
 mod permissions;
 mod plugin_operations;
+mod plugin_resources;
 mod plugins;
 mod restart;
 mod restores;
@@ -22,6 +23,14 @@ mod settings;
 mod status_stream;
 mod system_settings;
 pub(crate) use auth::SessionHandoff;
+
+#[cfg(test)]
+pub(crate) fn plugin_test_router(
+    manager: crate::plugin_management::PluginManager,
+    token: &str,
+) -> axum::Router {
+    plugins::router(manager, plugins::token_digest(token).unwrap())
+}
 
 use std::{net::SocketAddr, sync::Arc, thread, time::Duration};
 

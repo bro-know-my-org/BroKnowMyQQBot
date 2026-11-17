@@ -86,6 +86,14 @@ pub(super) fn router_with_runtime(
         .route("/api/marketplace/details", get(super::marketplace::details))
         .route("/api/plugins", get(list))
         .route(
+            "/api/plugins/management",
+            get(super::plugin_resources::descriptor),
+        )
+        .route(
+            "/api/plugins/management/resource",
+            get(super::plugin_resources::list).post(super::plugin_resources::write),
+        )
+        .route(
             "/api/plugins/bundled",
             get(super::bundled::get).post(super::bundled::save),
         )
@@ -277,9 +285,9 @@ impl IntoResponse for ApiError {
             }
             ManagementError::ExpiredSelection => StatusCode::GONE,
             ManagementError::Store => StatusCode::INTERNAL_SERVER_ERROR,
-            ManagementError::Lifecycle | ManagementError::MarketplaceUnavailable => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            ManagementError::Lifecycle
+            | ManagementError::MarketplaceUnavailable
+            | ManagementError::ResourceFailed => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
         (status, Json(json!({"error":self.0.to_string()}))).into_response()
@@ -360,6 +368,9 @@ mod tests {
     async fn all_plugin_operations_require_bearer_auth_before_body_parsing() {
         for (path, method) in [
             ("/api/plugins", "GET"),
+            ("/api/plugins/management", "GET"),
+            ("/api/plugins/management/resource", "GET"),
+            ("/api/plugins/management/resource", "POST"),
             ("/api/logs", "GET"),
             ("/api/plugins/config", "POST"),
             ("/api/plugins/enabled", "POST"),
