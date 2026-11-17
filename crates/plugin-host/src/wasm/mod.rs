@@ -4,6 +4,9 @@
 
 mod compat;
 mod conversion;
+mod management;
+#[cfg(test)]
+mod management_tests;
 
 use conversion::{
     config_entries, guest_error, handler_output, runtime_error, state_entries, state_op, wit_event,
@@ -32,7 +35,7 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsB
 
 wasmtime::component::bindgen!({
     path: "../plugin-api/wit",
-    world: "plugin",
+    world: "managed-plugin",
     async: true,
 });
 
@@ -204,6 +207,9 @@ struct WasmInstance {
 pub struct WasmPlugin {
     manifest: PluginManifest,
     config_schema: Option<Value>,
+    management_schema: Option<plugin_api::ManagementDescriptor>,
+    component: Component,
+    assets: BTreeMap<String, Vec<u8>>,
     engine: Engine,
     fuel: u64,
     timeout: Duration,
@@ -224,10 +230,11 @@ impl std::fmt::Debug for WasmPlugin {
 
 impl WasmPlugin {
     pub async fn from_package(package: ValidatedPluginPackage) -> Result<Self, WasmPluginError> {
-        let (manifest, config_schema, assets, engine, component) =
+        let (manifest, config_schema, management_schema, assets, engine, component) =
             tokio::task::spawn_blocking(move || {
                 let manifest = package.manifest().clone();
                 let config_schema = package.config_schema().cloned();
+                let management_schema = package.management_schema().cloned();
                 let assets = package
                     .files()
                     .filter(|(path, _)| path.starts_with("assets/"))
@@ -241,12 +248,39 @@ impl WasmPlugin {
                 let engine = Engine::new(&config).map_err(WasmPluginError::Wasmtime)?;
                 let component = Component::new(&engine, package.component())
                     .map_err(WasmPluginError::Wasmtime)?;
-                Ok::<_, WasmPluginError>((manifest, config_schema, assets, engine, component))
+                Ok::<_, WasmPluginError>((
+                    manifest,
+                    config_schema,
+                    management_schema,
+                    assets,
+                    engine,
+                    component,
+                ))
             })
             .await
             .map_err(WasmPluginError::PreparationTask)??;
-        let mut linker = Linker::new(&engine);
-        Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        let instance = Self::instantiate(&engine, &component, &manifest, &assets).await?;
+        Ok(Self {
+            fuel: manifest.runtime.fuel,
+            timeout: manifest.timeout(),
+            manifest,
+            config_schema,
+            management_schema,
+            component,
+            assets,
+            engine,
+            instance: Mutex::new(instance),
+        })
+    }
+
+    async fn instantiate(
+        engine: &Engine,
+        component: &Component,
+        manifest: &PluginManifest,
+        assets: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<WasmInstance, WasmPluginError> {
+        let mut linker = Linker::new(engine);
+        ManagedPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(WasmPluginError::Wasmtime)?;
         let memory_bytes = usize::try_from(manifest.runtime.memory_mb)
             .unwrap_or(usize::MAX)
@@ -258,11 +292,11 @@ impl WasmPlugin {
             .trap_on_grow_failure(true)
             .build();
         let mut store = Store::new(
-            &engine,
+            engine,
             StoreData {
                 config: BTreeMap::new(),
                 state: BTreeMap::new(),
-                assets,
+                assets: assets.clone(),
                 granted_capabilities: BTreeSet::new(),
                 invocation_time_ms: 0,
                 caller_authority: CallerAuthority::default(),
@@ -275,7 +309,7 @@ impl WasmPlugin {
             },
         );
         store.limiter(|state| &mut state.limits);
-        store.set_epoch_deadline(u64::MAX);
+        store.set_epoch_deadline(1);
         store
             .set_fuel(manifest.runtime.fuel)
             .map_err(WasmPluginError::Wasmtime)?;
@@ -283,19 +317,12 @@ impl WasmPlugin {
             .fuel_async_yield_interval(Some(10_000))
             .map_err(WasmPluginError::Wasmtime)?;
         let instance = linker
-            .instantiate_async(&mut store, &component)
+            .instantiate_async(&mut store, component)
             .await
             .map_err(WasmPluginError::Wasmtime)?;
         let bindings =
             compat::Bindings::new(&mut store, &instance).map_err(WasmPluginError::Wasmtime)?;
-        Ok(Self {
-            fuel: manifest.runtime.fuel,
-            timeout: manifest.timeout(),
-            manifest,
-            config_schema,
-            engine,
-            instance: Mutex::new(WasmInstance { store, bindings }),
-        })
+        Ok(WasmInstance { store, bindings })
     }
 
     async fn lock_instance(&self) -> tokio::sync::MutexGuard<'_, WasmInstance> {
@@ -312,16 +339,29 @@ impl WasmPlugin {
         store.set_epoch_deadline(1);
         let engine = self.engine.clone();
         let timeout = self.timeout;
+        let active = std::sync::Arc::new(std::sync::Mutex::new(true));
+        let timer_active = active.clone();
         let timer = tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            engine.increment_epoch();
+            // Fence the synchronous epoch increment with Drop, including when a
+            // cancellation races a timer already running on another thread.
+            let active = timer_active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *active {
+                engine.increment_epoch();
+            }
         });
-        Ok(EpochDeadline { timer: Some(timer) })
+        Ok(EpochDeadline {
+            timer: Some(timer),
+            active,
+        })
     }
 }
 
 struct EpochDeadline {
     timer: Option<tokio::task::JoinHandle<()>>,
+    active: std::sync::Arc<std::sync::Mutex<bool>>,
 }
 
 impl EpochDeadline {
@@ -335,6 +375,10 @@ impl EpochDeadline {
 
 impl Drop for EpochDeadline {
     fn drop(&mut self) {
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
         if let Some(timer) = &self.timer {
             timer.abort();
         }
@@ -357,6 +401,18 @@ impl StaticPlugin for WasmPlugin {
 
     fn config_schema(&self) -> Option<&Value> {
         self.config_schema.as_ref()
+    }
+
+    fn management_schema(&self) -> Option<&plugin_api::ManagementDescriptor> {
+        self.management_schema.as_ref()
+    }
+
+    async fn manage(
+        &self,
+        request: &plugin_api::ManagementRequest,
+        queries: &dyn HostQueries,
+    ) -> Result<plugin_api::ManagementResponse, plugin_api::ManagementError> {
+        self.invoke_management(request, queries).await
     }
 
     async fn validate_config(&self, config: &BTreeMap<String, Value>) -> Result<(), PluginError> {

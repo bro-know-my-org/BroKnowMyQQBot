@@ -55,6 +55,7 @@ type LegacyHandler =
 pub(super) struct Bindings {
     lifecycle: exports::bkm::plugin::lifecycle::Guest,
     handler: Handler,
+    pub(super) management: Option<exports::bkm::plugin::management::Guest>,
 }
 
 enum Handler {
@@ -88,7 +89,23 @@ impl Bindings {
                     Handler::Legacy(function)
                 }
             };
-        Ok(Self { lifecycle, handler })
+        let management = if pre
+            .component()
+            .get_export_index(None, "bkm:plugin/management@1.6.0")
+            .is_some()
+        {
+            Some(
+                exports::bkm::plugin::management::GuestIndices::new(&pre)?
+                    .load(&mut *store, instance)?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            lifecycle,
+            handler,
+            management,
+        })
     }
 
     pub(super) fn bkm_plugin_lifecycle(&self) -> &exports::bkm::plugin::lifecycle::Guest {
