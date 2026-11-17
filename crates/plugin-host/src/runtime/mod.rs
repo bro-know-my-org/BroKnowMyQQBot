@@ -8,12 +8,14 @@ mod media;
 mod observation;
 #[cfg(test)]
 mod observation_tests;
+mod resources;
 #[cfg(test)]
 mod upgrade_tests;
 mod validation;
 
 use management::LifecycleTransition;
 pub use management::{PluginInstanceSnapshot, PluginInstanceStatus};
+pub use resources::{PluginManagementLease, invoke_management};
 
 use command::{action_status_name, execute_context_command, failed_completion};
 use validation::{
@@ -2393,6 +2395,9 @@ struct InvocationQueries<'a> {
 }
 
 impl HostQueries for InvocationQueries<'_> {
+    fn config_snapshot(&self) -> BTreeMap<String, Value> {
+        self.config.clone()
+    }
     fn command_declarations(&self) -> Option<Vec<CommandDeclaration>> {
         Some(self.command_declarations.clone())
     }

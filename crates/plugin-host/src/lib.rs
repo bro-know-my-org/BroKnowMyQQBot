@@ -19,8 +19,8 @@ pub use http::{HttpExecutionError, HttpExecutor, SecureHttpExecutor};
 pub use package::{MAX_PLUGIN_PACKAGE_BYTES, PluginPackageError, ValidatedPluginPackage};
 pub use runtime::{
     PluginHostError, PluginInstanceSnapshot, PluginInstanceState, PluginInstanceStatus,
-    StaticPluginHost, TrustedAuthorityProvider, TrustedPlatformQuery, TrustedPluginCapabilities,
-    validate_plugin_config,
+    PluginManagementLease, StaticPluginHost, TrustedAuthorityProvider, TrustedPlatformQuery,
+    TrustedPluginCapabilities, invoke_management, validate_plugin_config,
 };
 pub use storage::{
     CommitOptions, DeadLetter, FailedDelivery, FailedDeliveryPage, LogicalArchive,
