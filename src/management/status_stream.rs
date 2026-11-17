@@ -68,8 +68,8 @@ impl Worker {
                 }} => {
                 sample = None;
                 match result {
-                    Ok((rows, truncated, bundled_revision)) => {
-                        plugins = json!({"plugins": rows, "plugins_truncated": truncated, "bundled_revision": bundled_revision});
+                    Ok((rows, truncated, bundled_revision, data_revisions)) => {
+                        plugins = json!({"plugins": rows, "plugins_truncated": truncated, "bundled_revision": bundled_revision, "plugin_data_revisions":data_revisions});
                         failed = false;
                     }
                     Err(_) => {

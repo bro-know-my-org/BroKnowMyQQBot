@@ -68,6 +68,43 @@ fn data(frame: &str) -> Value {
 }
 
 #[tokio::test]
+async fn private_state_changes_push_revision_without_payload_or_plugin_config_refresh() {
+    let fixture = crate::plugin_configuration::fixture::Fixture::new(false);
+    let manager = fixture.manager().await;
+    let id = &fixture.installation.instance_id;
+    let (app, task, stop) = self::fixture(manager.clone(), RuntimeObserver::new(), auth(), None);
+    let mut stream = open(&app).await.into_body().into_data_stream();
+    let first = data(&frame(&mut stream).await);
+    assert_eq!(first["plugin_data_revisions"][id], "0");
+    std::fs::remove_file(&fixture.installation.package_path).unwrap();
+    fixture
+        .store
+        .commit(
+            id,
+            "chat-state",
+            &[plugin_api::StateOp::Put {
+                key: "repos/PRIVATE-KEY".into(),
+                value: b"never-push-private-payload".to_vec(),
+                expected_revision: None,
+            }],
+            &[],
+            plugin_host::CommitOptions::new(1024),
+        )
+        .unwrap();
+    let changed = data(&frame(&mut stream).await);
+    assert_ne!(
+        changed["plugin_data_revisions"][id],
+        first["plugin_data_revisions"][id]
+    );
+    assert_eq!(changed["plugins"], first["plugins"]);
+    assert!(!changed.to_string().contains("never-push-private-payload"));
+    assert!(!changed.to_string().contains("PRIVATE-KEY"));
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    manager.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn disabled_bundled_configuration_changes_push_only_a_safe_revision() {
     let directory = std::env::temp_dir().join(format!("bundled-status-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&directory).unwrap();
@@ -275,7 +312,7 @@ async fn status_truncation_is_explicit_and_does_not_read_plugin_packages() {
         fixture.store.upsert_installation(&row).unwrap();
     }
     std::fs::remove_file(&fixture.installation.package_path).unwrap();
-    let (plugins, truncated, _) = manager.status().await.unwrap();
+    let (plugins, truncated, _, _) = manager.status().await.unwrap();
     assert!(truncated);
     assert_eq!(plugins.len(), 256);
     let encoded = serde_json::to_value(plugins).unwrap();

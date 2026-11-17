@@ -21,7 +21,12 @@ pub(crate) struct PluginStatus {
     pub(super) updated_at_ms: i64,
 }
 
-pub(crate) type Sample = (Vec<PluginStatus>, bool, Option<String>);
+pub(crate) type Sample = (
+    Vec<PluginStatus>,
+    bool,
+    Option<String>,
+    BTreeMap<String, String>,
+);
 
 impl PluginManager {
     pub(crate) async fn status(&self) -> Result<Sample, ManagementError> {
@@ -94,11 +99,10 @@ impl PluginManager {
                         views.insert(item.instance_id.clone(), item);
                     }
                     let truncated = views.len() > MAX_PLUGINS || loaded.len() > MAX_PLUGINS;
-                    Ok((
-                        views.into_values().take(MAX_PLUGINS).collect(),
-                        truncated,
-                        revision,
-                    ))
+                    let rows: Vec<_> = views.into_values().take(MAX_PLUGINS).collect();
+                    let ids: Vec<_> = rows.iter().map(|row| row.instance_id.clone()).collect();
+                    let data_revisions = store.management_revisions(&ids)?;
+                    Ok((rows, truncated, revision, data_revisions))
                 })();
                 let _ = send.send(result);
             })

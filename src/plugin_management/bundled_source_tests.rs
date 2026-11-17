@@ -166,7 +166,7 @@ async fn list_status_and_catalogue_agree_on_saved_enable_and_configuration_chang
         help.config,
         BTreeMap::from([("test".into(), json!("saved"))])
     );
-    let (rows, _, revision) = manager.status().await.unwrap();
+    let (rows, _, revision, _) = manager.status().await.unwrap();
     let rows = serde_json::to_value(rows).unwrap();
     let help = rows
         .as_array()
