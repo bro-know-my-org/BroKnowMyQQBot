@@ -20,6 +20,7 @@ fn formal_wit_contract_parses_with_expected_identity() {
         Some(plugin_api::BPP_VERSION.to_owned())
     );
     assert!(package.worlds.contains_key("plugin"));
+    assert_management_contract(&resolve, package);
     assert!(package.interfaces.contains_key("types"));
     assert!(package.interfaces.contains_key("queries"));
     assert!(package.interfaces.contains_key("lifecycle"));
@@ -90,4 +91,22 @@ fn formal_wit_contract_parses_with_expected_identity() {
             Some(expected_payload)
         );
     }
+}
+
+fn assert_management_contract(resolve: &Resolve, package: &wit_parser::Package) {
+    assert!(package.worlds.contains_key("managed-plugin"));
+    let management = &resolve.interfaces[package.interfaces["management"]];
+    assert_eq!(management.functions.len(), 1);
+    assert!(management.functions.contains_key("invoke"));
+    let TypeDefKind::Record(response) = &resolve.types[management.types["response"]].kind else {
+        panic!("management response must be a record");
+    };
+    assert_eq!(
+        response
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        ["data", "state-ops"]
+    );
 }

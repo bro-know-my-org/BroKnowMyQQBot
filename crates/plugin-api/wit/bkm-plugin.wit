@@ -1,4 +1,4 @@
-package bkm:plugin@1.5.0;
+package bkm:plugin@1.6.0;
 
 interface types {
     record command-context {
@@ -363,4 +363,20 @@ world plugin {
     import queries;
     export lifecycle;
     export handler;
+}
+
+interface management {
+    use types.{encoded-value, state-op};
+    record response {
+        data: encoded-value,
+        state-ops: list<state-op>,
+    }
+    enum error-code { invalid-argument, not-found, conflict, unsupported, internal }
+    record error { code: error-code, message: string }
+    invoke: func(request: encoded-value) -> result<response, error>;
+}
+
+world managed-plugin {
+    include plugin;
+    export management;
 }

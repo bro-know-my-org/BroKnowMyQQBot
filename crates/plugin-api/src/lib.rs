@@ -4,6 +4,7 @@
 
 mod command;
 mod id;
+mod management;
 mod manifest;
 mod protocol;
 
@@ -12,6 +13,7 @@ pub use command::{
     validate_command_prefix,
 };
 pub use id::{PluginId, PluginIdError};
+pub use management::*;
 pub use manifest::{
     Audience, BrowserPermission, CommandDeclaration, HttpPermission, LocalizedPluginMetadata,
     ManifestError, PluginManifest, PluginMetadata, PluginPermissions, PluginRuntimeConfig,
@@ -27,4 +29,4 @@ pub use protocol::{
     ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 
-pub const BPP_VERSION: &str = "1.5.0";
+pub const BPP_VERSION: &str = "1.6.0";

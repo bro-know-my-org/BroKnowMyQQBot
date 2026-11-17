@@ -374,6 +374,10 @@ impl Default for CallerAuthority {
 }
 
 pub trait HostQueries: Send + Sync {
+    /// Complete validated configuration for detached management invocations.
+    fn config_snapshot(&self) -> BTreeMap<String, Value> {
+        BTreeMap::new()
+    }
     /// Current Ready command catalog, if this Host provides discovery.
     fn command_declarations(&self) -> Option<Vec<CommandDeclaration>> {
         None
@@ -434,6 +438,21 @@ pub enum PluginError {
 #[async_trait]
 pub trait StaticPlugin: Send + Sync + 'static {
     fn manifest(&self) -> &PluginManifest;
+
+    fn management_schema(&self) -> Option<&crate::ManagementDescriptor> {
+        None
+    }
+
+    async fn manage(
+        &self,
+        _request: &crate::ManagementRequest,
+        _queries: &dyn HostQueries,
+    ) -> Result<crate::ManagementResponse, crate::ManagementError> {
+        Err(crate::ManagementError::new(
+            crate::ManagementErrorCode::Unsupported,
+            "plugin management is unsupported",
+        ))
+    }
 
     /// Returns the optional JSON Schema used by the Host before `validate_config`.
     ///
