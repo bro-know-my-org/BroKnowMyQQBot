@@ -145,13 +145,13 @@ async fn detached_manage_preloads_config_state_without_init_or_chat_identity() {
             }
         ));
     }
-    assert!(
+    assert_eq!(
         plugin
             .manage(&request(ManagementOperation::List, ""), &queries)
             .await
             .unwrap()
-            .state_ops
-            .is_empty()
+            .state_ops,
+        Vec::<StateOp>::new()
     );
     let conflict = plugin
         .manage(
