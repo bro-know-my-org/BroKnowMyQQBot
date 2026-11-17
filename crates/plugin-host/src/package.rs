@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-use plugin_api::PluginManifest;
+use plugin_api::{MAX_MANAGEMENT_DESCRIPTOR_BYTES, ManagementDescriptor, PluginManifest};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -25,6 +25,7 @@ pub struct ValidatedPluginPackage {
     package_sha256: String,
     files: BTreeMap<String, Vec<u8>>,
     config_schema: Option<Value>,
+    management_schema: Option<ManagementDescriptor>,
 }
 
 impl std::fmt::Debug for ValidatedPluginPackage {
@@ -35,6 +36,7 @@ impl std::fmt::Debug for ValidatedPluginPackage {
             .field("package_sha256", &self.package_sha256)
             .field("file_count", &self.files.len())
             .field("has_config_schema", &self.config_schema.is_some())
+            .field("has_management_schema", &self.management_schema.is_some())
             .finish()
     }
 }
@@ -91,6 +93,11 @@ impl ValidatedPluginPackage {
                 continue;
             }
             let file_size = usize::try_from(file.size()).unwrap_or(usize::MAX);
+            if path == "management.schema.json" && file_size > MAX_MANAGEMENT_DESCRIPTOR_BYTES {
+                return Err(PluginPackageError::ManagementSchema(
+                    "descriptor exceeds 64 KiB".into(),
+                ));
+            }
             if file_size > MAX_FILE_BYTES {
                 return Err(PluginPackageError::FileTooLarge {
                     path,
@@ -138,12 +145,17 @@ impl ValidatedPluginPackage {
             .get("config.schema.json")
             .map(|schema| validate_config_schema(schema))
             .transpose()?;
+        let management_schema = files
+            .get("management.schema.json")
+            .map(|bytes| validate_management_schema(bytes))
+            .transpose()?;
 
         Ok(Self {
             manifest,
             package_sha256,
             files,
             config_schema,
+            management_schema,
         })
     }
 
@@ -163,6 +175,10 @@ impl ValidatedPluginPackage {
 
     pub const fn config_schema(&self) -> Option<&Value> {
         self.config_schema.as_ref()
+    }
+
+    pub const fn management_schema(&self) -> Option<&ManagementDescriptor> {
+        self.management_schema.as_ref()
     }
 
     pub fn file(&self, path: &str) -> Option<&[u8]> {
@@ -224,6 +240,24 @@ pub enum PluginPackageError {
     ConfigSchemaTooLarge(usize),
     #[error("config.schema.json is invalid: {0}")]
     ConfigSchema(String),
+    #[error("management.schema.json is invalid: {0}")]
+    ManagementSchema(String),
+}
+
+fn validate_management_schema(bytes: &[u8]) -> Result<ManagementDescriptor, PluginPackageError> {
+    let invalid = |message| PluginPackageError::ManagementSchema(message);
+    if bytes.len() > MAX_MANAGEMENT_DESCRIPTOR_BYTES {
+        return Err(invalid("descriptor exceeds 64 KiB".into()));
+    }
+    let descriptor: ManagementDescriptor =
+        serde_json::from_slice(bytes).map_err(|error| invalid(error.to_string()))?;
+    descriptor
+        .validate()
+        .map_err(|error| invalid(error.to_string()))?;
+    for resource in &descriptor.resources {
+        jsonschema::validator_for(&resource.schema).map_err(|error| invalid(error.to_string()))?;
+    }
+    Ok(descriptor)
 }
 
 fn normalized_archive_path(name: &str, directory: bool) -> Result<String, PluginPackageError> {
@@ -357,6 +391,59 @@ mod tests {
             ),
             ("assets/readme.txt", b"fixture asset"),
         ]
+    }
+
+    #[test]
+    fn optional_management_descriptor_is_validated_and_exposed() {
+        let schema = br##"{"schema_version":1,"resources":[{"id":"repos","title":"Repos","schema":{"type":"object","properties":{"alias":{"$ref":"#/$defs/name"}},"$defs":{"name":{"type":"string"}}},"columns":[{"key":"alias","title":"Alias"}],"operations":["list","create"]}]}"##;
+        let mut entries = valid_entries();
+        assert!(
+            ValidatedPluginPackage::from_bytes(&package(&entries))
+                .unwrap()
+                .management_schema()
+                .is_none()
+        );
+        entries.push(("management.schema.json", schema));
+        let validated = ValidatedPluginPackage::from_bytes(&package(&entries)).unwrap();
+        assert_eq!(
+            validated.management_schema().unwrap().resources[0].id,
+            "repos"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_unbounded_management_descriptors() {
+        let resource = serde_json::json!({"id":"repos","title":"Repos","schema":{"type":"object"},"columns":[],"operations":["list"]});
+        let descriptor = serde_json::json!({"schema_version":1,"resources":[resource]});
+        let mut cases = vec![serde_json::json!({"schema_version":2,"resources":[]})];
+        for schema in [
+            serde_json::json!({"type":"imaginary"}),
+            serde_json::json!({"$ref":"https://example.com/schema"}),
+            serde_json::json!({"properties":{"nested":{"$dynamicRef":"file:///etc/passwd"}}}),
+            serde_json::json!({"description":"x".repeat(65536)}),
+        ] {
+            let mut invalid = descriptor.clone();
+            invalid["resources"][0]["schema"] = schema;
+            cases.push(invalid);
+        }
+        let mut duplicate = descriptor.clone();
+        duplicate["resources"]
+            .as_array_mut()
+            .unwrap()
+            .push(descriptor["resources"][0].clone());
+        cases.push(duplicate);
+        let mut too_many = descriptor.clone();
+        too_many["resources"] = serde_json::json!(vec![descriptor["resources"][0].clone(); 17]);
+        cases.push(too_many);
+        for invalid in cases {
+            let bytes = serde_json::to_vec(&invalid).unwrap();
+            let mut entries = valid_entries();
+            entries.push(("management.schema.json", &bytes));
+            assert!(matches!(
+                ValidatedPluginPackage::from_bytes(&package(&entries)),
+                Err(PluginPackageError::ManagementSchema(_))
+            ));
+        }
     }
 
     #[test]

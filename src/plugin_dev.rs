@@ -2363,7 +2363,12 @@ fn write_package_archive(
         options,
     )?;
     add_file(&mut archive, component_path, "component.wasm", options)?;
-    for optional in ["config.schema.json", "README.md", "LICENSE"] {
+    for optional in [
+        "config.schema.json",
+        "management.schema.json",
+        "README.md",
+        "LICENSE",
+    ] {
         let source = project.join(optional);
         if source.is_file() {
             add_file(&mut archive, &source, optional, options)?;
@@ -3888,6 +3893,37 @@ mod tests {
         assert!(!is_rust_identifier("struct"));
         assert!(!is_rust_identifier("_"));
         assert!(is_rust_identifier("WeatherPlugin"));
+    }
+
+    #[test]
+    fn package_archive_includes_optional_management_descriptor() {
+        let directory = std::env::temp_dir().join(format!(
+            "bkmqb-package-management-{}-{}",
+            std::process::id(),
+            nonce()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("plugin.toml"), b"fixture").unwrap();
+        fs::write(directory.join("component.wasm"), b"fixture").unwrap();
+        let descriptor = br#"{"schema_version":1,"resources":[]}"#;
+        fs::write(directory.join("management.schema.json"), descriptor).unwrap();
+        let output = directory.join("output.bkm-plugin");
+        write_package_archive(
+            &directory,
+            &directory.join("component.wasm"),
+            fs::File::create(&output).unwrap(),
+        )
+        .unwrap();
+        let mut archive = zip::ZipArchive::new(fs::File::open(output).unwrap()).unwrap();
+        let mut actual = Vec::new();
+        archive
+            .by_name("management.schema.json")
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, descriptor);
+        drop(archive);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
