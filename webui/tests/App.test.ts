@@ -61,6 +61,10 @@ const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) =
     const id = new URLSearchParams(path.split('?')[1]).get('instance_id'), p = plugins.find(p => p.instance_id === id)!;
     return new Response(JSON.stringify({ instance_id: id, expected_updated_at_ms: p.updated_at_ms, version: p.version, sha256: 'a'.repeat(64), requested_permissions: p.requested_permissions, granted_permissions: p.granted_permissions }));
   }
+  if (path.startsWith('/api/plugins/management?')) {
+    const id = new URLSearchParams(path.split('?')[1]).get('instance_id'), p = plugins.find(p => p.instance_id === id)!;
+    return new Response(JSON.stringify({ instance_id: id, plugin_updated_at_ms: p.updated_at_ms, revision: '0', descriptor: null, editable: false, unavailable_reason: null }));
+  }
   if (path.startsWith('/api/plugins/failures?')) return new Response(JSON.stringify({ entries: [], next_before: null }));
   if (!body) return new Response(JSON.stringify({ plugins }));
   const p = plugins.find(p => p.instance_id === body.instance_id)!; expect(body.expected_updated_at_ms).toBe(p.updated_at_ms);
@@ -112,7 +116,7 @@ describe('浏览器管理会话', () => {
     await login(); app.unmount(); document.body.replaceChildren(); requests.length = 0;
     await mount(pluginRoute('sample', 'config'));
     expect(value('#field-0')).toBe('1'); expect(document.querySelector('#token')).toBeNull();
-    expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins']);
+    expect(requests.map(r => r.path)).toEqual(['/api/session', '/api/plugins', '/api/plugins/management?instance_id=sample']);
     expect(requests.every(r => r.init.credentials === 'same-origin' && !r.body?.token)).toBe(true);
     expect(vi.mocked(Storage.prototype.setItem).mock.calls.every(args => !String(args[1]).includes('test-token'))).toBe(true);
   });

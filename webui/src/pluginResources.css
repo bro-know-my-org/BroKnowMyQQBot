@@ -1,0 +1,7 @@
+.plugin-resources .resource-table { max-width: 100%; overflow-x: auto; margin: 20px 0; }
+.plugin-resources table { width: 100%; border-collapse: collapse; text-align: left; }
+.plugin-resources th, .plugin-resources td { padding: 12px; border-bottom: 1px solid var(--e-ink-rule); overflow-wrap: anywhere; vertical-align: top; }
+.plugin-resources .resource-draft { margin-top: 24px; padding: 20px; border: 1px solid var(--e-ink-rule); }
+.plugin-resources > button, .plugin-resources > .actions { margin-top: 16px; }
+.plugin-resources .actions { flex-wrap: wrap; }
+.plugin-resources .actions label { flex: 1; min-width: 140px; }

@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, inject, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
+import PluginResources from './PluginResources.vue';
+import { managementStatusKey } from '../status';
 import SchemaEditor from "./SchemaEditor.vue";
 import LogsPage from "./LogsPage.vue";
 import PluginVersions from './PluginVersions.vue';
@@ -12,12 +14,14 @@ import { json, runtimeNames } from "../types";
 import type { Mutation, PluginView, SubscribeLogs } from "../types";
 const props = defineProps<{ plugin: PluginView; request: Request; subscribeLogs: SubscribeLogs; tab: "overview" | "config" | "logs"; busy: boolean; conflict: boolean }>();
 const emit = defineEmits<{ mutate: [change: Mutation]; dirty: [value: boolean]; error: [message: string]; busy: [value: boolean]; updated: [plugin: PluginView]; uncertain: [] }>();
-const editor = ref<InstanceType<typeof SchemaEditor>>(), configDirty = ref(false), permissionsDirty = ref(false);
-const dirty = computed(() => configDirty.value || permissionsDirty.value);
+const editor = ref<InstanceType<typeof SchemaEditor>>(), configDirty = ref(false), permissionsDirty = ref(false), resourceDirty = ref(false);
+const status = inject(managementStatusKey, undefined);
+const resourceRevision = computed(() => status?.snapshot.value?.plugin_data_revisions?.[props.plugin.instance_id]);
+const dirty = computed(() => configDirty.value || permissionsDirty.value || resourceDirty.value);
 watch(dirty, value => emit("dirty", value), { flush: "sync" });
 watch(() => props.plugin.config, () => { configDirty.value = false; emit("dirty", dirty.value); });
 watch(() => props.tab, () => { configDirty.value = false; });
-function save() { if (props.busy || !props.plugin.editable || props.conflict || !dirty.value) return; try { const config = editor.value!.read(); emit("mutate", { action: "config", config }); } catch (e) { emit("error", (e as Error).message); } }
+function save() { if (props.busy || !props.plugin.editable || props.conflict || !configDirty.value) return; try { const config = editor.value!.read(); emit("mutate", { action: "config", config }); } catch (e) { emit("error", (e as Error).message); } }
 function discard() { if (window.confirm("有未保存更改，是否放弃这些更改？")) editor.value?.reset(); }
 function operate(action: 'uninstall' | 'recover') {
   if (props.busy || !props.plugin.editable || props.conflict || dirty.value) return;
@@ -48,10 +52,11 @@ function operate(action: 'uninstall' | 'recover') {
         <h2>插件配置</h2><p class="muted">先保存设置，再应用到运行中的插件。已保存状态：{{ plugin.enabled ? '已启用' : '已停用' }}。</p>
         <p v-if="!plugin.editable" class="notice">此插件由声明式文件或随包配置管理。随包插件可前往<RouterLink :to="{ name: 'bundled-plugins', query: { instance_id: plugin.instance_id } }">内置插件管理</RouterLink>编辑；其他声明式插件请修改对应配置文件。</p>
         <form @submit.prevent="save"><SchemaEditor ref="editor" :config="plugin.config" :schema="plugin.schema" :disabled="busy || !plugin.editable" @dirty="configDirty = $event" />
-          <p class="hint" aria-live="polite">{{ conflict ? "状态已变化，请刷新后重新编辑。当前编辑仍保留，可先复制。" : dirty ? "有未保存更改。请先保存，再启停或立即应用。" : plugin.pending ? "已保存，等待应用到运行时。" : "当前没有未保存更改。" }}</p>
-          <div class="actions"><button id="save" class="primary" :disabled="busy || !plugin.editable || conflict || !dirty">保存配置</button><button id="discard" type="button" :disabled="busy || !dirty" @click="discard">放弃编辑</button></div>
+          <p class="hint" aria-live="polite">{{ conflict ? "状态已变化，请刷新后重新编辑。当前编辑仍保留，可先复制。" : configDirty ? "有未保存更改。请先保存，再启停或立即应用。" : plugin.pending ? "已保存，等待应用到运行时。" : "当前没有未保存更改。" }}</p>
+          <div class="actions"><button id="save" class="primary" :disabled="busy || !plugin.editable || conflict || !configDirty">保存配置</button><button id="discard" type="button" :disabled="busy || !configDirty" @click="discard">放弃编辑</button></div>
         </form>
         <details><summary>查看已保存配置</summary><pre>{{ json(plugin.config) }}</pre></details><details v-if="plugin.schema"><summary>查看配置 Schema</summary><pre>{{ json(plugin.schema) }}</pre></details>
+        <PluginResources :instance-id="plugin.instance_id" :updated-at="plugin.updated_at_ms" :revision="resourceRevision" :boot-id="status?.snapshot.value?.boot_id" :request="request" :busy="busy" @dirty="resourceDirty = $event" @busy="$emit('busy', $event)" />
       </section>
       <LogsPage v-else :request="request" :subscribe-logs="subscribeLogs" :instance-id="plugin.instance_id" />
     </div>

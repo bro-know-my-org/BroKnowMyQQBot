@@ -4,7 +4,7 @@ import { formFields } from '../schema';
 import { assertSafeNumbers, parseSafeJson } from '../json';
 import { isObject, json } from '../types';
 import type { Config } from '../types';
-const props = defineProps<{ config: Config; schema: Config | null; disabled: boolean }>();
+const props = defineProps<{ config: Config; schema: Config | null; disabled: boolean; idPrefix?: string }>();
 const emit = defineEmits<{ dirty: [value: boolean] }>();
 const forceJson = ref(false), raw = ref(''), dirty = ref(false);
 const definitions = computed(() => formFields(props.schema, props.config));
@@ -45,19 +45,19 @@ defineExpose({ read, reset });
   <fieldset :disabled="disabled" @input="edit" @change="edit">
     <template v-if="useJson">
       <p class="hint">此配置使用整对象 JSON 编辑，适用于复杂对象、数组或组合规则。保存时由服务校验。</p>
-      <label for="config-json">配置 JSON</label><textarea id="config-json" v-model="raw" spellcheck="false" />
+      <label :for="`${idPrefix ?? ''}config-json`">配置 JSON</label><textarea :id="`${idPrefix ?? ''}config-json`" v-model="raw" spellcheck="false" />
     </template>
     <template v-else>
       <div v-for="(field, index) in fields" :key="field.definition.key" class="field">
         <div class="field-heading">
-          <label :for="`field-${index}`">{{ field.definition.title }}{{ field.definition.required ? '（必填）' : '' }}</label>
+          <label :for="`${idPrefix ?? ''}field-${index}`">{{ field.definition.title }}{{ field.definition.required ? '（必填）' : '' }}</label>
           <label v-if="!field.definition.required"><input v-model="field.included" type="checkbox" :aria-label="`设置 ${field.definition.title}`"> 设置此项</label>
         </div>
-        <select v-if="field.definition.choices" :id="`field-${index}`" v-model="field.value" :disabled="!field.included">
+        <select v-if="field.definition.choices" :id="`${idPrefix ?? ''}field-${index}`" v-model="field.value" :disabled="!field.included">
           <option value="">请选择</option><option v-for="(choice, i) in field.definition.choices" :key="i" :value="String(i)">{{ json(choice) }}</option>
         </select>
-        <textarea v-else-if="field.definition.type === 'string'" :id="`field-${index}`" v-model="field.value" :disabled="!field.included" />
-        <input v-else :id="`field-${index}`" :value="field.value" type="number" step="any" :min="field.definition.minimum" :max="field.definition.maximum" :disabled="!field.included" @input="field.value = ($event.target as HTMLInputElement).value">
+        <textarea v-else-if="field.definition.type === 'string'" :id="`${idPrefix ?? ''}field-${index}`" v-model="field.value" :disabled="!field.included" />
+        <input v-else :id="`${idPrefix ?? ''}field-${index}`" :value="field.value" type="number" step="any" :min="field.definition.minimum" :max="field.definition.maximum" :disabled="!field.included" @input="field.value = ($event.target as HTMLInputElement).value">
         <p v-if="field.definition.description" class="hint">{{ field.definition.description }}</p>
         <p class="hint">{{ field.definition.key }}<template v-if="Object.hasOwn(field.definition, 'default')"> · 默认值：{{ json(field.definition.default) }}</template>{{ !field.definition.required ? ' · 取消设置时不保存此字段' : '' }}</p>
       </div>
