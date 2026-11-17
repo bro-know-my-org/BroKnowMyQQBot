@@ -6,24 +6,27 @@ import { parseSafeJson } from './json';
 import { readRuntime } from './runtime';
 import type { RuntimeStatus } from './runtime';
 import { isObject } from './types';
+import { dataRevision } from './pluginManagement';
 import type { PluginView, Session } from './types';
 
 export type StatusState = 'connecting' | 'open' | 'reconnecting' | 'closed' | 'stale';
 export type PluginStatus = Pick<PluginView, 'instance_id' | 'plugin_id' | 'name' | 'version' | 'loaded_version' | 'enabled' | 'runtime_state' | 'pending' | 'restart_required' | 'updated_at_ms'>;
 export interface ManagementSnapshot {
   boot_id: string; revision: string; runtime: RuntimeStatus; plugins: PluginStatus[];
-  plugins_truncated: boolean; settings_restart_required: boolean | null; bundled_revision: string | null;
+  plugins_truncated: boolean; settings_restart_required: boolean | null; bundled_revision: string | null; plugin_data_revisions?: Record<string, string>;
 }
 export const managementStatusKey: InjectionKey<ManagementStatus> = Symbol('management-status');
 const text = (v: unknown, max: number): v is string => typeof v === 'string' && v.length > 0 && v.length <= max;
 const boot = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
-const counter = (v: unknown): v is string => typeof v === 'string' && /^(0|[1-9]\d{0,19})$/.test(v) && BigInt(v) <= 18446744073709551615n;
+const counter = dataRevision;
 export function readManagementSnapshot(raw: unknown): ManagementSnapshot {
   const invalid = () => new ApiError('状态响应格式异常，保留上次快照，请重试。');
   if (!isObject(raw) || !boot(raw.boot_id) || !counter(raw.revision) || !Array.isArray(raw.plugins) || raw.plugins.length > 256
     || typeof raw.plugins_truncated !== 'boolean' || !(raw.settings_restart_required === null || typeof raw.settings_restart_required === 'boolean')
     || !(!Object.hasOwn(raw, 'bundled_revision') || raw.bundled_revision === null || (typeof raw.bundled_revision === 'string' && raw.bundled_revision.length === 64 && /^[0-9a-f]{64}$/.test(raw.bundled_revision)))
     || !isObject(raw.runtime) || raw.runtime.boot_id !== raw.boot_id) throw invalid();
+  if (raw.plugin_data_revisions !== undefined && (!isObject(raw.plugin_data_revisions) || Object.keys(raw.plugin_data_revisions).length > 256
+    || Object.entries(raw.plugin_data_revisions).some(([id, revision]) => !text(id, 512) || !dataRevision(revision)))) throw invalid();
   const ids = new Set<string>();
   const plugins = raw.plugins.map((p: unknown): PluginStatus => {
     if (!isObject(p) || !text(p.instance_id, 512) || ids.has(p.instance_id) || !text(p.plugin_id, 128) || !text(p.name, 512)
@@ -37,6 +40,7 @@ export function readManagementSnapshot(raw: unknown): ManagementSnapshot {
       restart_required: p.restart_required, updated_at_ms: Number(p.updated_at_ms) };
   });
   return { boot_id: raw.boot_id, revision: raw.revision, runtime: readRuntime(raw.runtime), plugins,
+    ...(raw.plugin_data_revisions === undefined ? {} : { plugin_data_revisions: raw.plugin_data_revisions as Record<string, string> }),
     plugins_truncated: raw.plugins_truncated, settings_restart_required: raw.settings_restart_required, bundled_revision: typeof raw.bundled_revision === 'string' ? raw.bundled_revision : null };
 }
 
