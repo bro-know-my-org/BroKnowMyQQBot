@@ -61,7 +61,7 @@ fn check_quota(connection: &Connection, id: &str, quota: u64) -> Result<(), Stor
 }
 
 impl PluginStore {
-    /// Generation and rows share one SQLite read snapshot, including other connections.
+    /// Generation and rows share one `SQLite` read snapshot, including other connections.
     pub fn management_snapshot(
         &self,
         id: &str,
