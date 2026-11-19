@@ -171,15 +171,39 @@ pub(super) fn wit_segment(segment: MessageSegment) -> types::MessageSegment {
 }
 
 pub(super) fn handler_output(output: types::HandlerOutput) -> Result<HandlerOutput, PluginError> {
-    if output.commands.len() > crate::runtime::MAX_COMMANDS {
+    validate_wit_commands(
+        output.commands.len(),
+        output.commands.iter().map(|command| &command.payload),
+        true,
+    )?;
+    Ok(handler_output_parts(
+        output.disposition,
+        output.state_ops,
+        output
+            .commands
+            .into_iter()
+            .map(plugin_command)
+            .collect::<Result<_, _>>()?,
+        output.diagnostics,
+    ))
+}
+
+pub(super) fn validate_wit_commands<'a>(
+    len: usize,
+    payloads: impl Iterator<Item = &'a types::CommandPayload>,
+    validate_requests: bool,
+) -> Result<(), PluginError> {
+    if len > crate::runtime::MAX_COMMANDS {
         return Err(PluginError::Permanent(
             "plugin output exceeds the 32 command limit".to_owned(),
         ));
     }
     let mut browser_bytes = 0_usize;
-    for command in &output.commands {
-        if let types::CommandPayload::BrowserRun(request) = &command.payload {
-            validate_wit_browser_request(request)?;
+    for payload in payloads {
+        if let types::CommandPayload::BrowserRun(request) = payload {
+            if validate_requests {
+                validate_wit_browser_request(request)?;
+            }
             browser_bytes = browser_bytes.saturating_add(wit_browser_request_size(request));
         }
     }
@@ -188,24 +212,25 @@ pub(super) fn handler_output(output: types::HandlerOutput) -> Result<HandlerOutp
             "browser commands exceed the aggregate 1 MiB output limit".to_owned(),
         ));
     }
-    Ok(HandlerOutput {
-        disposition: match output.disposition {
+    Ok(())
+}
+
+pub(super) fn handler_output_parts(
+    disposition: types::Disposition,
+    state_ops: Vec<types::StateOp>,
+    commands: Vec<PluginCommand>,
+    diagnostics: Vec<types::Diagnostic>,
+) -> HandlerOutput {
+    HandlerOutput {
+        disposition: match disposition {
             types::Disposition::Continue => plugin_api::Disposition::Continue,
             types::Disposition::Stop => plugin_api::Disposition::Stop,
             types::Disposition::Ignore => plugin_api::Disposition::Ignore,
         },
-        state_ops: output.state_ops.into_iter().map(state_op).collect(),
-        commands: output
-            .commands
-            .into_iter()
-            .map(plugin_command)
-            .collect::<Result<Vec<_>, _>>()?,
-        diagnostics: output
-            .diagnostics
-            .into_iter()
-            .map(plugin_diagnostic)
-            .collect(),
-    })
+        state_ops: state_ops.into_iter().map(state_op).collect(),
+        commands,
+        diagnostics: diagnostics.into_iter().map(plugin_diagnostic).collect(),
+    }
 }
 
 fn wit_browser_request_size(request: &types::BrowserRunCommand) -> usize {
@@ -257,8 +282,15 @@ fn json_string_upper_bound(value: &str) -> usize {
     value.len().saturating_mul(6).saturating_add(2)
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, PluginError> {
+    convert_command(command, true)
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn convert_command(
+    command: types::Command,
+    validate_requests: bool,
+) -> Result<PluginCommand, PluginError> {
     let (kind, payload) = match command.payload {
         types::CommandPayload::MediaCreate(create) => (
             "media.create".to_owned(),
@@ -314,11 +346,13 @@ pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, P
             )
         }
         types::CommandPayload::BrowserRun(request) => {
-            validate_wit_browser_request(&request)?;
+            if validate_requests {
+                validate_wit_browser_request(&request)?;
+            }
             let mut header_names = BTreeSet::new();
             let mut extra_headers = BTreeMap::new();
             for header in request.extra_headers {
-                if !header_names.insert(header.name.to_ascii_lowercase()) {
+                if validate_requests && !header_names.insert(header.name.to_ascii_lowercase()) {
                     return Err(PluginError::Permanent(format!(
                         "duplicate browser header `{}`",
                         header.name
@@ -349,6 +383,18 @@ pub(super) fn plugin_command(command: types::Command) -> Result<PluginCommand, P
                     .map_err(|error| PluginError::Permanent(error.to_string()))?,
             )
         }
+        types::CommandPayload::ScheduleCreate(create) if !validate_requests => (
+            "schedule.create".to_owned(),
+            json!({
+                "task_id": create.task_id,
+                "run_at_ms": create.run_at_ms,
+                "payload": {
+                    "schema_version": create.payload.schema_version,
+                    "content_type": create.payload.content_type,
+                    "data": create.payload.data,
+                },
+            }),
+        ),
         types::CommandPayload::ScheduleCreate(create) => {
             let payload = decode_json(&create.payload)?;
             let create = ScheduleCreate {

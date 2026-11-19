@@ -1,6 +1,8 @@
 //! Preserve the pre-1.5 handler result ABI: Component variants require exact cases.
 
-use super::{StoreData, exports, types};
+use super::conversion::{guest_error, handler_output, runtime_error, wit_event};
+use super::{StoreData, exports, qq, types};
+use plugin_api::{HandlerOutput, PluginError, PluginEventEnvelope};
 use wasmtime::{
     Store,
     component::{ComponentType, Instance, Lift, TypedFunc},
@@ -59,16 +61,34 @@ pub(super) struct Bindings {
 }
 
 enum Handler {
+    Qq(exports::bkm::plugin::qq_handler::Guest),
     Current(exports::bkm::plugin::handler::Guest),
     Legacy(LegacyHandler),
 }
 
 impl Bindings {
-    pub(super) fn new(store: &mut Store<StoreData>, instance: &Instance) -> anyhow::Result<Self> {
+    pub(super) fn new(
+        store: &mut Store<StoreData>,
+        instance: &Instance,
+        requires_qq: bool,
+    ) -> anyhow::Result<Self> {
         let pre = instance.instance_pre(&*store);
         let lifecycle = exports::bkm::plugin::lifecycle::GuestIndices::new(&pre)?
             .load(&mut *store, instance)?;
-        let handler =
+        let has_qq = pre
+            .component()
+            .get_export_index(None, "bkm:plugin/qq-handler@1.7.0")
+            .is_some();
+        let handler = if has_qq || requires_qq {
+            anyhow::ensure!(
+                has_qq,
+                "BPP QQ Markdown and buttons require the qq-handler export"
+            );
+            Handler::Qq(
+                exports::bkm::plugin::qq_handler::GuestIndices::new(&pre)?
+                    .load(&mut *store, instance)?,
+            )
+        } else {
             match exports::bkm::plugin::handler::GuestIndices::new(&pre)?
                 .load(&mut *store, instance)
             {
@@ -88,7 +108,8 @@ impl Bindings {
                     ))?;
                     Handler::Legacy(function)
                 }
-            };
+            }
+        };
         let management = if pre
             .component()
             .get_export_index(None, "bkm:plugin/management@1.6.0")
@@ -112,16 +133,34 @@ impl Bindings {
         &self.lifecycle
     }
 
-    pub(super) fn bkm_plugin_handler(&self) -> &Self {
-        self
+    pub(super) async fn call_on_event(
+        &self,
+        store: &mut Store<StoreData>,
+        event: &PluginEventEnvelope,
+    ) -> Result<HandlerOutput, PluginError> {
+        if let Handler::Qq(handler) = &self.handler {
+            let output = handler
+                .call_on_event(store, &qq::wit_event(event)?)
+                .await
+                .map_err(runtime_error)?
+                .map_err(guest_error)?;
+            return qq::handler_output(output, event.event_type == plugin_api::QQ_BUTTON_CLICKED);
+        }
+        let output = self
+            .call_core_event(store, &wit_event(event)?)
+            .await
+            .map_err(runtime_error)?
+            .map_err(guest_error)?;
+        handler_output(output)
     }
 
-    pub(super) async fn call_on_event(
+    async fn call_core_event(
         &self,
         store: &mut Store<StoreData>,
         event: &types::EventEnvelope,
     ) -> anyhow::Result<Result<types::HandlerOutput, types::PluginError>> {
         match &self.handler {
+            Handler::Qq(_) => unreachable!("QQ events use the QQ handler directly"),
             Handler::Current(handler) => handler.call_on_event(store, event).await,
             Handler::Legacy(handler) => {
                 let (output,) = handler.call_async(&mut *store, (event.clone(),)).await?;

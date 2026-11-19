@@ -7,10 +7,9 @@ mod conversion;
 mod management;
 #[cfg(test)]
 mod management_tests;
+mod qq;
 
-use conversion::{
-    config_entries, guest_error, handler_output, runtime_error, state_entries, state_op, wit_event,
-};
+use conversion::{config_entries, guest_error, runtime_error, state_entries, state_op};
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -35,7 +34,7 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsB
 
 wasmtime::component::bindgen!({
     path: "../plugin-api/wit",
-    world: "managed-plugin",
+    world: "host-plugins",
     async: true,
 });
 
@@ -280,7 +279,7 @@ impl WasmPlugin {
         assets: &BTreeMap<String, Vec<u8>>,
     ) -> Result<WasmInstance, WasmPluginError> {
         let mut linker = Linker::new(engine);
-        ManagedPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        HostPlugins::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(WasmPluginError::Wasmtime)?;
         let memory_bytes = usize::try_from(manifest.runtime.memory_mb)
             .unwrap_or(usize::MAX)
@@ -321,7 +320,8 @@ impl WasmPlugin {
             .await
             .map_err(WasmPluginError::Wasmtime)?;
         let bindings =
-            compat::Bindings::new(&mut store, &instance).map_err(WasmPluginError::Wasmtime)?;
+            compat::Bindings::new(&mut store, &instance, manifest.uses_qq_rich_messages())
+                .map_err(WasmPluginError::Wasmtime)?;
         Ok(WasmInstance { store, bindings })
     }
 
@@ -463,7 +463,6 @@ impl StaticPlugin for WasmPlugin {
         event: &PluginEventEnvelope,
         queries: &dyn HostQueries,
     ) -> Result<HandlerOutput, PluginError> {
-        let event = wit_event(event)?;
         let state = queries
             .state_scan("", usize::MAX)
             .into_iter()
@@ -482,14 +481,9 @@ impl StaticPlugin for WasmPlugin {
         instance.store.data_mut().command_prefix = queries.command_prefix();
         instance.store.data_mut().command_context = queries.command_context();
         let WasmInstance { store, bindings } = &mut *instance;
-        let output = bindings
-            .bkm_plugin_handler()
-            .call_on_event(store, &event)
-            .await
-            .map_err(runtime_error)
-            .and_then(|result| result.map_err(guest_error));
+        let output = bindings.call_on_event(store, event).await;
         epoch_deadline.cancel().await;
-        handler_output(output?)
+        output
     }
 
     async fn health(&self) -> Result<HealthStatus, PluginError> {
