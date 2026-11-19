@@ -285,15 +285,15 @@ struct Harness {
 impl Harness {
     async fn new(inner: Arc<dyn StaticPlugin>, deny_ack: bool) -> Self {
         let mock: Arc<MockQq> = Arc::default();
-        let app = Router::new()
+        let router = Router::new()
             .route("/app/getAppAccessToken", post(token))
             .route("/v2/{scope}/{id}/messages", post(send))
             .route("/interactions/{id}", put(ack))
             .with_state(mock.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let api = OpenApiClient::with_base_url(
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let open_api = OpenApiClient::with_base_url(
             base.clone(),
             TokenManager::with_client_and_endpoint(
                 Client::new(),
@@ -306,7 +306,7 @@ impl Harness {
         let (input, rx) = mpsc::channel(4);
         let (handled, handled_rx) = mpsc::unbounded_channel();
         let adapter = Arc::new(InputAdapter {
-            qq: QqWebSocketAdapter::new(QqWebSocketConfig::default(), api),
+            qq: QqWebSocketAdapter::new(QqWebSocketConfig::default(), open_api),
             input: tokio::sync::Mutex::new(rx),
             handled,
         });
