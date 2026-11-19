@@ -78,6 +78,8 @@ pub struct OutboxOrigin {
     pub platform: Option<String>,
     pub reply_target: Option<MessageTarget>,
     pub source_message_id: Option<String>,
+    #[serde(default)]
+    pub button_callback: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -941,6 +943,20 @@ impl PluginStore {
         Ok(())
     }
 
+    pub(crate) fn retire_callback_delivery(
+        &self,
+        instance_id: &str,
+        event_id: &str,
+        now_ms: i64,
+    ) -> Result<(), StoreError> {
+        self.connection.lock().map_err(|_| StoreError::Poisoned)?.execute(
+            "UPDATE plugin_deliveries SET status = 'retired', next_attempt_ms = 0, updated_at_ms = ?
+             WHERE instance_id = ? AND event_id = ? AND status IN ('pending', 'running')",
+            params![now_ms, instance_id, event_id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn pending_deliveries(
         &self,
         instance_id: &str,
@@ -1786,6 +1802,7 @@ mod tests {
                 group_id: "group-1".to_owned(),
             }),
             source_message_id: Some("message-1".to_owned()),
+            button_callback: false,
         }
     }
 

@@ -52,6 +52,7 @@ fn seed(store: &PluginStore) -> LogicalSnapshot {
         platform: None,
         reply_target: None,
         source_message_id: None,
+        button_callback: false,
     };
     store
         .commit(
@@ -140,6 +141,7 @@ fn restore_is_atomic_and_never_replays_or_rewinds_execution_history() {
         platform: None,
         reply_target: None,
         source_message_id: None,
+        button_callback: false,
     };
     assert!(
         store

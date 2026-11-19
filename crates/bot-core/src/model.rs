@@ -120,10 +120,32 @@ impl CommonMessage {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Event {
     Message(CommonMessage),
+    ButtonInteraction(ButtonInteraction),
     Notice(Value),
     Request(Value),
     Lifecycle(Value),
     Platform { name: String, payload: Value },
+}
+
+/// Adapter-to-Host routing data for a managed button. Kept out of plugin payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ButtonInteraction {
+    pub interaction_id: String,
+    pub target: MessageTarget,
+    pub actor_id: String,
+    pub button_id: String,
+    pub token: String,
+}
+
+impl ButtonInteraction {
+    pub const MANAGED_TOKEN_PREFIX: &str = "bkm1:";
+
+    pub fn is_managed_token(data: &str) -> bool {
+        data.strip_prefix(Self::MANAGED_TOKEN_PREFIX)
+            .is_some_and(|token| {
+                token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -8,6 +8,9 @@ mod media;
 mod observation;
 #[cfg(test)]
 mod observation_tests;
+mod qq;
+mod qq_callbacks;
+mod qq_keyboard;
 mod resources;
 #[cfg(test)]
 mod upgrade_tests;
@@ -197,6 +200,7 @@ pub struct StaticPluginHost {
     http_executor: Arc<dyn HttpExecutor>,
     browser_executor: Arc<dyn BrowserExecutor>,
     assets: AssetStore,
+    qq_callbacks: qq_callbacks::QqCallbacks,
     adapters: Arc<BTreeMap<String, Arc<dyn Adapter>>>,
     scheduled_tasks: Arc<StdMutex<ScheduleWorkers>>,
 }
@@ -214,6 +218,7 @@ impl std::fmt::Debug for StaticPluginHost {
             .field("http_executor", &"configured")
             .field("browser_executor", &"configured")
             .field("assets", &"configured")
+            .field("qq_callbacks", &"process-local")
             .field("adapter_count", &self.adapters.len())
             .field("scheduled_tasks", &"supervised")
             .finish()
@@ -267,6 +272,7 @@ impl StaticPluginHost {
             http_executor: Arc::new(SecureHttpExecutor::default()),
             browser_executor: Arc::new(UnavailableBrowserExecutor),
             assets: AssetStore::default(),
+            qq_callbacks: qq_callbacks::QqCallbacks::default(),
             adapters: Arc::new(BTreeMap::new()),
             scheduled_tasks: Arc::new(StdMutex::new(HashMap::new())),
         }
@@ -735,6 +741,7 @@ impl StaticPluginHost {
                         commands: Vec::new(),
                         diagnostics: Vec::new(),
                     },
+                    false,
                 )?;
                 self.store.commit(
                     instance_id,
@@ -804,6 +811,9 @@ impl StaticPluginHost {
     }
 
     async fn dispatch(&self, context: Context, event: &Event) -> Result<(), PluginHostError> {
+        if let Event::ButtonInteraction(button) = event {
+            return self.dispatch_button(&context, button).await;
+        }
         let event_type = event_type(event);
         let scope = event_scope(event);
         let mut plugins = self
@@ -818,7 +828,7 @@ impl StaticPluginHost {
         if plugins.is_empty() {
             return Ok(());
         }
-        let envelope = Self::event_envelope(&context, event, event_type)?;
+        let envelope = Self::event_envelope(&context, event_type, event)?;
         plugins.sort_by_key(|(priority, plugin)| (*priority, plugin.manifest.id.clone()));
 
         for (_, plugin) in plugins {
@@ -865,8 +875,8 @@ impl StaticPluginHost {
 
     fn event_envelope(
         context: &Context,
-        event: &Event,
         event_type: &str,
+        payload: &impl serde::Serialize,
     ) -> Result<PluginEventEnvelope, PluginHostError> {
         let invocation_id = Uuid::new_v4().to_string();
         let now = now_ms();
@@ -880,9 +890,11 @@ impl StaticPluginHost {
             adapter_id: context.adapter_id().to_string(),
             event_type: event_type.to_owned(),
             trace_id: None,
-            payload: serde_json::to_value(event).map_err(|error| PluginHostError::Invocation {
-                plugin_id: "event-envelope".to_owned(),
-                message: error.to_string(),
+            payload: serde_json::to_value(payload).map_err(|error| {
+                PluginHostError::Invocation {
+                    plugin_id: "event-envelope".to_owned(),
+                    message: error.to_string(),
+                }
             })?,
             extensions: Vec::new(),
         })
@@ -956,10 +968,38 @@ impl StaticPluginHost {
             self.assets.remove_instance(&plugin.instance_id);
             return Ok((false, VecDeque::new()));
         }
+        let button_deadline = if envelope.event_type == plugin_api::QQ_BUTTON_CLICKED {
+            let deadline = match origin {
+                ExecutionOrigin::Event(context) => self.qq_callbacks.deadline(context),
+                _ => None,
+            };
+            let Some(deadline) = deadline else {
+                self.store.retire_callback_delivery(
+                    &plugin.instance_id,
+                    &envelope.event_id,
+                    now_ms(),
+                )?;
+                return Ok((false, VecDeque::new()));
+            };
+            Some(deadline)
+        } else {
+            None
+        };
         loop {
+            if button_deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                self.store.retire_callback_delivery(
+                    &plugin.instance_id,
+                    &envelope.event_id,
+                    now_ms(),
+                )?;
+                return Ok((false, VecDeque::new()));
+            }
             envelope.delivery_id = Uuid::new_v4().to_string();
             envelope.invocation_id = Uuid::new_v4().to_string();
-            if envelope.event_type != "action.completed" {
+            if !matches!(
+                envelope.event_type.as_str(),
+                "action.completed" | plugin_api::QQ_BUTTON_CLICKED
+            ) {
                 if let ExecutionOrigin::Event(context) = origin {
                     envelope.extensions = event_extensions(plugin, context)?;
                 }
@@ -988,21 +1028,13 @@ impl StaticPluginHost {
             let result = async {
                 let result = async {
                     let (output, declared_command, validated_images) = self
-                        .invoke_envelope(plugin, &envelope, caller_authority)
+                        .invoke_envelope(plugin, &envelope, caller_authority, button_deadline)
                         .await?;
                     let observation =
                         observation::OutputObservation::new(&output, declared_command);
                     let stop = output.disposition == Disposition::Stop;
                     let completions = self
-                        .commit_and_execute(
-                            plugin,
-                            origin,
-                            &envelope.event_id,
-                            &envelope.delivery_id,
-                            &envelope.invocation_id,
-                            output,
-                            validated_images,
-                        )
+                        .commit_and_execute(plugin, origin, &envelope, output, validated_images)
                         .await?;
                     observation.completed(started.elapsed());
                     Ok::<_, PluginHostError>((stop, completions))
@@ -1052,6 +1084,17 @@ impl StaticPluginHost {
                     }
                     return Ok((stop, completion_envelopes));
                 }
+                Err(PluginHostError::Timeout { .. })
+                    if button_deadline
+                        .is_some_and(|deadline| deadline <= tokio::time::Instant::now()) =>
+                {
+                    self.store.retire_callback_delivery(
+                        &plugin.instance_id,
+                        &envelope.event_id,
+                        now_ms(),
+                    )?;
+                    return Ok((false, VecDeque::new()));
+                }
                 Err(error) => {
                     let Some(delay_ms) =
                         self.record_delivery_failure(plugin, &envelope, delivery.attempt, &error)?
@@ -1060,7 +1103,12 @@ impl StaticPluginHost {
                             self.recover_committed_delivery(plugin, origin, &envelope)?;
                         return Ok((false, recovered));
                     };
-                    sleep(Duration::from_millis(delay_ms)).await;
+                    let next_attempt =
+                        tokio::time::Instant::now() + Duration::from_millis(delay_ms);
+                    tokio::time::sleep_until(
+                        button_deadline.map_or(next_attempt, |deadline| deadline.min(next_attempt)),
+                    )
+                    .await;
                 }
             }
         }
@@ -1285,6 +1333,14 @@ impl StaticPluginHost {
             .pending_deliveries(&plugin.instance_id, i64::MAX)?;
         pending.sort_by_key(|delivery| (delivery.next_attempt_ms, delivery.event_id.clone()));
         for pending in pending {
+            if pending.envelope.event_type == plugin_api::QQ_BUTTON_CLICKED {
+                self.store.retire_callback_delivery(
+                    &plugin.instance_id,
+                    &pending.event_id,
+                    now_ms(),
+                )?;
+                continue;
+            }
             let recovery_wait_ms = u64::try_from(pending.next_attempt_ms.saturating_sub(now_ms()))
                 .unwrap_or_default()
                 .min(delivery_retry_delay_ms(pending.attempt.max(1)));
@@ -1312,9 +1368,12 @@ impl StaticPluginHost {
         plugin: &RegisteredPlugin,
         envelope: &PluginEventEnvelope,
         caller_authority: &CallerAuthority,
+        button_deadline: Option<tokio::time::Instant>,
     ) -> Result<(HandlerOutput, bool, BTreeMap<String, media::ValidatedImage>), PluginHostError>
     {
-        let deadline = tokio::time::Instant::now() + plugin.manifest.timeout();
+        let plugin_deadline = tokio::time::Instant::now() + plugin.manifest.timeout();
+        let deadline =
+            button_deadline.map_or(plugin_deadline, |deadline| deadline.min(plugin_deadline));
         let state = self.store.snapshot(&plugin.instance_id)?;
         let config = plugin.config_snapshot()?;
         let command_prefix = self.command_prefix();
@@ -1382,11 +1441,12 @@ impl StaticPluginHost {
                     message: error.to_string(),
                 },
             })?;
-        validate_output(plugin, &output)?;
+        let initial_click = envelope.event_type == plugin_api::QQ_BUTTON_CLICKED;
+        validate_output(plugin, &output, initial_click)?;
         let validated_images = tokio::time::timeout_at(deadline, async {
             let mut images = BTreeMap::new();
             for command in &output.commands {
-                if command.kind == "media.create" {
+                if command.kind == "media.create" && !initial_click {
                     let image = media::validate_create_async(command.payload.clone())
                         .await
                         .map_err(|error| PluginHostError::InvalidOutput {
@@ -1410,17 +1470,22 @@ impl StaticPluginHost {
         Ok((output, declared_command, validated_images))
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn commit_and_execute(
         &self,
         plugin: &Arc<RegisteredPlugin>,
         origin: ExecutionOrigin<'_>,
-        source_event_id: &str,
-        delivery_id: &str,
-        invocation_id: &str,
+        envelope: &PluginEventEnvelope,
         output: HandlerOutput,
         mut validated_images: BTreeMap<String, media::ValidatedImage>,
     ) -> Result<VecDeque<ActionCompleted>, PluginHostError> {
+        let source_event_id = &envelope.event_id;
+        let invocation_id = &envelope.invocation_id;
+        let phase = match origin {
+            ExecutionOrigin::Event(context) if context.button_interaction().is_some() => {
+                qq::ButtonPhase::for_event(envelope)
+            }
+            _ => qq::ButtonPhase::Other,
+        };
         let outbox_origin = origin.outbox_origin(source_event_id);
         let commands = self.store.commit(
             &plugin.instance_id,
@@ -1429,7 +1494,7 @@ impl StaticPluginHost {
             &output.commands,
             CommitOptions::new(plugin.manifest.permissions.storage_quota_bytes)
                 .with_origin(&outbox_origin)
-                .with_delivery(source_event_id, delivery_id),
+                .with_delivery(source_event_id, &envelope.delivery_id),
         )?;
         let mut completions = VecDeque::new();
         for command in commands {
@@ -1438,8 +1503,11 @@ impl StaticPluginHost {
                 self.execute_command(
                     plugin,
                     origin,
-                    source_event_id,
-                    invocation_id,
+                    CommandSource {
+                        event_id: source_event_id,
+                        invocation_id,
+                        phase,
+                    },
                     command,
                     image,
                 )
@@ -1453,38 +1521,42 @@ impl StaticPluginHost {
         &self,
         plugin: &Arc<RegisteredPlugin>,
         origin: ExecutionOrigin<'_>,
-        source_event_id: &str,
-        invocation_id: &str,
+        source: CommandSource<'_>,
         command: PluginCommand,
         validated_image: Option<media::ValidatedImage>,
     ) -> Result<ActionCompleted, PluginHostError> {
-        let span = observation::action_span(plugin, source_event_id, invocation_id, &command);
-        self.execute_command_observed(
-            plugin,
-            origin,
-            source_event_id,
-            invocation_id,
-            command,
-            validated_image,
-        )
-        .instrument(span)
-        .await
+        let span =
+            observation::action_span(plugin, source.event_id, source.invocation_id, &command);
+        self.execute_command_observed(plugin, origin, source, command, validated_image)
+            .instrument(span)
+            .await
     }
 
     async fn execute_command_observed(
         &self,
         plugin: &Arc<RegisteredPlugin>,
         origin: ExecutionOrigin<'_>,
-        source_event_id: &str,
-        invocation_id: &str,
+        source: CommandSource<'_>,
         command: PluginCommand,
         validated_image: Option<media::ValidatedImage>,
     ) -> Result<ActionCompleted, PluginHostError> {
+        let CommandSource {
+            event_id: source_event_id,
+            invocation_id,
+            phase,
+        } = source;
         let started = std::time::Instant::now();
         let execution = async {
+            qq::validate_origin_command(origin, phase, &command.kind)?;
             match command.kind.as_str() {
                 "schedule.create" | "schedule.cancel" => {
                     self.execute_schedule_command(plugin, origin, &command)
+                }
+                plugin_api::QQ_MARKDOWN_REPLY
+                | plugin_api::QQ_MARKDOWN_SEND
+                | plugin_api::QQ_BUTTON_ACK => {
+                    self.execute_qq_command(plugin, origin, source_event_id, phase, &command)
+                        .await
                 }
                 _ => {
                     execute_context_command(
@@ -2088,6 +2160,12 @@ impl EventHandler for StaticPluginHost {
     }
 }
 
+struct CommandSource<'a> {
+    event_id: &'a str,
+    invocation_id: &'a str,
+    phase: qq::ButtonPhase,
+}
+
 #[derive(Clone, Copy)]
 enum ExecutionOrigin<'a> {
     Event(&'a Context),
@@ -2104,6 +2182,14 @@ impl<'a> ExecutionOrigin<'a> {
         }
     }
 
+    fn is_button_callback(self) -> bool {
+        match self {
+            Self::Event(context) => context.button_interaction().is_some(),
+            Self::Recovered(origin) => origin.button_callback,
+            Self::Scheduled { .. } => false,
+        }
+    }
+
     fn outbox_origin(self, source_event_id: &str) -> OutboxOrigin {
         match self {
             Self::Event(context) => OutboxOrigin {
@@ -2112,6 +2198,7 @@ impl<'a> ExecutionOrigin<'a> {
                 platform: Some(context.platform().to_owned()),
                 reply_target: context.reply_target().cloned(),
                 source_message_id: context.source_message_id().map(str::to_owned),
+                button_callback: context.button_interaction().is_some(),
             },
             Self::Scheduled { adapter_id } => OutboxOrigin {
                 source_event_id: source_event_id.to_owned(),
@@ -2119,6 +2206,7 @@ impl<'a> ExecutionOrigin<'a> {
                 platform: None,
                 reply_target: None,
                 source_message_id: None,
+                button_callback: false,
             },
             Self::Recovered(origin) => origin.clone(),
         }
@@ -2831,57 +2919,64 @@ mod tests {
         }
     }
 
+    struct SlowImage(PluginManifest, bool);
+    #[async_trait::async_trait]
+    impl StaticPlugin for SlowImage {
+        fn manifest(&self) -> &PluginManifest {
+            &self.0
+        }
+        async fn on_event(
+            &self,
+            event: &PluginEventEnvelope,
+            _: &dyn HostQueries,
+        ) -> Result<HandlerOutput, PluginError> {
+            use base64::Engine as _;
+            use std::time::Duration;
+            if self.1 {
+                std::thread::sleep(Duration::from_millis(20));
+                return Ok(HandlerOutput::default());
+            }
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(1, 1)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            let mut commands = vec![PluginCommand {
+                command_id: "image".into(),
+                kind: "media.create".into(),
+                idempotency_key: None,
+                deadline_ms: None,
+                payload: json!({"mime_type":"image/png","data_base64":base64::engine::general_purpose::STANDARD.encode(png.into_inner())}),
+            }];
+            if event.event_type == plugin_api::QQ_BUTTON_CLICKED {
+                commands.push(PluginCommand::qq_button_ack(
+                    "ack",
+                    plugin_api::QqButtonAck::Success,
+                ));
+            }
+            Ok(HandlerOutput {
+                commands,
+                ..HandlerOutput::default()
+            })
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn image_validation_shares_the_handler_deadline_when_decoder_is_busy() {
         use super::media;
         use std::time::Duration;
-        use tokio::time::sleep;
-        struct SlowImage(PluginManifest, bool);
-        #[async_trait::async_trait]
-        impl StaticPlugin for SlowImage {
-            fn manifest(&self) -> &PluginManifest {
-                &self.0
-            }
-            async fn on_event(
-                &self,
-                _: &PluginEventEnvelope,
-                _: &dyn HostQueries,
-            ) -> Result<HandlerOutput, PluginError> {
-                use base64::Engine as _;
-                if self.1 {
-                    std::thread::sleep(Duration::from_millis(20));
-                    return Ok(HandlerOutput::default());
-                }
-                sleep(Duration::from_millis(80)).await;
-                let mut png = std::io::Cursor::new(Vec::new());
-                image::DynamicImage::new_rgb8(1, 1)
-                    .write_to(&mut png, image::ImageFormat::Png)
-                    .unwrap();
-                Ok(HandlerOutput {
-                    commands: vec![PluginCommand {
-                        command_id: "image".into(),
-                        kind: "media.create".into(),
-                        idempotency_key: None,
-                        deadline_ms: None,
-                        payload: json!({"mime_type":"image/png","data_base64":base64::engine::general_purpose::STANDARD.encode(png.into_inner())}),
-                    }],
-                    ..HandlerOutput::default()
-                })
-            }
-        }
         let _slot = media::decoder_slots()
             .clone()
             .acquire_owned()
             .await
             .unwrap();
         let mut plugin = plugin_without_grants();
-        plugin.manifest.protocol = ">=1.5,<2.0".into();
+        plugin.manifest.protocol = ">=1.7,<2.0".into();
         plugin.manifest.runtime.timeout_ms = 100;
-        plugin
-            .manifest
-            .permissions
-            .actions
-            .insert("media.create".into());
+        plugin.manifest.permissions.actions.extend([
+            "media.create".to_owned(),
+            plugin_api::QQ_BUTTON_ACK.to_owned(),
+        ]);
         plugin.granted_capabilities = plugin.manifest.requested_capabilities();
         plugin.plugin = Arc::new(SlowImage(plugin.manifest.clone(), false));
         let host = StaticPluginHost::new(PluginStore::in_memory().unwrap());
@@ -2900,15 +2995,36 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         let result = host
-            .invoke_envelope(&plugin, &envelope, &CallerAuthority::default())
+            .invoke_envelope(&plugin, &envelope, &CallerAuthority::default(), None)
             .await;
         assert!(matches!(result, Err(PluginHostError::Timeout { .. })));
         assert_eq!(started.elapsed(), Duration::from_millis(100));
+        let callback = PluginEventEnvelope {
+            event_type: plugin_api::QQ_BUTTON_CLICKED.to_owned(),
+            ..envelope.clone()
+        };
+        let (output, _, images) = host
+            .invoke_envelope(
+                &plugin,
+                &callback,
+                &CallerAuthority::default(),
+                Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            )
+            .await
+            .unwrap();
+        let kinds: Vec<_> = output
+            .commands
+            .iter()
+            .map(|command| command.kind.as_str())
+            .collect();
+        assert_eq!(kinds, ["media.create", plugin_api::QQ_BUTTON_ACK]);
+        assert_eq!(images.keys().next(), None);
+
         tokio::time::resume();
         plugin.manifest.runtime.timeout_ms = 1;
         plugin.plugin = Arc::new(SlowImage(plugin.manifest.clone(), true));
         let result = host
-            .invoke_envelope(&plugin, &envelope, &CallerAuthority::default())
+            .invoke_envelope(&plugin, &envelope, &CallerAuthority::default(), None)
             .await;
         assert!(matches!(result, Err(PluginHostError::Timeout { .. })));
     }
@@ -2986,7 +3102,7 @@ mod tests {
                 payload: json!({"type":"message", "data":{"text":text}}),
                 extensions: Vec::new(),
             };
-            host.invoke_envelope(plugin, &envelope, &CallerAuthority::default())
+            host.invoke_envelope(plugin, &envelope, &CallerAuthority::default(), None)
                 .await
                 .unwrap();
             assert_eq!(host.command_prefix(), "changed!");
@@ -3050,7 +3166,12 @@ mod tests {
                 extensions: Vec::new(),
             };
             let (output, _, _) = host
-                .invoke_envelope(&host.plugins[0], &envelope, &CallerAuthority::default())
+                .invoke_envelope(
+                    &host.plugins[0],
+                    &envelope,
+                    &CallerAuthority::default(),
+                    None,
+                )
                 .await
                 .unwrap();
             assert_eq!(!output.commands.is_empty(), matches);
@@ -3090,7 +3211,12 @@ mod tests {
         for enabled in [true, false, true] {
             host.set_instance_enabled("ping", enabled).await.unwrap();
             let (output, _, _) = host
-                .invoke_envelope(&host.plugins[0], &envelope, &CallerAuthority::default())
+                .invoke_envelope(
+                    &host.plugins[0],
+                    &envelope,
+                    &CallerAuthority::default(),
+                    None,
+                )
                 .await
                 .unwrap();
             let content = output.commands[0].payload["content"].as_str().unwrap();
@@ -3196,6 +3322,7 @@ mod tests {
         let error = validate_output(
             &plugin_without_grants(),
             &reply_output(Disposition::Continue),
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("not granted"));
@@ -3215,7 +3342,7 @@ mod tests {
             }],
             diagnostics: Vec::new(),
         };
-        let error = validate_output(&plugin_without_grants(), &output).unwrap_err();
+        let error = validate_output(&plugin_without_grants(), &output, false).unwrap_err();
         assert!(
             error
                 .to_string()
@@ -3226,7 +3353,7 @@ mod tests {
         plugin
             .trusted_platform_queries
             .insert(TrustedPlatformQuery::QqGuildApiPermissionList);
-        validate_output(&plugin, &output).unwrap();
+        validate_output(&plugin, &output, false).unwrap();
     }
 
     #[tokio::test]
@@ -3349,8 +3476,12 @@ mod tests {
 
     #[test]
     fn rejects_side_effects_with_ignore_disposition() {
-        let error = validate_output(&plugin_without_grants(), &reply_output(Disposition::Ignore))
-            .unwrap_err();
+        let error = validate_output(
+            &plugin_without_grants(),
+            &reply_output(Disposition::Ignore),
+            false,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("Ignore disposition"));
     }
 
@@ -3362,6 +3493,7 @@ mod tests {
                 disposition: Disposition::Stop,
                 ..HandlerOutput::default()
             },
+            false,
         )
         .unwrap_err();
         assert!(error.to_string().contains("stop_propagation"));
@@ -3392,6 +3524,7 @@ mod tests {
                 group_id: "group-1".to_owned(),
             }),
             source_message_id: Some("message-1".to_owned()),
+            button_callback: false,
         };
         store
             .begin_delivery(instance_id, &source_event, &origin, 1)
@@ -3559,6 +3692,7 @@ mod tests {
                     group_id: "group".to_owned(),
                 }),
                 source_message_id: Some("source-message".to_owned()),
+                button_callback: false,
             };
             store
                 .enqueue_delivery(instance_id, &envelope, &origin, 0)
@@ -3766,6 +3900,7 @@ mod tests {
             platform: Some("mock".to_owned()),
             reply_target: None,
             source_message_id: None,
+            button_callback: false,
         }
     }
 }

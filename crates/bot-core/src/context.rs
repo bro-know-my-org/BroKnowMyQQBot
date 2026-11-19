@@ -6,8 +6,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    Action, ActionResult, Adapter, AdapterError, AdapterId, Event, EventEnvelope, EventId,
-    MessageTarget, ReplyAction,
+    Action, ActionResult, Adapter, AdapterError, AdapterId, ButtonInteraction, Event,
+    EventEnvelope, EventId, MessageTarget, ReplyAction,
 };
 
 #[derive(Debug, Error)]
@@ -25,6 +25,7 @@ pub struct Context {
     event_id: EventId,
     occurred_at_ms: Option<i64>,
     raw_event: Arc<Value>,
+    button_interaction: Option<ButtonInteraction>,
     source_message_id: Option<String>,
     reply_target: Option<MessageTarget>,
     adapter: Arc<dyn Adapter>,
@@ -61,6 +62,10 @@ impl Context {
                 .timestamp
                 .map(|timestamp| timestamp.timestamp_millis()),
             raw_event: Arc::new(envelope.raw.clone()),
+            button_interaction: match &envelope.event {
+                Event::ButtonInteraction(button) => Some(button.clone()),
+                _ => None,
+            },
             source_message_id,
             reply_target,
             adapter,
@@ -85,6 +90,10 @@ impl Context {
 
     pub fn raw_event(&self) -> &Value {
         &self.raw_event
+    }
+
+    pub fn button_interaction(&self) -> Option<&ButtonInteraction> {
+        self.button_interaction.as_ref()
     }
 
     pub fn reply_target(&self) -> Option<&MessageTarget> {

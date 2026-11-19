@@ -1111,18 +1111,20 @@ fn check_adapter_join(joined: Option<AdapterTaskResult>) -> Result<(), RuntimeEr
 
 fn runtime_partition_key(event: &crate::EventEnvelope) -> String {
     let adapter = event.adapter.as_str();
-    match &event.event {
-        Event::Message(message) => match &message.target {
-            crate::MessageTarget::Group { group_id } => format!("{adapter}:group:{group_id}"),
-            crate::MessageTarget::Private { user_id } => format!("{adapter}:private:{user_id}"),
-            crate::MessageTarget::Channel { channel_id } => {
-                format!("{adapter}:channel:{channel_id}")
-            }
-            crate::MessageTarget::GuildDirect { guild_id } => {
-                format!("{adapter}:guild-direct:{guild_id}")
-            }
-        },
-        _ => format!("{adapter}:event:{}", event.id),
+    let target = match &event.event {
+        Event::Message(message) => &message.target,
+        Event::ButtonInteraction(button) => &button.target,
+        _ => return format!("{adapter}:event:{}", event.id),
+    };
+    match target {
+        crate::MessageTarget::Group { group_id } => format!("{adapter}:group:{group_id}"),
+        crate::MessageTarget::Private { user_id } => format!("{adapter}:private:{user_id}"),
+        crate::MessageTarget::Channel { channel_id } => {
+            format!("{adapter}:channel:{channel_id}")
+        }
+        crate::MessageTarget::GuildDirect { guild_id } => {
+            format!("{adapter}:guild-direct:{guild_id}")
+        }
     }
 }
 

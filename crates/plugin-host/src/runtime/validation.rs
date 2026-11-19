@@ -180,6 +180,7 @@ pub(super) fn validate_upgrade_commands(
 pub(super) fn validate_output(
     plugin: &RegisteredPlugin,
     output: &HandlerOutput,
+    initial_click: bool,
 ) -> Result<(), PluginHostError> {
     let invalid = |message: String| PluginHostError::InvalidOutput {
         plugin_id: plugin.manifest.id.to_string(),
@@ -231,6 +232,9 @@ pub(super) fn validate_output(
                 | "browser.run"
                 | "schedule.create"
                 | "schedule.cancel"
+                | plugin_api::QQ_MARKDOWN_REPLY
+                | plugin_api::QQ_MARKDOWN_SEND
+                | plugin_api::QQ_BUTTON_ACK
         ) && !trusted_platform_query
         {
             return Err(invalid(format!(
@@ -264,7 +268,8 @@ pub(super) fn validate_output(
             )));
         }
     }
-    Ok(())
+    super::qq::validate_commands(plugin, output, initial_click)
+        .map_err(|error| invalid(error.to_owned()))
 }
 pub(super) fn requested_capabilities(manifest: &PluginManifest) -> BTreeSet<String> {
     manifest.requested_capabilities()
@@ -273,6 +278,7 @@ pub(super) fn requested_capabilities(manifest: &PluginManifest) -> BTreeSet<Stri
 pub(super) const fn event_type(event: &Event) -> &'static str {
     match event {
         Event::Message(_) => "message.created",
+        Event::ButtonInteraction(_) => plugin_api::QQ_BUTTON_CLICKED,
         Event::Notice(_) => "notice.received",
         Event::Request(_) => "request.received",
         Event::Lifecycle(_) => "lifecycle.changed",

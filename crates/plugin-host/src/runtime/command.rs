@@ -598,7 +598,7 @@ fn browser_plugin_error(error: BrowserExecutionError) -> PluginError {
     }
 }
 
-fn adapter_command_error(error: &AdapterError) -> PluginError {
+pub(super) fn adapter_command_error(error: &AdapterError) -> PluginError {
     match error {
         AdapterError::ActionUnknown(_) | AdapterError::Transport(_) => {
             PluginError::Transient(error.to_string())
@@ -622,7 +622,7 @@ fn http_plugin_error(error: HttpExecutionError) -> PluginError {
     }
 }
 
-fn context_command_error(error: &ContextError) -> PluginError {
+pub(super) fn context_command_error(error: &ContextError) -> PluginError {
     match error {
         ContextError::Adapter(AdapterError::ActionUnknown(_) | AdapterError::Transport(_)) => {
             PluginError::Transient(error.to_string())
@@ -894,6 +894,7 @@ mod tests {
             platform: Some(platform.to_owned()),
             reply_target: None,
             source_message_id: None,
+            button_callback: false,
         };
         let result = execute_context_command(
             ExecutionOrigin::Recovered(&origin),

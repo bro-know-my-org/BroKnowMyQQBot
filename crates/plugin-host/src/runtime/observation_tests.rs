@@ -435,6 +435,7 @@ async fn scheduled_and_recovered_direct_sends_keep_source_event_and_action_ident
         platform: Some("mock".to_owned()),
         reply_target: None,
         source_message_id: None,
+        button_callback: false,
     };
     for (invocation, origin) in [
         (
@@ -473,8 +474,11 @@ async fn scheduled_and_recovered_direct_sends_keep_source_event_and_action_ident
         host.execute_command(
             &host.plugins[0],
             origin,
-            "background-event",
-            invocation,
+            super::CommandSource {
+                event_id: "background-event",
+                invocation_id: invocation,
+                phase: super::qq::ButtonPhase::Other,
+            },
             command,
             None,
         )
