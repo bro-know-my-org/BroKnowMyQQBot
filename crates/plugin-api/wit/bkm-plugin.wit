@@ -1,4 +1,4 @@
-package bkm:plugin@1.6.0;
+package bkm:plugin@1.7.0;
 
 interface types {
     record command-context {
@@ -379,4 +379,100 @@ interface management {
 world managed-plugin {
     include plugin;
     export management;
+}
+
+// The original handler keeps its exact variant layout for existing components.
+interface qq-handler {
+    use types.{event-envelope, disposition, state-op, diagnostic, plugin-error, command-payload};
+
+    variant qq-chat { group(string), private(string) }
+
+    record button-clicked {
+        actor-id: string,
+        target: qq-chat,
+        button-id: string,
+        data: string,
+    }
+
+    record button-envelope {
+        protocol-version: string,
+        event-id: string,
+        delivery-id: string,
+        invocation-id: string,
+        occurred-at-ms: option<s64>,
+        received-at-ms: s64,
+        adapter-id: string,
+        trace-id: option<string>,
+        button: button-clicked,
+    }
+
+    variant event { core(event-envelope), button(button-envelope) }
+
+    record markdown-param { key: string, values: list<string> }
+    record markdown-template { id: string, params: list<markdown-param> }
+    variant markdown-body { content(string), template(markdown-template) }
+    variant keyboard { template(string), inline(list<list<button>>) }
+    enum button-style { gray, blue, red, blue-filled }
+    variant button-access { everyone, administrators, users(list<string>) }
+    record button-command { text: string, enter: bool, reply: bool }
+    variant button-action { link(string), command(button-command), callback(string) }
+
+    record button {
+        id: string,
+        label: string,
+        visited-label: option<string>,
+        style: button-style,
+        access: button-access,
+        action: button-action,
+        unsupported-tips: option<string>,
+    }
+
+    record markdown {
+        body: markdown-body,
+        keyboard: option<keyboard>,
+        force-verify-image-resource: bool,
+    }
+
+    record markdown-send { target: qq-chat, message: markdown }
+    enum ack-result { success, failure, too-frequent, duplicate, no-permission, only-administrator }
+
+    variant qq-command-payload {
+        core(command-payload),
+        markdown-reply(markdown),
+        markdown-send(markdown-send),
+        button-ack(ack-result),
+    }
+
+    record command {
+        command-id: string,
+        idempotency-key: option<string>,
+        deadline-ms: option<u64>,
+        payload: qq-command-payload,
+    }
+
+    record output {
+        disposition: disposition,
+        state-ops: list<state-op>,
+        commands: list<command>,
+        diagnostics: list<diagnostic>,
+    }
+
+    on-event: func(input: event) -> result<output, plugin-error>;
+}
+
+world qq-plugin {
+    import queries;
+    export lifecycle;
+    export qq-handler;
+}
+
+world qq-managed-plugin {
+    include qq-plugin;
+    export management;
+}
+
+// Host binding generation includes every supported export.
+world host-plugins {
+    include managed-plugin;
+    export qq-handler;
 }

@@ -95,6 +95,11 @@ impl PluginManifest {
         {
             return Err(ManifestError::FeatureRequiresProtocol15);
         }
+        if self.uses_qq_rich_messages()
+            && (0..7).any(|minor| requirement_matches_bpp_minor(&requirement, minor))
+        {
+            return Err(ManifestError::FeatureRequiresProtocol17);
+        }
         if self.runtime.max_concurrency == 0 {
             return Err(ManifestError::ZeroConcurrency);
         }
@@ -120,7 +125,14 @@ impl PluginManifest {
         for action in &self.permissions.actions {
             if !matches!(
                 action.as_str(),
-                "message.reply" | "message.send" | "media.reply" | "media.send" | "media.create"
+                "message.reply"
+                    | "message.send"
+                    | "media.reply"
+                    | "media.send"
+                    | "media.create"
+                    | crate::QQ_MARKDOWN_REPLY
+                    | crate::QQ_MARKDOWN_SEND
+                    | crate::QQ_BUTTON_ACK
             ) {
                 return Err(ManifestError::UnsupportedAction(action.clone()));
             }
@@ -142,6 +154,18 @@ impl PluginManifest {
             permission.validate()?;
         }
         Ok(())
+    }
+
+    pub fn uses_qq_rich_messages(&self) -> bool {
+        self.permissions.actions.iter().any(|action| {
+            matches!(
+                action.as_str(),
+                crate::QQ_MARKDOWN_REPLY | crate::QQ_MARKDOWN_SEND | crate::QQ_BUTTON_ACK
+            )
+        }) || self
+            .subscriptions
+            .iter()
+            .any(|subscription| subscription.event == crate::QQ_BUTTON_CLICKED)
     }
 
     pub const fn timeout(&self) -> Duration {
@@ -794,6 +818,10 @@ pub enum StoragePermission {
 
 #[derive(Debug, Error)]
 pub enum ManifestError {
+    #[error(
+        "QQ Markdown and button capabilities require a protocol range that excludes BPP versions before 1.7"
+    )]
+    FeatureRequiresProtocol17,
     #[error("media.create requires a protocol range that excludes BPP versions before 1.5")]
     FeatureRequiresProtocol15,
     #[error("plugin manifest TOML is invalid")]

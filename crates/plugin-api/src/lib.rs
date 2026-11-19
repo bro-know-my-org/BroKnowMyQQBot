@@ -7,6 +7,7 @@ mod id;
 mod management;
 mod manifest;
 mod protocol;
+mod qq;
 
 pub use command::{
     CommandContext, DEFAULT_COMMAND_PREFIX, InvalidCommandPrefix, MAX_COMMAND_PREFIX_CHARS,
@@ -29,4 +30,6 @@ pub use protocol::{
     ScheduleCancel, ScheduleCreate, ScheduleTriggered, StateOp, StateValue, StaticPlugin,
 };
 
-pub const BPP_VERSION: &str = "1.6.0";
+pub use qq::*;
+
+pub const BPP_VERSION: &str = "1.7.0";
