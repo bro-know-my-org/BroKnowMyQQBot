@@ -1069,7 +1069,7 @@ impl QqActionExecutor {
         payload: Value,
     ) -> Result<ActionResult, AdapterError> {
         match name {
-            "qq.message.markdown" | "qq.message.ark" => {
+            "qq.message.markdown" | "qq.message.markdown.once" | "qq.message.ark" => {
                 self.execute_rich_message(name, payload).await
             }
             "qq.dms.create" => {
@@ -1101,21 +1101,8 @@ impl QqActionExecutor {
             _ if is_audio_forum_action(name) => {
                 self.execute_audio_forum_action(name, payload).await
             }
-            "qq.interaction.respond" => {
-                reject_unknown_object_fields(
-                    name,
-                    "payload",
-                    &payload,
-                    &["interaction_id", "code"],
-                )?;
-                let action: InteractionResponseAction = decode_platform_payload(name, payload)?;
-                self.complete_unit_action(
-                    "qq.interaction.respond",
-                    "interaction",
-                    self.api
-                        .respond_interaction(&action.interaction_id, &action.request)
-                        .await,
-                )
+            "qq.interaction.respond" | "qq.interaction.respond.managed" => {
+                self.execute_interaction_response(name, payload).await
             }
             "qq.guild.message-setting.get"
             | "qq.guild.mute.set"
@@ -1167,6 +1154,23 @@ impl QqActionExecutor {
         }
     }
 
+    async fn execute_interaction_response(
+        &self,
+        name: &str,
+        payload: Value,
+    ) -> Result<ActionResult, AdapterError> {
+        reject_unknown_object_fields(name, "payload", &payload, &["interaction_id", "code"])?;
+        let action: InteractionResponseAction = decode_platform_payload(name, payload)?;
+        let result = self
+            .api
+            .respond_interaction(&action.interaction_id, &action.request)
+            .await;
+        if name == "qq.interaction.respond.managed" {
+            return self.complete_managed_action(name, result.map(|()| ActionResult::default()));
+        }
+        self.complete_unit_action("qq.interaction.respond", "interaction", result)
+    }
+
     async fn execute_rich_message(
         &self,
         name: &str,
@@ -1182,6 +1186,10 @@ impl QqActionExecutor {
                 "qq.message.ark does not accept keyboard".to_owned(),
             ));
         }
+        if name == "qq.message.markdown.once" {
+            return self.execute_managed_markdown(action).await;
+        }
+        let markdown = name == "qq.message.markdown";
         let message_scope = message_scope_name(&action.target);
         let RichMessageAction {
             target,
@@ -1191,7 +1199,7 @@ impl QqActionExecutor {
         } = action;
         let result = match target {
             MessageTarget::Group { group_id } => {
-                let request = if name == "qq.message.markdown" {
+                let request = if markdown {
                     MessageRequest::markdown(body, keyboard)
                 } else {
                     MessageRequest::ark(body)
@@ -1203,7 +1211,7 @@ impl QqActionExecutor {
                 self.api.send_group_message(&group_id, &request).await
             }
             MessageTarget::Private { user_id } => {
-                let request = if name == "qq.message.markdown" {
+                let request = if markdown {
                     MessageRequest::markdown(body, keyboard)
                 } else {
                     MessageRequest::ark(body)
@@ -1215,7 +1223,7 @@ impl QqActionExecutor {
                 self.api.send_c2c_message(&user_id, &request).await
             }
             MessageTarget::Channel { channel_id } => {
-                let request = if name == "qq.message.markdown" {
+                let request = if markdown {
                     ChannelMessageRequest::markdown(body, keyboard)
                 } else {
                     ChannelMessageRequest::ark(body)
@@ -1227,7 +1235,7 @@ impl QqActionExecutor {
                 self.api.send_channel_message(&channel_id, &request).await
             }
             MessageTarget::GuildDirect { guild_id } => {
-                let request = if name == "qq.message.markdown" {
+                let request = if markdown {
                     ChannelMessageRequest::markdown(body, keyboard)
                 } else {
                     ChannelMessageRequest::ark(body)
@@ -1240,7 +1248,7 @@ impl QqActionExecutor {
             }
         };
         self.complete_message_action(
-            if name == "qq.message.markdown" {
+            if markdown {
                 "qq.message.markdown"
             } else {
                 "qq.message.ark"
@@ -1248,6 +1256,34 @@ impl QqActionExecutor {
             message_scope,
             result,
             None,
+        )
+    }
+
+    async fn execute_managed_markdown(
+        &self,
+        action: RichMessageAction,
+    ) -> Result<ActionResult, AdapterError> {
+        let (group, id) = match &action.target {
+            MessageTarget::Group { group_id } => (true, group_id),
+            MessageTarget::Private { user_id } => (false, user_id),
+            _ => {
+                return Err(AdapterError::Action(
+                    "QQ Markdown requires a group or C2C target".to_owned(),
+                ));
+            }
+        };
+        let request = MessageRequest::markdown(action.body, action.keyboard);
+        let request = match action.reply_to {
+            Some(reply) => request.with_reply_to(reply),
+            None => request,
+        };
+        let result = self.api.send_chat_message_once(group, id, &request).await;
+        self.complete_managed_action(
+            "qq.message.markdown.once",
+            result.map(|response| ActionResult {
+                message_id: response.id,
+                raw: Value::Null,
+            }),
         )
     }
 
@@ -2212,6 +2248,38 @@ impl QqActionExecutor {
                 )
             }
             _ => unreachable!("group-join-strategy Action dispatcher only calls known names"),
+        }
+    }
+
+    fn complete_managed_action(
+        &self,
+        action_type: &str,
+        result: Result<ActionResult, ApiError>,
+    ) -> Result<ActionResult, AdapterError> {
+        match result {
+            Ok(result) => {
+                info!(adapter_id = %self.adapter_id, action_type, "QQ managed action succeeded");
+                Ok(result)
+            }
+            Err(error) => {
+                let error = match error {
+                    ApiError::HttpStatus { status, code, .. } if status.is_server_error() => {
+                        AdapterError::ActionUnknown(format!("QQ HTTP {status}, code={code:?}"))
+                    }
+                    ApiError::HttpStatus { status, code, .. } => {
+                        AdapterError::Action(format!("QQ HTTP {status}, code={code:?}"))
+                    }
+                    ApiError::Platform { code, .. } => {
+                        AdapterError::Action(format!("QQ platform code={code}"))
+                    }
+                    error if matches!(map_action_error(&error), AdapterError::ActionUnknown(_)) => {
+                        AdapterError::ActionUnknown("QQ response could not be verified".to_owned())
+                    }
+                    _ => AdapterError::Action("QQ request failed before completion".to_owned()),
+                };
+                warn!(adapter_id = %self.adapter_id, action_type, error = %error, "QQ managed action failed");
+                Err(error)
+            }
         }
     }
 

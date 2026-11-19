@@ -152,6 +152,10 @@ impl BotConfig {
         )?;
         apply_bool_override("BKMQB_QQ_DIRECT_MESSAGES", &mut self.qq.direct_messages)?;
         apply_bool_override("BKMQB_QQ_EXTENDED_EVENTS", &mut self.qq.extended_events.0)?;
+        apply_bool_override(
+            "BKMQB_QQ_INTERACTION_EVENTS",
+            &mut self.qq.interaction_events,
+        )?;
         apply_bool_override("BKMQB_QQ_FORUM_EVENTS", &mut self.qq.forum_events)?;
         apply_bool_override("BKMQB_QQ_AUDIO_EVENTS", &mut self.qq.audio_events)?;
         apply_bool_override("BKMQB_QQ_OPEN_FORUM_EVENTS", &mut self.qq.open_forum_events)?;

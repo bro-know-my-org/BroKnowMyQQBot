@@ -602,6 +602,22 @@ impl OpenApiClient {
         self.post_json(url, request).await
     }
 
+    /// Sends a group or C2C message without retrying or following redirects.
+    pub async fn send_chat_message_once(
+        &self,
+        group: bool,
+        openid: &str,
+        request: &MessageRequest,
+    ) -> Result<MessageResponse, ApiError> {
+        validate_path_id(if group { "group_openid" } else { "user_openid" }, openid)?;
+        request
+            .validate()
+            .map_err(|message| ApiError::InvalidRequest(message.to_owned()))?;
+        let collection = if group { "groups" } else { "users" };
+        let url = self.endpoint(&["v2", collection, openid, "messages"])?;
+        self.post_json_once(url, request).await
+    }
+
     pub async fn send_channel_message(
         &self,
         channel_id: &str,

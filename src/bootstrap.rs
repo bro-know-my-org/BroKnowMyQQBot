@@ -398,8 +398,10 @@ fn configured_qq_intents(config: &BotConfig) -> Intents {
             | Intents::GUILD_MEMBERS
             | Intents::GUILD_MESSAGE_REACTIONS
             | Intents::GROUP_MEMBER_EVENT
-            | Intents::INTERACTION
             | Intents::MESSAGE_AUDIT;
+    }
+    if config.qq.interaction_events || config.qq.extended_events.is_enabled() {
+        intents |= Intents::INTERACTION;
     }
     if config.qq.forum_events {
         intents = intents.with_forums();
@@ -511,6 +513,15 @@ mod tests {
         let disabled: BotConfig = toml::from_str("[qq]\nextended_events = false").unwrap();
         let disabled_intents = configured_qq_intents(&disabled);
         assert_eq!(disabled_intents, Intents::GROUP_AND_C2C_EVENT);
+    }
+
+    #[test]
+    fn interaction_can_be_enabled_without_other_optional_intents() {
+        let config: BotConfig = toml::from_str("[qq]\ninteraction_events = true").unwrap();
+        assert_eq!(
+            configured_qq_intents(&config),
+            Intents::GROUP_AND_C2C_EVENT | Intents::INTERACTION
+        );
     }
 
     #[test]

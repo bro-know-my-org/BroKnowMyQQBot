@@ -761,14 +761,69 @@ fn map_interaction_event(
     } else {
         Event::Notice
     };
-    map_structured_event_with_fallback_id(
+    let mut envelope = map_structured_event_with_fallback_id(
         adapter,
         payload,
         event_type,
         Some("timestamp"),
         wrap,
         Some(&interaction.id),
-    )
+    )?;
+    if let Some(button) = managed_button(interaction) {
+        // Gateway dispatch IDs can differ across deliveries of one interaction.
+        let digest = sha256_hex(button.interaction_id.as_bytes());
+        envelope.id = EventId::new(format!("qq:button:{digest}"));
+        envelope.event = Event::ButtonInteraction(button);
+    }
+    Ok(envelope)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn managed_button(event: InteractionEvent) -> Option<bot_core::ButtonInteraction> {
+    if event.interaction_type != 11 || event.id.len() > 256 {
+        return None;
+    }
+    let (actor_id, target) = match event.scene.as_deref() {
+        Some("group") => (
+            event.group_member_openid?,
+            MessageTarget::Group {
+                group_id: event.group_openid?,
+            },
+        ),
+        Some("c2c") => {
+            let user_id = event.user_openid?;
+            (user_id.clone(), MessageTarget::Private { user_id })
+        }
+        _ => return None,
+    };
+    let data = event.data?.resolved?;
+    let token = data.get("button_data")?.as_str()?;
+    let button_id = data.get("button_id")?.as_str()?;
+    if !bot_core::ButtonInteraction::is_managed_token(token)
+        || button_id.is_empty()
+        || button_id.len() > 64
+        || button_id
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+        || actor_id.len() > 256
+    {
+        return None;
+    }
+    Some(bot_core::ButtonInteraction {
+        interaction_id: event.id,
+        target,
+        actor_id,
+        button_id: button_id.to_owned(),
+        token: token.to_owned(),
+    })
 }
 
 fn map_group_join_request(
@@ -836,13 +891,8 @@ fn map_structured_event_with_fallback_id(
                     event_type: event_type.to_owned(),
                     field: "dispatch id or sequence",
                 })?;
-                let digest = Sha256::digest(
-                    serde_json::to_vec(&(event_type, &payload.d)).unwrap_or_default(),
-                );
-                let mut encoded = String::with_capacity(digest.len() * 2);
-                for byte in digest {
-                    let _ = write!(encoded, "{byte:02x}");
-                }
+                let encoded =
+                    sha256_hex(&serde_json::to_vec(&(event_type, &payload.d)).unwrap_or_default());
                 Ok(format!("qq:{event_type}:{sequence}:{encoded}"))
             },
             Ok,
@@ -1479,6 +1529,150 @@ mod tests {
             Err(MappingError::InvalidUnixTimestamp { timestamp, .. })
                 if timestamp == u64::MAX
         ));
+    }
+
+    const MANAGED_BUTTON_TOKEN: &str = "bkm1:0123456789abcdef0123456789abcdef";
+
+    fn group_button_dispatch() -> GatewayPayload {
+        GatewayPayload {
+            id: Some("gateway-button-id".to_owned()),
+            op: OpCode::DISPATCH,
+            d: json!({
+                "id": "interaction-id",
+                "type": 11,
+                "scene": "group",
+                "timestamp": "2026-08-22T10:00:00+08:00",
+                "group_openid": "group-id",
+                "group_member_openid": "member-id",
+                "data": {"resolved": {"button_id": "next-page", "button_data": MANAGED_BUTTON_TOKEN}}
+            }),
+            s: Some(8),
+            t: Some("INTERACTION_CREATE".to_owned()),
+        }
+    }
+
+    #[test]
+    fn maps_managed_group_and_c2c_buttons() {
+        let group = group_button_dispatch();
+        let c2c = GatewayPayload {
+            d: json!({
+                "id": "c2c-interaction-id",
+                "type": 11,
+                "scene": "c2c",
+                "timestamp": "2026-08-22T10:00:00+08:00",
+                "user_openid": "user-id",
+                "data": {"resolved": {"button_id": "previous-page", "button_data": MANAGED_BUTTON_TOKEN}}
+            }),
+            ..group.clone()
+        };
+        let adapter = AdapterId::new("qq");
+        for (payload, target, actor, button_id, interaction_id) in [
+            (
+                group,
+                MessageTarget::Group {
+                    group_id: "group-id".to_owned(),
+                },
+                "member-id",
+                "next-page",
+                "interaction-id",
+            ),
+            (
+                c2c,
+                MessageTarget::Private {
+                    user_id: "user-id".to_owned(),
+                },
+                "user-id",
+                "previous-page",
+                "c2c-interaction-id",
+            ),
+        ] {
+            let envelope = map_dispatch(&adapter, &payload).unwrap().unwrap();
+            assert_eq!(envelope.adapter, adapter);
+            assert_eq!(
+                envelope.timestamp.unwrap().to_rfc3339(),
+                "2026-08-22T02:00:00+00:00"
+            );
+            let Event::ButtonInteraction(button) = envelope.event else {
+                panic!("expected a managed button for interaction {interaction_id}");
+            };
+            assert_eq!(button.target, target);
+            assert_eq!(button.actor_id, actor);
+            assert_eq!(button.button_id, button_id);
+            assert_eq!(button.interaction_id, interaction_id);
+            assert_eq!(button.token, MANAGED_BUTTON_TOKEN);
+        }
+    }
+
+    #[test]
+    fn uses_interaction_id_for_managed_button_event_identity() {
+        let adapter = AdapterId::new("qq");
+        let mut payload = group_button_dispatch();
+        let first = map_dispatch(&adapter, &payload).unwrap().unwrap();
+
+        payload.id = Some("a-new-gateway-id".to_owned());
+        payload.s = Some(9);
+        let duplicate = map_dispatch(&adapter, &payload).unwrap().unwrap();
+        assert_eq!(first.id, duplicate.id);
+
+        payload.d["id"] = json!("another-interaction-id");
+        let next_click = map_dispatch(&adapter, &payload).unwrap().unwrap();
+        assert_ne!(first.id, next_click.id);
+    }
+
+    #[test]
+    fn preserves_generic_interaction_requests_outside_managed_buttons() {
+        let adapter = AdapterId::new("qq");
+        for (case, field, value) in [
+            (
+                "unmanaged token",
+                "/data/resolved/button_data",
+                json!("approve"),
+            ),
+            ("wrong scene", "/scene", json!("guild")),
+            ("malformed button ID", "/data/resolved/button_id", json!(42)),
+            (
+                "malformed managed token",
+                "/data/resolved/button_data",
+                json!("bkm1:0123456789abcdef0123456789abcdeg"),
+            ),
+            ("missing group actor", "/group_member_openid", json!(null)),
+            ("type 12 with managed button data", "/type", json!(12)),
+            (
+                "button ID with whitespace",
+                "/data/resolved/button_id",
+                json!("next page"),
+            ),
+        ] {
+            let mut payload = group_button_dispatch();
+            *payload.d.pointer_mut(field).unwrap() = value;
+            for dispatch_id in [Some("gateway-button-id"), None] {
+                payload.id = dispatch_id.map(str::to_owned);
+                let envelope = map_dispatch(&adapter, &payload).unwrap().unwrap();
+                let Event::Request(body) = envelope.event else {
+                    panic!("expected a generic request for {case}");
+                };
+                assert_eq!(
+                    envelope.id.as_str(),
+                    dispatch_id.unwrap_or("interaction-id"),
+                    "{case}"
+                );
+                assert_eq!(
+                    envelope.timestamp.unwrap().to_rfc3339(),
+                    "2026-08-22T02:00:00+00:00",
+                    "{case}"
+                );
+                assert_eq!(
+                    envelope.raw,
+                    serde_json::to_value(&payload).unwrap(),
+                    "{case}"
+                );
+                assert_eq!(
+                    body,
+                    json!({"type": "INTERACTION_CREATE", "data": payload.d}),
+                    "{case}"
+                );
+            }
+        }
     }
 
     #[test]
