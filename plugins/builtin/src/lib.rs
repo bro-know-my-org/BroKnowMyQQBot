@@ -27,7 +27,7 @@ mod business;
 #[cfg(feature = "coverage-probes")]
 mod probes;
 
-pub use basic::{CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin};
+pub use basic::{CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin, QqMarkdownPagesPlugin};
 pub use business::{AdminPlugin, ReminderPlugin};
 #[cfg(feature = "coverage-probes")]
 pub use probes::{

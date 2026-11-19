@@ -52,9 +52,9 @@ async fn catalogue_includes_unselected_plugins_and_compiled_feature_boundary() {
     assert_eq!(
         catalogue.plugins.len(),
         if cfg!(feature = "coverage-probes") {
-            12
+            13
         } else {
-            6
+            7
         }
     );
     let ping = catalogue.plugins.iter().find(|p| p.key == "ping").unwrap();

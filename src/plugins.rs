@@ -20,7 +20,8 @@ use builtin_plugins::{
     QqExtensionProbePlugin, SchedulerProbePlugin,
 };
 use builtin_plugins::{
-    AdminPlugin, CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin, ReminderPlugin,
+    AdminPlugin, CounterPlugin, EchoPlugin, HelpPlugin, PingPlugin, QqMarkdownPagesPlugin,
+    ReminderPlugin,
 };
 #[cfg(feature = "coverage-probes")]
 use plugin_host::TrustedPlatformQuery;
@@ -44,6 +45,7 @@ const BUNDLED_PLUGIN_INSTANCES: &[(&str, &str)] = &[
     ("counter", "dev.bkm.counter/default"),
     ("admin", "dev.bkm.admin/default"),
     ("reminder", "dev.bkm.reminder/default"),
+    ("qq-markdown-pages", "dev.bkm.qq-markdown-pages/default"),
     ("http-probe", "dev.bkm.http-probe/default"),
     ("browser-probe", "dev.bkm.browser-probe/default"),
     ("scheduler-probe", "dev.bkm.scheduler-probe/default"),
@@ -593,6 +595,23 @@ mod tests {
         assert_eq!(
             DEFAULT_BUNDLED_PLUGINS,
             ["ping", "help", "echo", "counter", "reminder"]
+        );
+    }
+
+    #[tokio::test]
+    async fn qq_markdown_pages_can_be_enabled_explicitly() {
+        let mut plugins = StaticPluginHost::new(PluginStore::in_memory().unwrap());
+        let (include_help, instances) = register_bundled_plugins(
+            &mut plugins,
+            Some(vec!["qq-markdown-pages".to_owned()]),
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!include_help);
+        assert_eq!(
+            instances,
+            BTreeSet::from(["dev.bkm.qq-markdown-pages/default".to_owned()])
         );
     }
 

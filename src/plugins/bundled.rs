@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::{
     AdminPlugin, BUNDLED_PLUGIN_INSTANCES, COVERAGE_PROBE_NAMES, CounterPlugin,
     DEFAULT_BUNDLED_PLUGINS, EchoPlugin, HelpPlugin, PingPlugin, PluginConfigError,
-    PluginInstallations, ReminderPlugin,
+    PluginInstallations, QqMarkdownPagesPlugin, ReminderPlugin,
 };
 
 pub(crate) struct Definition {
@@ -33,6 +33,7 @@ pub(crate) fn definition(name: &str) -> Result<Definition, PluginConfigError> {
         "counter" => Arc::new(CounterPlugin::default()),
         "admin" => Arc::new(AdminPlugin::default()),
         "reminder" => Arc::new(ReminderPlugin::default()),
+        "qq-markdown-pages" => Arc::new(QqMarkdownPagesPlugin::default()),
         #[cfg(feature = "coverage-probes")]
         "http-probe" => Arc::new(super::HttpProbePlugin::default()),
         #[cfg(feature = "coverage-probes")]

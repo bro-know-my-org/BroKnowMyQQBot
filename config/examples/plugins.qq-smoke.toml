@@ -2,6 +2,7 @@
 # Test-only fault fixtures remain excluded from the production application.
 bundled = [
     "ping",
+    "qq-markdown-pages",
     "help",
     "echo",
     "counter",
