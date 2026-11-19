@@ -1,0 +1,18 @@
+{
+  "protocol_version": "1.7.0",
+  "event_id": "fixture-event-2",
+  "delivery_id": "fixture-delivery-2",
+  "invocation_id": "fixture-invocation-2",
+  "occurred_at_ms": 1700000000000,
+  "received_at_ms": 1700000000100,
+  "adapter_id": "fixture-adapter",
+  "event_type": "qq.button.clicked",
+  "trace_id": null,
+  "payload": {
+    "actor_id": "fixture-user-1",
+    "target": { "scope": "private", "user_id": "fixture-user-1" },
+    "button_id": "next",
+    "data": "page=2"
+  },
+  "extensions": []
+}

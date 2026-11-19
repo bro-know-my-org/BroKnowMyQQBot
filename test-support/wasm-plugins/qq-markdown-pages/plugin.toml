@@ -1,0 +1,41 @@
+manifest_version = 1
+id = "dev.bkm.qq-markdown-pages"
+version = "0.1.0"
+protocol = ">=1.7,<2.0"
+state_version = 1
+entry = "component.wasm"
+
+[metadata]
+default_locale = "en"
+
+[metadata.locales.en]
+name = "QQ Markdown Pages"
+description = "QQ Markdown pagination using BPP button events and action receipts"
+
+[runtime]
+mode = "serial"
+max_concurrency = 1
+timeout_ms = 1500
+memory_mb = 16
+fuel = 10000000
+
+[[subscriptions]]
+id = "message"
+event = "message.created"
+scopes = ["group", "private"]
+
+[[subscriptions]]
+id = "buttons"
+event = "qq.button.clicked"
+scopes = ["group", "private"]
+
+[[subscriptions]]
+id = "receipts"
+event = "action.completed"
+
+[[commands]]
+name = "md-pages"
+description = "Show QQ Markdown pages"
+
+[permissions]
+actions = ["qq.markdown.reply", "qq.markdown.send", "qq.button.ack"]

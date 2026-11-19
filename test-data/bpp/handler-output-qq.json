@@ -1,0 +1,47 @@
+{
+  "disposition": "continue",
+  "state_ops": [],
+  "commands": [
+    {
+      "command_id": "reply",
+      "kind": "qq.markdown.reply",
+      "payload": {
+        "body": { "type": "content", "content": "# Page 1" },
+        "keyboard": {
+          "type": "inline",
+          "rows": [[{
+            "id": "next",
+            "label": "Next",
+            "visited_label": "Opened",
+            "style": "blue_filled",
+            "access": { "type": "users", "ids": ["fixture-user-1"] },
+            "action": { "type": "callback", "data": "page=2" }
+          }]]
+        },
+        "force_verify_image_resource": true
+      }
+    },
+    {
+      "command_id": "send",
+      "kind": "qq.markdown.send",
+      "payload": {
+        "target": { "scope": "group", "group_id": "fixture-group-1" },
+        "markdown": {
+          "body": {
+            "type": "template",
+            "id": "fixture-markdown",
+            "params": [{ "key": "title", "values": ["Page 2"] }]
+          },
+          "keyboard": { "type": "template", "id": "fixture-keyboard" },
+          "force_verify_image_resource": false
+        }
+      }
+    },
+    {
+      "command_id": "ack",
+      "kind": "qq.button.ack",
+      "payload": "success"
+    }
+  ],
+  "diagnostics": []
+}
